@@ -1,0 +1,109 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "deliverability-guard"
+dynamic = ["version"]
+description = "A sending circuit breaker for outbound email. Refuses to trip on statistically meaningless data."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.12"
+authors = [{ name = "Kate Kruger" }]
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Typing :: Typed",
+]
+dependencies = ["httpx>=0.28", "pyyaml>=6.0", "scipy>=1.14"]
+
+[project.urls]
+Repository = "https://github.com/katekruger/deliverability-guard"
+Changelog = "https://github.com/katekruger/deliverability-guard/blob/main/CHANGELOG.md"
+
+# [project.scripts] lands once cli.py implements a real entry point — an
+# empty stub would register a command that fails on invocation.
+
+[tool.hatch.version]
+path = "src/deliverability_guard/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/deliverability_guard"]
+
+[dependency-groups]
+# PEP 735 dev dependencies. Deliberately NOT [project.optional-dependencies] —
+# that installs alongside the package for end users; this group never ships.
+dev = [
+    # Linter/type-checker versions are PINNED, not floated with `>=`. Ruff and
+    # pyright both change their default rule sets between releases, so an
+    # unpinned linter can turn a green CI red with zero code change on our
+    # side. Bump these deliberately, in their own PR, reviewing the changelog.
+    # (parsedmarc does the same and it's the right call.)
+    "ruff==0.16.5",
+    "pyright==1.1.411",
+    "pytest>=8.3",
+    "pytest-cov>=6.0",
+    "hypothesis>=6.115",
+    "pre-commit>=4.0",
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+# BUILD-PLAN.md is committed byte-identical to the original plan document —
+# ruff's markdown-embedded-code formatting must not touch it.
+extend-exclude = ["BUILD-PLAN.md"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade
+    "B",   # flake8-bugbear
+    "S",   # flake8-bandit (security)
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+    "RET", # flake8-return
+    "PTH", # flake8-use-pathlib
+    "RUF", # ruff-specific rules
+]
+ignore = [
+    "S101", # assert is how pytest and our own invariants work
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Test files may use asserts freely and construct fixtures with weaker names.
+"tests/**" = ["S101", "S105", "S106"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["deliverability_guard"]
+
+[tool.ruff.format]
+quote-style = "double"
+
+[tool.pyright]
+include = ["src", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "strict"
+reportMissingImports = true
+reportMissingTypeStubs = false
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--cov=deliverability_guard --cov-report=term-missing"
+filterwarnings = ["error"]
+
+[tool.coverage.run]
+source = ["src/deliverability_guard"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\."]
+show_missing = true

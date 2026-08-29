@@ -1,0 +1,48 @@
+# deliverability-guard — example thresholds
+#
+# Copy to thresholds.yml and adjust per tenant/domain. Values are lower bounds
+# on the posterior credible interval for the complaint rate (BUILD-PLAN.md
+# §6), not raw point estimates — that is what lets the breaker refuse to trip
+# on a single complaint at cold-outbound volume.
+#
+# Rationale for the defaults (BUILD-PLAN.md §7):
+#
+# Google's 0.30% is a TERMINAL threshold — the hard ceiling before Gmail
+# penalizes the domain. By the time you measure it, the damage is already
+# done, because complaint data lags 24h-3 days behind send. Waiting for 0.30%
+# to fire means reacting to a post-mortem, not preventing one.
+#
+# 0.10% is the natural amber line: it is simultaneously Google's own
+# RECOMMENDED target spam rate and Amazon SES's own review-trigger threshold.
+# Two independent providers converge on the same number as "you should be
+# worried now," which is why it sits in the middle of the ladder rather than
+# at the top.
+#
+# IMPORTANT: Google's 0.30% and SES's 0.10% are NOT the same measurement.
+# Google's denominator is Gmail inbox-delivered, DKIM-authenticated mail to
+# engaged users. SES's is mail to domains that return complaint feedback to
+# SES. Never blend these into one number — thresholds here are deliberately
+# provider-agnostic policy points, not a claim that the two rates are
+# comparable.
+
+complaint_rate_ladder:
+  # Notify only. No throttle, no pause.
+  warn: 0.0005 # 0.05%
+
+  # Reduce the mailbox's daily send limit by 50%.
+  throttle: 0.0010 # 0.10%
+
+  # Pause the mailbox. Requires a human to resume — see ADR 0003.
+  pause: 0.0020 # 0.20%
+
+# Weakly informative prior for the beta-binomial posterior (BUILD-PLAN.md §6).
+# Centred near 0.1%, easily overwhelmed by real data once a mailbox has
+# meaningful volume. See engine/posterior.py for why a prior exists at all.
+prior:
+  alpha: 0.5
+  beta: 500
+
+# Dry-run is the default everywhere in this repo. Any code path that can
+# pause or throttle a real mailbox must be off unless explicitly enabled.
+# See AGENTS.md.
+dry_run: true
