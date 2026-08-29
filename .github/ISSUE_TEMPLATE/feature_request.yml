@@ -1,0 +1,29 @@
+name: Feature request
+description: Propose something new — a provider driver, a signal, a capability.
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: What can't you do today that this would enable? Prefer a concrete scenario over an abstract capability.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed approach
+      description: If you have one. It's fine to leave this blank and just describe the problem.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked BUILD-PLAN.md to see if this is already scoped for a future version, deferred, or explicitly a non-goal.
+          required: true
+        - label: If this involves a new provider or external API, I've noted what's verified vs. assumed about its behavior.
+          required: false

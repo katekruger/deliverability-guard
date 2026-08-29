@@ -1,0 +1,58 @@
+name: Bug report
+description: Something is broken or behaving incorrectly.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, including what you expected instead.
+    validations:
+      required: true
+
+  - type: textarea
+    id: repro
+    attributes:
+      label: How to reproduce
+      description: Minimal steps to reproduce, ideally including your `thresholds.yml` (redact anything sensitive) and whether `dry_run` was on.
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: deliverability-guard version
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: e.g. 3.12.4
+    validations:
+      required: true
+
+  - type: dropdown
+    id: provider
+    attributes:
+      label: Provider(s) involved, if relevant
+      multiple: true
+      options:
+        - Instantly
+        - Smartlead
+        - Google Postmaster Tools
+        - Not provider-specific
+        - Other (mention in description)
+    validations:
+      required: false
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant decision log / traceback
+      description: Paste the relevant excerpt from `audit/log.py` output or a stack trace. This will be rendered as a code block — do not paste real API keys or PII.
+      render: shell
+    validations:
+      required: false
