@@ -138,8 +138,16 @@ def unsupported(capability: Capability, provider: str, reason: str) -> ActionRes
 
 
 class ProviderDriver(Protocol):
-    name: str
-    capabilities: frozenset[Capability]
+    # Declared as read-only properties, not plain mutable attributes: a
+    # Protocol's plain attributes are invariant, which would reject any
+    # implementation (like providers/dry_run.py's DryRunDriver) that
+    # exposes these as `@property` instead of a bare class attribute, even
+    # though both satisfy "read `driver.name` and get a str" identically.
+    @property
+    def name(self) -> str: ...
+
+    @property
+    def capabilities(self) -> frozenset[Capability]: ...
 
     def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]: ...
     def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult: ...

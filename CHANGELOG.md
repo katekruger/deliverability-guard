@@ -34,3 +34,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   daily-limit endpoint; campaign-level pause only, not per-mailbox.
 - `docs/threat-model.md`: the Smartlead query-string-API-key risk and how
   the driver avoids leaking it into logs or error messages.
+- `engine/breaker.py`: the warn/throttle/pause ladder on the posterior lower
+  bound, idempotent pause handling (no double-pause on a repeat trip,
+  reconciliation on the next tick after a lost provider response), and
+  `ThresholdStore` for an atomic config swap with no torn reads.
+- `providers/dry_run.py`: the no-op provider decorator. Dry-run and live
+  runs now produce identical decisions -- only the driver object passed to
+  `engine.breaker.evaluate` differs.
+- `audit/log.py`: the decision log. Every evaluation is serializable to
+  JSONL and replayable from the log alone via `replay()`.
+- `loops/fast.py`: webhook-driven evaluation with idempotent handling of
+  redelivered events.
+- `loops/slow.py`: threshold tuning, structurally unable to pause or
+  throttle anything -- it has no parameter capable of it.
+- ADR 0003: never auto-resume a paused mailbox, and why.
