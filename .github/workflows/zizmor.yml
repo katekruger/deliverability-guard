@@ -27,6 +27,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Upload SARIF file
+        # Code scanning (and therefore SARIF upload) requires GitHub Advanced
+        # Security, which is not enabled by default on a private repo. This
+        # step will start succeeding once code scanning is turned on at
+        # go-public time (docs/plans/going-public-checklist.md) — until then,
+        # don't let an environment limitation fail CI on every push.
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@cdf488f595d80d6e07e03d4674febd5ab45fa938 # v4.37.9
         with:
           sarif_file: results.sarif
