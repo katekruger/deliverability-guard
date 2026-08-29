@@ -1,0 +1,9 @@
+{
+  "data": [
+    {
+      "from_email": "sender1@example.com",
+      "sent_count": 500,
+      "bounce_count": 4
+    }
+  ]
+}

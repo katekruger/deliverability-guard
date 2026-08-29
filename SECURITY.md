@@ -18,7 +18,8 @@ solo-maintained project, so timelines are best-effort, not contractual.
 - One provider driver in scope (Smartlead) authenticates via an API key in
   the query string, which risks leaking into server/proxy logs and `Referer`
   headers. If you find a place we log a full request URL for that provider,
-  that is itself a security bug — please report it.
+  that is itself a security bug — please report it. See
+  `docs/threat-model.md` for the full detail and what is/isn't mitigated.
 - Dry-run is the default everywhere. If you find a code path that can pause
   or throttle a real mailbox without `dry_run=False` explicitly set, treat it
   as a security-relevant bug, not just a correctness one.

@@ -31,7 +31,7 @@ def synthetic_stream(
         raise ValueError(f"daily_sends must be >= 0, got {daily_sends}")
     if not 0 <= true_complaint_rate <= 1:
         raise ValueError(f"true_complaint_rate must be in [0, 1], got {true_complaint_rate}")
-    rng = random.Random(seed)  # noqa: S311 -- synthetic test data, not cryptographic
+    rng = random.Random(seed)
     for day in range(days):
         complaints = rng.binomialvariate(daily_sends, true_complaint_rate) if daily_sends else 0
         yield DailyCounts(day=day, sends=daily_sends, complaints=complaints)

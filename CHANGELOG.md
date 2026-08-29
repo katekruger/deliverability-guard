@@ -23,3 +23,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   structurally wrong at cold-outbound volume, with the worked 0.15-message
   example.
 - ADR 0002: beta-binomial posterior with hierarchical pooling.
+- `providers/base.py`: the `ProviderDriver` protocol, `Capability`
+  declaration (`READ_STATS`/`THROTTLE`/`PAUSE`/`WEBHOOKS`), `ActionResult`
+  with an explicit `UNSUPPORTED` outcome so a driver degrades to alert-only
+  instead of silently no-oping, and webhook idempotency/ordering
+  (`WebhookLedger`, `order_events`).
+- `providers/instantly.py`: the reference provider driver -- read per-mailbox
+  daily stats, pause a mailbox or campaign. No throttle primitive.
+- `providers/smartlead.py`: proves the throttle path via the per-mailbox
+  daily-limit endpoint; campaign-level pause only, not per-mailbox.
+- `docs/threat-model.md`: the Smartlead query-string-API-key risk and how
+  the driver avoids leaking it into logs or error messages.

@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "from_email": "sender1@example.com",
+      "sent_date": "2026-08-01",
+      "sent_count": 500,
+      "bounce_count": 4
+    },
+    {
+      "from_email": "sender2@example.com",
+      "sent_date": "2026-08-01",
+      "sent_count": 0,
+      "bounce_count": 0,
+      "email_account_disconnected": true
+    },
+    {
+      "from_email": "sender3@example.com",
+      "sent_date": "2026-07-25",
+      "sent_count": 300,
+      "bounce_count": 1
+    }
+  ]
+}
