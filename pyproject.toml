@@ -90,7 +90,7 @@ known-first-party = ["deliverability_guard"]
 quote-style = "double"
 
 [tool.pyright]
-include = ["src", "tests"]
+include = ["src", "tests", "examples"]
 pythonVersion = "3.12"
 typeCheckingMode = "strict"
 reportMissingImports = true

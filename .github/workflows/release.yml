@@ -1,0 +1,133 @@
+name: Release
+
+# Tag-triggered, on the parsedmarc pattern: verify the tag matches the
+# package version -> verify CHANGELOG.md has a section for it -> run the
+# full CI suite -> build -> publish to PyPI via Trusted Publishing (OIDC,
+# no API token secret anywhere) into an environment that requires manual
+# approval -> create the GitHub Release from the CHANGELOG section.
+#
+# Set up the PyPI Trusted Publisher BEFORE pushing the first tag -- PyPI
+# needs to already trust this repo/workflow/environment combination, or the
+# publish step has nothing to authenticate against.
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: verify tag matches version, CHANGELOG has a section
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          # This workflow publishes release artifacts; a cache poisoned by
+          # an earlier run must never be trusted here, so caching is off
+          # for this workflow specifically (unlike ci.yml, which runs far
+          # more often and has more to gain from it).
+          enable-cache: false
+
+      - name: Verify tag matches package version
+        run: |
+          tag_version="${GITHUB_REF_NAME#v}"
+          pkg_version="$(uvx hatch version)"
+          if [ "$tag_version" != "$pkg_version" ]; then
+            echo "::error::tag $GITHUB_REF_NAME (version $tag_version) does not match" \
+                 "package version $pkg_version (src/deliverability_guard/__init__.py)"
+            exit 1
+          fi
+          echo "OK: tag $GITHUB_REF_NAME matches package version $pkg_version"
+
+      - name: Verify CHANGELOG.md has a section for this version
+        run: |
+          pkg_version="$(uvx hatch version)"
+          if ! grep -qE "^## \[?${pkg_version//./\\.}\]?" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md has no '## $pkg_version' section"
+            exit 1
+          fi
+          echo "OK: CHANGELOG.md has a section for $pkg_version"
+
+  ci:
+    name: run CI
+    needs: verify
+    uses: ./.github/workflows/ci.yml
+
+  build:
+    name: build sdist and wheel
+    needs: ci
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: false # see the same note in the verify job above
+
+      - name: Build
+        run: uv build
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    name: publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: release
+      url: https://pypi.org/project/deliverability-guard/
+    permissions:
+      id-token: write # required for PyPI Trusted Publishing (OIDC); no API token anywhere
+      contents: read
+    steps:
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist/
+
+      # PEP 740 attestations are generated and uploaded automatically here
+      # under Trusted Publishing -- no extra configuration -- and show up
+      # as a provenance badge on the PyPI project page.
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2
+
+  github-release:
+    name: create GitHub Release
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Extract this version's CHANGELOG section
+        run: |
+          pkg_version="$(sed -n 's/^__version__ = "\(.*\)"/\1/p' src/deliverability_guard/__init__.py)"
+          awk -v ver="$pkg_version" '
+            $0 ~ "^## \\[?" ver { found=1; next }
+            found && /^## / { exit }
+            found { print }
+          ' CHANGELOG.md > release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" --title "$GITHUB_REF_NAME" --notes-file release-notes.md

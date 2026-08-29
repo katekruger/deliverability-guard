@@ -7,8 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## 0.1.0 - 2026-08-29
+
 ### Added
 
+- `.github/workflows/release.yml`: tag-triggered release -- verifies the
+  tag matches the package version and that `CHANGELOG.md` has a section for
+  it, runs the full CI suite, builds, and publishes to PyPI via Trusted
+  Publishing (OIDC, no API token secret anywhere) into a `release`
+  environment that requires manual approval, then creates the GitHub
+  Release from this section.
+- `examples/demo.py` and `docs/demo.gif`: the breaker declining to trip on
+  1 complaint in 50 sends, then correctly tripping on 40 complaints in
+  5,000 sends -- dry-run, no credentials, same code path either way.
+- README rewritten for release: the honest-limits section leads, ahead of
+  every feature, per BUILD-PLAN.md §2's positioning and this project's
+  entire reason for existing.
 - Project scaffolding: `src/` layout, package skeleton, CI, and repo hygiene
   files, per `BUILD-PLAN.md`.
 - `engine/posterior.py`: beta-binomial posterior on complaint/bounce rates,
