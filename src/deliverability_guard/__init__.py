@@ -4,4 +4,4 @@ Watches reputation, bounce, complaint and warmup signals per mailbox and
 throttles or pauses before a domain burns. See BUILD-PLAN.md for the design.
 """
 
-__version__ = "0.1.0.dev0"
+__version__ = "0.1.0"

@@ -31,6 +31,16 @@ Planned for **Prompt 5** (release), when v0.1.0 is ready to ship.
 
 ## At release time (v0.1.0), also see Prompt 5
 
-- [ ] PyPI Trusted Publisher configured **before** tagging
-- [ ] `release.yml` workflow verified end-to-end against a pre-release tag
-- [ ] Terminal GIF recorded and embedded in the README
+- [ ] PyPI Trusted Publisher configured **before** tagging (human-only: needs
+      a PyPI account and can't be done from this repo)
+- [x] `release.yml` written (tag-triggered, verifies tag/CHANGELOG match,
+      calls `ci.yml`, builds, publishes via Trusted Publishing into a
+      `release` environment requiring manual approval, creates the GitHub
+      Release) -- **not yet verified end-to-end against a real tag push**,
+      since that requires the PyPI Trusted Publisher to exist first
+- [x] Terminal GIF recorded (`docs/demo.gif`, via `examples/demo.py` +
+      `examples/demo.tape`) and embedded in the README
+- [ ] Expand `ci.yml` to a real Python version matrix -- deliberately NOT
+      done yet: the repo is still private, and doing this before the
+      visibility flip spends metered private-repo Actions minutes for no
+      benefit. Do this at the same time as the flip, not before.
