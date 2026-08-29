@@ -1,0 +1,18 @@
+{
+  "name": "domains/example.com/complianceStatus",
+  "complianceData": {
+    "domainId": "example.com",
+    "deliverabilityStatusVerdict": {
+      "state": { "status": "COMPLIANT" }
+    },
+    "oneClickUnsubscribeVerdict": {
+      "status": { "status": "COMPLIANT" }
+    },
+    "honorUnsubscribeVerdict": {
+      "status": { "status": "COMPLIANT" }
+    },
+    "rowData": [
+      { "requirement": "USER_REPORTED_SPAM_RATE", "status": { "status": "COMPLIANT" } }
+    ]
+  }
+}

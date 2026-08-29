@@ -15,6 +15,7 @@ from deliverability_guard.engine.breaker import (
     rung,
 )
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
+from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
     Capability,
@@ -432,3 +433,86 @@ def test_dry_run_decision_is_identical_to_live_except_the_flag_and_detail() -> N
     # And critically: dry-run never touched the real driver.
     assert dry_driver.pause_calls == []
     assert live_driver.pause_calls == [_MAILBOX]
+
+
+# --- Compliance hard gate ----------------------------------------------
+
+
+def test_compliance_gate_forces_pause_even_with_a_healthy_posterior() -> None:
+    """Google telling you directly you're non-compliant outranks any
+    statistical inference -- trip regardless of volume."""
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    assert result.verdict == Verdict.PAUSE
+    assert driver.pause_calls == [_MAILBOX]
+
+
+def test_compliance_gate_forces_pause_even_with_zero_sends() -> None:
+    """The hard gate outranks volume entirely -- even INSUFFICIENT_DATA
+    doesn't block it, since the compliance verdict isn't derived from
+    today's send volume at all."""
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=0,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    assert result.verdict == Verdict.PAUSE
+    assert result.data_state == DataState.INSUFFICIENT_DATA
+    assert result.posterior is None
+    assert driver.pause_calls == [_MAILBOX]
+
+
+def test_compliance_gate_false_does_not_change_normal_behavior() -> None:
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=False,
+    )
+    assert result.verdict == Verdict.OK
+    assert driver.pause_calls == []
+
+
+def test_compliance_gate_is_idempotent_like_any_other_pause() -> None:
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    for _ in range(3):
+        evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=5000,
+            complaints=0,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            compliance_gate_tripped=True,
+        )
+    assert driver.pause_calls == [_MAILBOX]

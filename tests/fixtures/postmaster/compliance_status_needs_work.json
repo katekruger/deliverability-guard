@@ -1,0 +1,22 @@
+{
+  "name": "domains/example.com/complianceStatus",
+  "complianceData": {
+    "domainId": "example.com",
+    "deliverabilityStatusVerdict": {
+      "state": { "status": "NEEDS_WORK" },
+      "reason": "SPAM_RATE_HIGH"
+    },
+    "oneClickUnsubscribeVerdict": {
+      "status": { "status": "COMPLIANT" }
+    },
+    "honorUnsubscribeVerdict": {
+      "status": { "status": "NEEDS_WORK" },
+      "reason": "NOT_HONORING_TOO_MANY_CAMPAIGNS"
+    },
+    "rowData": [
+      { "requirement": "USER_REPORTED_SPAM_RATE", "status": { "status": "NEEDS_WORK" } },
+      { "requirement": "SPF", "status": { "status": "COMPLIANT" } },
+      { "requirement": "DKIM", "status": { "status": "COMPLIANT" } }
+    ]
+  }
+}

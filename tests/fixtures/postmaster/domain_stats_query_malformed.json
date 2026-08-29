@@ -1,0 +1,9 @@
+{
+  "domainStats": [
+    {
+      "name": "domains/example.com/domainStats/bad1",
+      "value": { "doubleValue": 0.001 },
+      "date": { "year": 2026, "month": 8, "day": 1 }
+    }
+  ]
+}

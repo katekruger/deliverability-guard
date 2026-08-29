@@ -1,0 +1,5 @@
+{
+  "name": "domains/example.com/verificationToken",
+  "verificationMethod": "TXT",
+  "token": "google-site-verification=abc123def456"
+}
