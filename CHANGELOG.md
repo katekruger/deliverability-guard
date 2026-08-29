@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+
+- `ci.yml`: expanded from a single job to a Python 3.12/3.13 matrix, now
+  that the repo is public and Actions minutes aren't metered the way they
+  were while private.
+
 ## 0.1.0 - 2026-08-29
 
 ### Added

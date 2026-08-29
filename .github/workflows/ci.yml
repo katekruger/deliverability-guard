@@ -10,12 +10,17 @@ permissions:
   contents: read
 
 jobs:
-  # Single job while this repo is private — Actions minutes are metered on
-  # private repos. Expand to a real Python version matrix at go-public time;
-  # see docs/plans/going-public-checklist.md.
+  # A real Python version matrix. This was a single job while the repo was
+  # private, since Actions minutes are metered there; the repo is public
+  # now, so there's real value in catching a version-specific regression
+  # instead of only ever testing 3.12. See docs/plans/going-public-checklist.md.
   check:
     name: lint, format, types, tests
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -24,7 +29,7 @@ jobs:
       - uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
         with:
           enable-cache: true
-          python-version: "3.12"
+          python-version: ${{ matrix.python-version }}
 
       - name: Install dependencies
         run: uv sync --locked --all-groups
