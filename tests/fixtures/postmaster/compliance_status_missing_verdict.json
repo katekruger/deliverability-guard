@@ -1,0 +1,12 @@
+{
+  "name": "domains/example.com/complianceStatus",
+  "complianceData": {
+    "domainId": "example.com",
+    "deliverabilityStatusVerdict": {
+      "state": { "status": "COMPLIANT" }
+    },
+    "honorUnsubscribeVerdict": {
+      "status": { "status": "COMPLIANT" }
+    }
+  }
+}

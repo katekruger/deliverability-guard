@@ -58,6 +58,37 @@ def test_rejects_a_tighten_factor_out_of_range() -> None:
         tune_thresholds(recent_lower_bounds=[0.001], current=DEFAULT_LADDER, tighten_factor=0.0)
 
 
+# --- compliance_degraded -----------------------------------------------
+
+
+def test_compliance_degraded_tightens_even_with_no_recent_evidence() -> None:
+    """Unsubscribe-compliance verdicts needing work are a real risk factor
+    worth tightening over, even with no elevated posterior evidence yet."""
+    adjustment = tune_thresholds(
+        recent_lower_bounds=[], current=DEFAULT_LADDER, compliance_degraded=True
+    )
+    assert adjustment is not None
+    assert adjustment.new_thresholds.warn < DEFAULT_LADDER.warn
+    assert "compliance" in adjustment.reason.lower()
+
+
+def test_compliance_degraded_false_and_no_evidence_is_no_adjustment() -> None:
+    assert (
+        tune_thresholds(recent_lower_bounds=[], current=DEFAULT_LADDER, compliance_degraded=False)
+        is None
+    )
+
+
+def test_compliance_degraded_and_evidence_both_present_in_reason() -> None:
+    close_to_warn = DEFAULT_LADDER.warn * 0.95
+    adjustment = tune_thresholds(
+        recent_lower_bounds=[close_to_warn], current=DEFAULT_LADDER, compliance_degraded=True
+    )
+    assert adjustment is not None
+    assert "peaked" in adjustment.reason
+    assert "compliance" in adjustment.reason.lower()
+
+
 # --- The structural guarantee ---------------------------------------------
 
 

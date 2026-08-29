@@ -1,0 +1,28 @@
+{
+  "domainStats": [
+    {
+      "name": "domains/example.com/domainStats/aaa111",
+      "metric": "spam_rate",
+      "value": { "doubleValue": 0.0015 },
+      "date": { "year": 2026, "month": 8, "day": 1 }
+    },
+    {
+      "name": "domains/example.com/domainStats/bbb222",
+      "metric": "spam_rate",
+      "value": { "doubleValue": 0.0022 },
+      "date": { "year": 2026, "month": 8, "day": 3 }
+    },
+    {
+      "name": "domains/example.com/domainStats/ccc333",
+      "metric": "auth_success_rate",
+      "value": { "doubleValue": 0.998 },
+      "date": { "year": 2026, "month": 8, "day": 3 }
+    },
+    {
+      "name": "domains/example.com/domainStats/ddd444",
+      "metric": "delivery_error_count",
+      "value": { "intValue": "12" },
+      "date": { "year": 2026, "month": 8, "day": 3 }
+    }
+  ]
+}

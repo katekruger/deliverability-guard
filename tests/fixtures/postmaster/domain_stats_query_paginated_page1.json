@@ -1,0 +1,11 @@
+{
+  "domainStats": [
+    {
+      "name": "domains/example.com/domainStats/page1a",
+      "metric": "spam_rate",
+      "value": { "doubleValue": 0.0011 },
+      "date": { "year": 2026, "month": 8, "day": 1 }
+    }
+  ],
+  "nextPageToken": "2026-08-02/spam_rate"
+}

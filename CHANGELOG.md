@@ -48,3 +48,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `loops/slow.py`: threshold tuning, structurally unable to pause or
   throttle anything -- it has no parameter capable of it.
 - ADR 0003: never auto-resume a paused mailbox, and why.
+- `docs/postmaster-verdicts.md`: the Postmaster v2 verdict enums and reason
+  codes, verified against the live discovery document, and confirmation
+  that v2's `SPAM_RATE` dropped v1's confidence bounds -- a real regression,
+  documented rather than softened.
+- `signals/postmaster.py`: the Postmaster Tools v2 client --
+  `domainStats:query`/`batchQuery`, `getComplianceStatus`, and the
+  `create`/`getVerificationToken`/`verify` domain-onboarding flow. Gaps in
+  `domainStats:query` are never coerced to zero; a 401 mid-run triggers
+  exactly one token refresh and retry, never a crash; an unverified domain
+  raises a clear `DomainNotVerifiedError`.
+- `engine/breaker.py`: wired `getComplianceStatus` as a hard gate --
+  `compliance_gate_tripped` forces `PAUSE` regardless of volume, including
+  when `sends == 0`, since the compliance verdict isn't derived from
+  today's send volume at all. See `signals.postmaster.forces_hard_gate`.
+- `loops/slow.py`: now also tightens the ladder on `compliance_degraded`
+  (Google's unsubscribe-compliance verdicts needing work), staying
+  decoupled from `signals.postmaster`'s types on purpose so it never gains
+  a reason to import anything capability-bearing.
+- `identity/feedback_id.py`: the `campaign:segment:mailbox:tenant`
+  Feedback-ID scheme, a parser, and `check_coverage` for reporting partial
+  adoption as a percentage rather than silently under-attributing.
+- `identity/subdomain_advisor.py`: per-campaign-class subdomain
+  recommendations, honest that this is an operational requirement the tool
+  can advise on but not enforce.
+- `docs/limits.md`: the attribution problem -- Postmaster gives a
+  domain-day scalar, the sequencer gives per-message events, there is no
+  join key without the identity scheme above, and the identity scheme has
+  to be adopted before an incident, not after one.

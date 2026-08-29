@@ -197,6 +197,7 @@ def evaluate(
     now: datetime,
     confidence: float = 0.95,
     current_daily_limit: int | None = None,
+    compliance_gate_tripped: bool = False,
 ) -> BreakerEvaluation:
     """Evaluate one mailbox and, if warranted, attempt an action.
 
@@ -210,11 +211,47 @@ def evaluate(
     `dry_run` has no default: every call site must decide explicitly.
     AGENTS.md: no code path may pause or throttle a real mailbox without
     `dry_run=False` set on purpose.
+
+    `compliance_gate_tripped` is the hard gate from
+    `signals.postmaster.forces_hard_gate` (BUILD-PLAN.md §5): if Google's
+    own `getComplianceStatus` says a domain's deliverability verdict needs
+    work, that outranks any statistical inference from this function's own
+    posterior and forces PAUSE regardless of volume -- including when
+    `sends == 0`, since the compliance verdict is an account-level fact
+    Google is asserting independent of today's send volume, not something
+    derived from today's data at all.
     """
     if sends < 0:
         raise ValueError(f"sends must be >= 0, got {sends}")
     if not 0 <= complaints <= sends:
         raise ValueError(f"complaints must be between 0 and sends ({sends}), got {complaints}")
+
+    if compliance_gate_tripped:
+        posterior = update(prior, sends, complaints) if sends > 0 else None
+        lower_bound = posterior.lower_bound(confidence) if posterior is not None else None
+        action = _act(
+            driver,
+            mailbox,
+            Verdict.PAUSE,
+            state_store,
+            dry_run=dry_run,
+            current_daily_limit=current_daily_limit,
+        )
+        return BreakerEvaluation(
+            evaluated_at=now,
+            mailbox=mailbox,
+            sends=sends,
+            complaints=complaints,
+            data_state=DataState.OK if sends > 0 else DataState.INSUFFICIENT_DATA,
+            prior=prior,
+            posterior=posterior,
+            lower_bound=lower_bound,
+            confidence=confidence,
+            thresholds=thresholds,
+            verdict=Verdict.PAUSE,
+            dry_run=dry_run,
+            action=action,
+        )
 
     if sends == 0:
         return BreakerEvaluation(
