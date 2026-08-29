@@ -1,0 +1,23 @@
+{
+  "data": [
+    {
+      "email": "sender1@example.com",
+      "date": "2026-08-01",
+      "sent": 50,
+      "bounced": 1
+    },
+    {
+      "email": "sender2@example.com",
+      "date": "2026-08-01",
+      "sent": 0,
+      "bounced": 0,
+      "status": "disconnected"
+    },
+    {
+      "email": "sender3@example.com",
+      "date": "2026-08-01T23:30:00-07:00",
+      "sent": 120,
+      "bounced": 3
+    }
+  ]
+}

@@ -1,0 +1,9 @@
+{
+  "data": [
+    {
+      "email": "sender1@example.com",
+      "sent": 50,
+      "bounced": 1
+    }
+  ]
+}

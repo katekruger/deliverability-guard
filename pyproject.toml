@@ -79,8 +79,9 @@ ignore = [
 ]
 
 [tool.ruff.lint.per-file-ignores]
-# Test files may use asserts freely and construct fixtures with weaker names.
-"tests/**" = ["S101", "S105", "S106"]
+# Test files may use asserts freely, construct fixtures with weaker names,
+# and seed non-cryptographic RNGs deterministically for reproducible tests.
+"tests/**" = ["S101", "S105", "S106", "S311"]
 
 [tool.ruff.lint.isort]
 known-first-party = ["deliverability_guard"]
