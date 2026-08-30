@@ -32,10 +32,11 @@ driver is passed in -- never as a separate branch of logic in this module.
 False; only the driver object passed to the provider call differs.
 """
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
+from pathlib import Path
 
 from deliverability_guard.engine.posterior import (
     DEFAULT_MAX_POOLED_ESS,
@@ -121,9 +122,24 @@ class MailboxBreakerStatus(Enum):
     PAUSED = auto()
 
 
+class BreakerStateStoreLoadError(Exception):
+    """The persisted decision log exists but couldn't be read or parsed.
+
+    Raised instead of silently falling back to an empty (every-mailbox-
+    ACTIVE) store: `status_of` defaulting to ACTIVE for a mailbox with no
+    record is correct for a genuinely new mailbox, but wrong for one whose
+    state failed to load -- that could auto-resume a mailbox that was
+    actually PAUSED, which is exactly what ADR 0003 exists to prevent. See
+    `BreakerStateStore.from_log`.
+    """
+
+
 class BreakerStateStore:
-    """Tracks per-mailbox pause/throttle status, in memory, injectable for
-    tests.
+    """Tracks per-mailbox pause/throttle status, in memory by default, and
+    rebuildable from `audit.log`'s append-only decision log via `from_log`
+    so a process restart doesn't silently un-pause every paused mailbox
+    (ENG-5b: at HEAD, `_status` was in-memory only, and restarting the
+    process reset every mailbox to ACTIVE regardless of pause history).
 
     This is what makes a repeat PAUSE verdict idempotent (BUILD-PLAN.md §5:
     "breaker trips while a previous trip is still in flight -> idempotent,
@@ -138,8 +154,65 @@ class BreakerStateStore:
     0003: never auto-resume a paused mailbox.
     """
 
-    def __init__(self) -> None:
-        self._status: dict[MailboxRef, MailboxBreakerStatus] = {}
+    def __init__(self, initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None) -> None:
+        self._status: dict[MailboxRef, MailboxBreakerStatus] = dict(initial) if initial else {}
+
+    @classmethod
+    def from_log(cls, path: Path) -> "BreakerStateStore":
+        """Rebuild pause/throttle state by replaying `audit.log`'s decision
+        records in order, most-recent-wins per mailbox.
+
+        `path` not existing at all means there is genuinely no history yet
+        (a brand-new deployment) -- returns an empty store, where every
+        mailbox correctly defaults to ACTIVE. `path` existing but failing to
+        read or parse is a DIFFERENT situation and fails loudly with
+        `BreakerStateStoreLoadError` rather than returning that same empty
+        store, which would be indistinguishable from "no history" and could
+        silently un-pause a mailbox that the log actually says is PAUSED.
+
+        Known limitation: `resume_after_human_review` doesn't itself write a
+        decision record (it isn't a `BreakerEvaluation`), so a mailbox that
+        was resumed by a human and never evaluated again before a restart
+        will be rebuilt as PAUSED rather than ACTIVE. This is a real gap,
+        but an intentionally fail-safe one, consistent with ADR 0003: on
+        ambiguity, this class errs toward PAUSED, never toward ACTIVE.
+        """
+        # Imported here, not at module level, to avoid a circular import:
+        # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
+        # from this module.
+        import json
+
+        from deliverability_guard.audit.log import CorruptDecisionRecordError, read_records
+
+        if not path.exists():
+            return cls()
+        try:
+            records = read_records(path)
+        except (OSError, json.JSONDecodeError, CorruptDecisionRecordError) as exc:
+            raise BreakerStateStoreLoadError(
+                f"could not rebuild breaker state from {path}: {exc}"
+            ) from exc
+
+        status: dict[MailboxRef, MailboxBreakerStatus] = {}
+        for record in records:
+            mailbox = MailboxRef(provider=record.provider, mailbox_id=record.mailbox_id)
+            if record.verdict is Verdict.PAUSE:
+                status[mailbox] = (
+                    MailboxBreakerStatus.PAUSED
+                    if record.action_outcome is ActionOutcome.PERFORMED
+                    else MailboxBreakerStatus.ACTIVE
+                )
+            elif record.verdict is Verdict.THROTTLE:
+                status[mailbox] = (
+                    MailboxBreakerStatus.THROTTLED
+                    if record.action_outcome is ActionOutcome.PERFORMED
+                    else MailboxBreakerStatus.ACTIVE
+                )
+            # OK or WARN: notify-only or nothing happened -- leave whatever
+            # status this mailbox already had alone. In particular, a
+            # PAUSED mailbox reporting healthy-looking evidence later stays
+            # PAUSED; only `resume_after_human_review` can change that.
+        return cls(status)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)

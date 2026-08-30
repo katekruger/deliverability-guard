@@ -1,12 +1,15 @@
 """Tests for engine/breaker.py: the ladder, idempotent pause, and dry-run identity."""
 
 from datetime import UTC, datetime
+from pathlib import Path
 
 import pytest
 
+from deliverability_guard.audit.log import DecisionRecord, append_record
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
     BreakerStateStore,
+    BreakerStateStoreLoadError,
     MailboxBreakerStatus,
     ThresholdLadder,
     ThresholdStore,
@@ -697,3 +700,132 @@ def test_compliance_gate_is_idempotent_like_any_other_pause() -> None:
             compliance_gate_tripped=True,
         )
     assert driver.pause_calls == [_MAILBOX]
+
+
+# --- BreakerStateStore: rebuilding from the decision log (ENG-5b) ---------
+
+
+def test_state_store_rebuilds_paused_status_from_the_decision_log(tmp_path: Path) -> None:
+    """The reproduction: a fresh `BreakerStateStore()` (as a process restart
+    would create) must not un-pause a mailbox the log says was paused."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_rebuilds_throttled_status_from_the_decision_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+
+def test_state_store_rebuild_reverts_to_active_on_a_failed_pause_attempt(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver(pause_outcome=ActionOutcome.FAILED)
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_later_healthy_evaluations(
+    tmp_path: Path,
+) -> None:
+    """A paused mailbox that later reports near-zero, healthy-looking
+    evidence must NOT be read back as un-paused on rebuild -- ADR 0003's
+    guarantee (never auto-resume) has to survive a restart, not just an
+    in-process run."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    pause_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(pause_eval))
+
+    healthy_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=0,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(healthy_eval))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_from_log_with_no_file_yet_is_an_empty_active_store(tmp_path: Path) -> None:
+    """No log file at all is a genuinely new deployment -- every mailbox
+    correctly defaults to ACTIVE. This is the "no record" case, distinct
+    from "couldn't read the record" below."""
+    missing = tmp_path / "does-not-exist.jsonl"
+    store = BreakerStateStore.from_log(missing)
+    assert store.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_from_log_fails_closed_on_an_unreadable_log(tmp_path: Path) -> None:
+    """A log that EXISTS but can't be parsed must not silently produce an
+    empty (every-mailbox-ACTIVE) store -- that would be indistinguishable
+    from "no record" and could auto-resume a mailbox that was actually
+    PAUSED. Fail loudly instead."""
+    log_path = tmp_path / "decisions.jsonl"
+    log_path.write_text("not valid json\n")
+    with pytest.raises(BreakerStateStoreLoadError):
+        BreakerStateStore.from_log(log_path)

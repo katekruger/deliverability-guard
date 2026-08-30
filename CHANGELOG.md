@@ -18,6 +18,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verdict rather than the numeric limit, and a throttle that would drop
   below the floor now escalates to `PAUSE` instead of floor-clamping
   forever. See the ADR 0003 addendum.
+- **`engine/breaker.py`: `BreakerStateStore` was in-memory only, so a
+  process restart silently un-paused every paused mailbox** (audit finding
+  ENG-5b). `BreakerStateStore.from_log(path)` now rebuilds pause/throttle
+  state from `audit.log`'s append-only decision log; a log that exists but
+  can't be read or parsed now raises `BreakerStateStoreLoadError` instead
+  of silently falling back to an empty (every-mailbox-ACTIVE) store. See
+  the ADR 0003 addendum.
 - **`engine/posterior.py`: hierarchical pooling was complete pooling, not
   partial pooling, and could mask a genuinely breaching mailbox behind a
   large healthy peer group** (audit finding ENG-4). `pooled_prior` weighted

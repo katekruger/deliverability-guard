@@ -152,6 +152,43 @@ not a floor-clamped throttle -- this replaces an old assertion
 (`driver.throttle_calls == [("a@example.com", 1)]`) that encoded the exact
 bug this fixes.
 
+## Addendum (2026-08-30): the never-auto-resume guarantee didn't survive a process restart
+
+The same audit (ENG-5b) found that `BreakerStateStore` was in-memory only,
+with `status_of` defaulting any mailbox it had never seen to `ACTIVE`.
+Restarting the process therefore reset every previously-`PAUSED` mailbox
+back to `ACTIVE` with no human ever touching it -- this ADR's guarantee was
+enforced by process uptime alone, the weakest possible enforcement, and
+invisible in every test because no test had ever restarted the process.
+
+**Fix:** `BreakerStateStore.from_log(path)` rebuilds pause/throttle status
+by replaying `audit.log`'s append-only decision log in order. A log file
+that doesn't exist yet is genuinely "no history" (a new deployment) and
+correctly produces an empty, all-`ACTIVE` store. A log file that exists but
+can't be read or parsed is a *different* situation -- silently falling back
+to that same empty store would be indistinguishable from "no history" and
+could un-pause a mailbox the log actually says is `PAUSED`, so this now
+raises `BreakerStateStoreLoadError` instead of returning a store at all.
+
+**Known limitation, carried forward deliberately:** `resume_after_human_review`
+doesn't itself produce a decision record (it isn't a `BreakerEvaluation`),
+so a mailbox resumed by a human and never re-evaluated before a restart
+will rebuild as `PAUSED` rather than `ACTIVE`. This is a real gap, but an
+intentionally fail-safe one: on ambiguity, `from_log` errs toward `PAUSED`,
+never toward `ACTIVE`, which is the same asymmetry this ADR already argues
+for everywhere else. A future version should log resume events too (once
+the CLI's `resume` command exists to originate them) so this gap closes
+rather than being merely safe.
+
+### Confirmation
+
+`tests/test_breaker.py::test_state_store_rebuilds_paused_status_from_the_decision_log`
+is the restart reproduction: pause a mailbox, rebuild a fresh store from
+the same log, assert it's still `PAUSED`. Companion tests cover THROTTLED
+rebuild, a failed pause attempt correctly rebuilding as `ACTIVE`, a paused
+mailbox staying paused through later healthy-looking log entries, and the
+no-history-vs-unreadable-history distinction.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and
