@@ -32,11 +32,19 @@ driver is passed in -- never as a separate branch of logic in this module.
 False; only the driver object passed to the provider call differs.
 """
 
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
+from pathlib import Path
 
-from deliverability_guard.engine.posterior import BetaDistribution, update
+from deliverability_guard.engine.posterior import (
+    DEFAULT_MAX_POOLED_ESS,
+    BetaDistribution,
+    GroupObservation,
+    pooled_posterior,
+    update,
+)
 from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
@@ -109,29 +117,108 @@ def rung(lower_bound: float, thresholds: ThresholdLadder) -> Verdict:
 
 class MailboxBreakerStatus(Enum):
     ACTIVE = auto()
+    THROTTLED = auto()
     PAUSE_IN_FLIGHT = auto()
     PAUSED = auto()
 
 
+class BreakerStateStoreLoadError(Exception):
+    """The persisted decision log exists but couldn't be read or parsed.
+
+    Raised instead of silently falling back to an empty (every-mailbox-
+    ACTIVE) store: `status_of` defaulting to ACTIVE for a mailbox with no
+    record is correct for a genuinely new mailbox, but wrong for one whose
+    state failed to load -- that could auto-resume a mailbox that was
+    actually PAUSED, which is exactly what ADR 0003 exists to prevent. See
+    `BreakerStateStore.from_log`.
+    """
+
+
 class BreakerStateStore:
-    """Tracks per-mailbox pause status, in memory, injectable for tests.
+    """Tracks per-mailbox pause/throttle status, in memory by default, and
+    rebuildable from `audit.log`'s append-only decision log via `from_log`
+    so a process restart doesn't silently un-pause every paused mailbox
+    (ENG-5b: at HEAD, `_status` was in-memory only, and restarting the
+    process reset every mailbox to ACTIVE regardless of pause history).
 
     This is what makes a repeat PAUSE verdict idempotent (BUILD-PLAN.md §5:
     "breaker trips while a previous trip is still in flight -> idempotent,
-    no double-pause") and what lets a lost provider response get reconciled
-    on the next tick instead of either silently giving up or blindly
-    assuming success.
+    no double-pause"), what makes a repeat THROTTLE verdict idempotent
+    (ENG-5a: six identical THROTTLE evaluations must not compound into
+    50 -> 25 -> 12 -> 6 -> 3 -> 1), and what lets a lost provider response
+    get reconciled on the next tick instead of either silently giving up or
+    blindly assuming success.
 
     `resume_after_human_review` is the ONLY path back from PAUSED to ACTIVE
     in this entire class. Nothing in `evaluate()` below calls it. See ADR
     0003: never auto-resume a paused mailbox.
     """
 
-    def __init__(self) -> None:
-        self._status: dict[MailboxRef, MailboxBreakerStatus] = {}
+    def __init__(self, initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None) -> None:
+        self._status: dict[MailboxRef, MailboxBreakerStatus] = dict(initial) if initial else {}
+
+    @classmethod
+    def from_log(cls, path: Path) -> "BreakerStateStore":
+        """Rebuild pause/throttle state by replaying `audit.log`'s decision
+        records in order, most-recent-wins per mailbox.
+
+        `path` not existing at all means there is genuinely no history yet
+        (a brand-new deployment) -- returns an empty store, where every
+        mailbox correctly defaults to ACTIVE. `path` existing but failing to
+        read or parse is a DIFFERENT situation and fails loudly with
+        `BreakerStateStoreLoadError` rather than returning that same empty
+        store, which would be indistinguishable from "no history" and could
+        silently un-pause a mailbox that the log actually says is PAUSED.
+
+        Known limitation: `resume_after_human_review` doesn't itself write a
+        decision record (it isn't a `BreakerEvaluation`), so a mailbox that
+        was resumed by a human and never evaluated again before a restart
+        will be rebuilt as PAUSED rather than ACTIVE. This is a real gap,
+        but an intentionally fail-safe one, consistent with ADR 0003: on
+        ambiguity, this class errs toward PAUSED, never toward ACTIVE.
+        """
+        # Imported here, not at module level, to avoid a circular import:
+        # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
+        # from this module.
+        import json
+
+        from deliverability_guard.audit.log import CorruptDecisionRecordError, read_records
+
+        if not path.exists():
+            return cls()
+        try:
+            records = read_records(path)
+        except (OSError, json.JSONDecodeError, CorruptDecisionRecordError) as exc:
+            raise BreakerStateStoreLoadError(
+                f"could not rebuild breaker state from {path}: {exc}"
+            ) from exc
+
+        status: dict[MailboxRef, MailboxBreakerStatus] = {}
+        for record in records:
+            mailbox = MailboxRef(provider=record.provider, mailbox_id=record.mailbox_id)
+            if record.verdict is Verdict.PAUSE:
+                status[mailbox] = (
+                    MailboxBreakerStatus.PAUSED
+                    if record.action_outcome is ActionOutcome.PERFORMED
+                    else MailboxBreakerStatus.ACTIVE
+                )
+            elif record.verdict is Verdict.THROTTLE:
+                status[mailbox] = (
+                    MailboxBreakerStatus.THROTTLED
+                    if record.action_outcome is ActionOutcome.PERFORMED
+                    else MailboxBreakerStatus.ACTIVE
+                )
+            # OK or WARN: notify-only or nothing happened -- leave whatever
+            # status this mailbox already had alone. In particular, a
+            # PAUSED mailbox reporting healthy-looking evidence later stays
+            # PAUSED; only `resume_after_human_review` can change that.
+        return cls(status)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)
+
+    def mark_throttled(self, mailbox: MailboxRef) -> None:
+        self._status[mailbox] = MailboxBreakerStatus.THROTTLED
 
     def mark_pause_in_flight(self, mailbox: MailboxRef) -> None:
         self._status[mailbox] = MailboxBreakerStatus.PAUSE_IN_FLIGHT
@@ -198,8 +285,20 @@ def evaluate(
     confidence: float = 0.95,
     current_daily_limit: int | None = None,
     compliance_gate_tripped: bool = False,
+    peer_group: Iterable[GroupObservation] | None = None,
+    max_pooled_ess: float = DEFAULT_MAX_POOLED_ESS,
 ) -> BreakerEvaluation:
     """Evaluate one mailbox and, if warranted, attempt an action.
+
+    `peer_group` is the mailbox's OTHER same-domain (or same-tenant) members
+    -- leave-one-out, matching `engine.posterior.pooled_posterior`'s own
+    contract. When given, the posterior is computed via hierarchical partial
+    pooling instead of this mailbox's own data alone: a mailbox with little
+    of its own evidence borrows strength from a healthy or unhealthy peer
+    group, capped at `max_pooled_ess` so a large peer group can never dilute
+    a mailbox with enough of its own evidence into looking healthy (ADR
+    0002). `None` (the default) reproduces the flat, non-pooled posterior
+    every caller used before this parameter existed.
 
     `thresholds` must be a value already snapshotted by the caller (e.g.
     `ThresholdStore.current` read once before calling) -- this function
@@ -227,7 +326,11 @@ def evaluate(
         raise ValueError(f"complaints must be between 0 and sends ({sends}), got {complaints}")
 
     if compliance_gate_tripped:
-        posterior = update(prior, sends, complaints) if sends > 0 else None
+        posterior = (
+            _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
+            if sends > 0
+            else None
+        )
         lower_bound = posterior.lower_bound(confidence) if posterior is not None else None
         action = _act(
             driver,
@@ -270,9 +373,20 @@ def evaluate(
             action=None,
         )
 
-    posterior = update(prior, sends, complaints)
+    posterior = _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
     lower_bound = posterior.lower_bound(confidence)
     verdict = rung(lower_bound, thresholds)
+
+    if (
+        verdict is Verdict.THROTTLE
+        and current_daily_limit is not None
+        and current_daily_limit // 2 < _MIN_THROTTLED_DAILY_LIMIT
+    ):
+        # Escalate: a throttle that would floor-clamp is a pause wearing a
+        # different hat (see `_MIN_THROTTLED_DAILY_LIMIT`'s docstring). Route
+        # it through PAUSE -- and therefore through the human-review gate
+        # (ADR 0003) -- instead of silently clamping at the floor forever.
+        verdict = Verdict.PAUSE
 
     action: ActionResult | None = None
     if verdict in (Verdict.THROTTLE, Verdict.PAUSE):
@@ -302,6 +416,23 @@ def evaluate(
     )
 
 
+def _posterior_for(
+    prior: BetaDistribution,
+    sends: int,
+    complaints: int,
+    peer_group: Iterable[GroupObservation] | None,
+    max_pooled_ess: float,
+) -> BetaDistribution:
+    """Flat `update()` when there's no peer group; hierarchical partial
+    pooling (`engine.posterior.pooled_posterior`) when there is. See
+    `evaluate`'s `peer_group` parameter and ADR 0002."""
+    if peer_group is None:
+        return update(prior, sends, complaints)
+    return pooled_posterior(
+        prior, peer_group, own_sends=sends, own_complaints=complaints, max_ess=max_pooled_ess
+    )
+
+
 def _act(
     driver: ProviderDriver,
     mailbox: MailboxRef,
@@ -314,6 +445,17 @@ def _act(
     effective_driver: ProviderDriver = DryRunDriver(inner=driver) if dry_run else driver
 
     if verdict is Verdict.THROTTLE:
+        if state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
+            # Idempotent, keyed on the VERDICT, not the limit (ENG-5a): a
+            # mailbox already throttled for this same verdict is a no-op --
+            # otherwise every repeat evaluation halves the limit again
+            # (50 -> 25 -> 12 -> ...) until it silently becomes a pause with
+            # no human ever seeing it happen.
+            return ActionResult(
+                outcome=ActionOutcome.PERFORMED,
+                detail="mailbox already throttled at this verdict; no action taken (idempotent)",
+                capability=Capability.THROTTLE,
+            )
         if current_daily_limit is None:
             return ActionResult(
                 outcome=ActionOutcome.UNSUPPORTED,
@@ -324,7 +466,10 @@ def _act(
                 capability=Capability.THROTTLE,
             )
         new_limit = max(_MIN_THROTTLED_DAILY_LIMIT, current_daily_limit // 2)
-        return effective_driver.throttle(mailbox.mailbox_id, new_limit)
+        result = effective_driver.throttle(mailbox.mailbox_id, new_limit)
+        if result.outcome is ActionOutcome.PERFORMED:
+            state_store.mark_throttled(mailbox)
+        return result
 
     # PAUSE.
     status = state_store.status_of(mailbox)
