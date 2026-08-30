@@ -105,7 +105,7 @@ Capability declaration is the whole design of the provider driver interface (`pr
 | Outreach | Researched, not yet implemented | yes | likely (unverified) | likely (unverified) | best-in-class |
 | Salesloft | Researched, not yet implemented | yes | **likely UI-only** — no API | ❌ | unverified |
 | Amplemarket | Researched, not yet implemented | ❌ | **no status-change API at all** — app-only | ❌ | ❌ |
-| Amazon SES | Researched, not yet implemented | via CloudWatch | account-level (config set) | via config set | via SNS |
+| **Amazon SES** | ✅ Implemented (read + pause; see [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)) | CloudWatch `Send`/`Bounce` metrics | ✅ configuration set or whole account | ❌ no daily-volume primitive | not implemented (SNS ingestion is separate infra) |
 | Postmark | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 | SendGrid | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 
