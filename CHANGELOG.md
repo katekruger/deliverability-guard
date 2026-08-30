@@ -36,6 +36,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unverified. Endpoint shapes are hand-authored from public documentation
   (no live lemlist account in this environment), same caveat as
   `providers/instantly.py` -- see `tests/fixtures/lemlist/README.md`.
+- **`providers/apollo.py`: the Apollo driver** (BUILD-PLAN.md §3 v0.3).
+  `READ_STATS` per campaign (Apollo has no global per-mailbox feed, like
+  Smartlead and lemlist); `PAUSE` at campaign granularity only via
+  Apollo's own named `/abort` endpoint, since Apollo's per-mailbox
+  pause/throttle capability is "list only" (`list_email_accounts()`
+  enumerates connected mailboxes but cannot act on one individually).
+  `activate_campaign`'s resume semantics are explicitly flagged as
+  unverified in both the docstring and its `ActionResult.detail`, per
+  BUILD-PLAN.md's own caveat -- confirm it restores prior sequence state
+  before relying on it. `THROTTLE`/`WEBHOOKS` are not claimed: no
+  daily-limit endpoint exists, and Apollo's webhook support is polling
+  only. Endpoint shapes are hand-authored from public documentation, same
+  caveat as `providers/instantly.py` -- see
+  `tests/fixtures/apollo/README.md`.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
