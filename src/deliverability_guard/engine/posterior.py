@@ -20,6 +20,11 @@ trip the breaker on the LOWER BOUND of a one-sided credible interval crossing
 the threshold -- i.e. only when the data supports real confidence that the
 true rate is that high, not merely that a single unlucky (or lucky) draw
 landed there.
+
+STATUS (August 2026): the pooling implemented in this module is complete
+pooling weighted by raw volume, not the partial pooling ADR 0002 describes,
+and it is not called from breaker.evaluate(). Every production verdict comes
+from the flat per-mailbox posterior described in ADR 0001. See ENG-4.
 """
 
 from collections.abc import Iterable
@@ -257,6 +262,12 @@ def pooled_posterior(
     every group at once (which would need MCMC or variational inference to
     fit). See ADR 0002 for why that tradeoff is the right one here, and what
     it does and doesn't assume.
+
+    STATUS (August 2026): despite the name, what this implements is complete
+    pooling weighted by raw volume, not the partial pooling described above. A
+    mailbox with 5,000 sends does not dominate the aggregate: against 99 peers
+    it contributes roughly 1 percent of its own posterior. This function is
+    also not called from breaker.evaluate(). See ADR 0002 and ENG-4.
     """
     group_posterior = pooled_prior(prior, other_members, max_ess=max_ess)
     return update(group_posterior, own_sends, own_complaints)
