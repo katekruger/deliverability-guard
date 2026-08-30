@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cli.py`, `config.py`: a real running system** (audit finding ENG-6).
+  `deliverability-guard check` is the single-shot form of the fast loop —
+  the minimum viable thing a user can put in cron: it loads
+  `config/thresholds.yml` (which no code previously read, despite `pyyaml`
+  being a declared runtime dependency and the README's quickstart telling
+  users to `cp` it into place), pulls each mailbox's stats from the
+  configured provider, evaluates every mailbox through
+  `engine.breaker.evaluate`, appends a decision record per mailbox, and
+  exits non-zero if any mailbox's verdict isn't OK. `status <mailbox>`
+  prints current breaker state; `resume <mailbox>` is the only way a
+  paused mailbox becomes active again (ADR 0003). Provider credentials are
+  read from the environment, never the YAML config. `[project.scripts]`
+  now registers a real `deliverability-guard` entry point. The full
+  always-running two-loop daemon controller (BUILD-PLAN.md §5) is still
+  future work; `check` is its cron-friendly single-shot equivalent.
+
 ### Fixed
 
 - **`engine/breaker.py`: THROTTLE was not idempotent and could reach a

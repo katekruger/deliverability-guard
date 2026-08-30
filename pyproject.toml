@@ -25,8 +25,8 @@ dependencies = ["httpx>=0.28", "pyyaml>=6.0", "scipy>=1.14"]
 Repository = "https://github.com/katekruger/deliverability-guard"
 Changelog = "https://github.com/katekruger/deliverability-guard/blob/main/CHANGELOG.md"
 
-# [project.scripts] lands once cli.py implements a real entry point — an
-# empty stub would register a command that fails on invocation.
+[project.scripts]
+deliverability-guard = "deliverability_guard.cli:main"
 
 [tool.hatch.version]
 path = "src/deliverability_guard/__init__.py"

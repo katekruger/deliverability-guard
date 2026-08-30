@@ -46,3 +46,14 @@ prior:
 # pause or throttle a real mailbox must be off unless explicitly enabled.
 # See AGENTS.md.
 dry_run: true
+
+# Which provider driver `deliverability-guard check` uses. Credentials for
+# it come from the environment (.env), never from this file -- see
+# AGENTS.md's "no secrets in the repo, ever."
+provider: instantly
+
+# Where the append-only decision log lives (audit/log.py). `check` appends
+# one record per mailbox per run; `status`/`resume` rebuild breaker state
+# from this file, so it must persist across restarts -- back it up like you
+# would any other state.
+decision_log_path: var/decisions.jsonl
