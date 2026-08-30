@@ -87,6 +87,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   genuinely heavy (~15MB) addition. Tests use hand-defined `Protocol`
   fakes for the SESv2/CloudWatch clients -- no `moto`, no live AWS
   account, no network call of any kind.
+- **`signals/dmarc.py`: DMARC aggregate-report auth-health signal, built
+  on `parsedmarc`** (BUILD-PLAN.md §4 item #17 -- "Reuse as a library. Do
+  not reimplement."). `summarize_auth_health` aggregates parsedmarc's own
+  parsed-report dicts (this module never parses raw DMARC XML itself)
+  into total/aligned message counts and a ranked list of unauthenticated
+  `UnknownSource`s -- sources failing BOTH SPF and DKIM alignment (RFC
+  9989 §3: DMARC passes on either, not both). Zero reports is
+  `INSUFFICIENT_DATA`, never a 0%- or 100%-aligned rate. A malformed
+  report (missing `records`/`alignment`/`source`, a non-integer `count`)
+  raises `MalformedDmarcReportError` rather than silently skipping or
+  defaulting -- same missing-data discipline as everywhere else in this
+  project. Explicitly a slow-loop, cross-provider signal, never a
+  real-time one, and carries no complaint or inbox-placement data at all.
+
+  Adds `parsedmarc` as a runtime dependency, justified in [ADR
+  0006](docs/decisions/0006-parsedmarc-dependency-for-dmarc-auth-health.md)
+  -- BUILD-PLAN.md's own research already concluded this shouldn't be
+  reimplemented; the ADR discloses the ~20-transitive-package weight this
+  adds. `tests/test_dmarc.py` includes a real integration test against
+  `parsedmarc.parse_aggregate_report_xml(..., offline=True)` (no network
+  call) that caught a real gap in the initial implementation: offline
+  parsing leaves `source.base_domain` unset, which is why
+  `_source_identifier` falls back to the raw IP address.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
