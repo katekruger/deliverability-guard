@@ -1,17 +1,25 @@
 """Tests for loops/fast.py, including the end-to-end webhook -> evaluation
 -> throttle path in dry-run required by Prompt 3's definition of done."""
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from deliverability_guard.engine.breaker import DEFAULT_LADDER, BreakerStateStore, Verdict
 from deliverability_guard.engine.changepoint import CusumState
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
 from deliverability_guard.loops.fast import (
     FastLoopSignal,
+    aggregate_mailbox_stats,
+    evaluate_all_mailboxes,
     evaluate_signal,
     evaluate_signal_with_trend,
 )
-from deliverability_guard.providers.base import MailboxRef, WebhookEvent, WebhookLedger
+from deliverability_guard.providers.base import (
+    MailboxDayStats,
+    MailboxRef,
+    MailboxStatus,
+    WebhookEvent,
+    WebhookLedger,
+)
 from fixtures.fake_driver import FakeDriver
 
 _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -203,3 +211,92 @@ def test_evaluate_signal_with_trend_skips_cusum_on_a_redelivered_event() -> None
     assert evaluation is None
     assert trend.alarmed is False
     assert trend.state.cumulative == 0.0
+
+
+# --- aggregate_mailbox_stats / evaluate_all_mailboxes ---------------------
+#
+# Factored out of cli.cmd_check so the one-shot `check` command and the
+# continuous daemon (loops/controller.py) share one aggregation-and-
+# evaluation path and cannot drift apart from each other.
+
+
+def test_aggregate_sums_sends_and_bounces_per_mailbox() -> None:
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    totals = aggregate_mailbox_stats(
+        [
+            MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 30), sends=2500, bounces=20),
+            MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 31), sends=2500, bounces=20),
+        ]
+    )
+    assert len(totals) == 1
+    assert totals[0].mailbox == mailbox
+    assert totals[0].sends == 5000
+    assert totals[0].complaints == 40
+
+
+def test_aggregate_excludes_disconnected_days() -> None:
+    """A DISCONNECTED day is an outage, not evidence -- see
+    providers.base.MailboxStatus. It must not be folded into the aggregate
+    as 0 sends/0 bounces."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    totals = aggregate_mailbox_stats(
+        [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=0,
+                bounces=0,
+                status=MailboxStatus.DISCONNECTED,
+            )
+        ]
+    )
+    assert totals == []
+
+
+def test_aggregate_sorts_by_mailbox_id_for_stable_output() -> None:
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    totals = aggregate_mailbox_stats(
+        [
+            MailboxDayStats(mailbox=mailbox_b, day=date(2025, 12, 31), sends=1, bounces=0),
+            MailboxDayStats(mailbox=mailbox_a, day=date(2025, 12, 31), sends=1, bounces=0),
+        ]
+    )
+    assert [t.mailbox for t in totals] == [mailbox_a, mailbox_b]
+
+
+def test_evaluate_all_mailboxes_evaluates_every_mailbox_the_driver_reports() -> None:
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(
+        stats_to_return=[
+            MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 31), sends=5000, bounces=0)
+        ]
+    )
+
+    results = evaluate_all_mailboxes(
+        driver=driver,
+        since=date(2025, 12, 31),
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+
+    assert len(results) == 1
+    assert results[0].mailbox == mailbox
+    assert results[0].verdict == Verdict.OK
+
+
+def test_evaluate_all_mailboxes_with_no_stats_is_an_empty_list() -> None:
+    driver = FakeDriver(stats_to_return=[])
+    results = evaluate_all_mailboxes(
+        driver=driver,
+        since=date(2025, 12, 31),
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert results == []

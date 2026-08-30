@@ -16,8 +16,9 @@ the mailbox's current cumulative counts, e.g. from a running tally kept
 elsewhere as webhooks arrive.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 
 from deliverability_guard.engine.breaker import (
     BreakerEvaluation,
@@ -28,7 +29,9 @@ from deliverability_guard.engine.breaker import (
 from deliverability_guard.engine.changepoint import CusumResult, CusumState, cusum_step
 from deliverability_guard.engine.posterior import BetaDistribution
 from deliverability_guard.providers.base import (
+    MailboxDayStats,
     MailboxRef,
+    MailboxStatus,
     ProviderDriver,
     WebhookEvent,
     WebhookLedger,
@@ -139,3 +142,69 @@ def evaluate_signal_with_trend(
         threshold=threshold,
     )
     return evaluation, trend
+
+
+@dataclass(frozen=True, slots=True)
+class MailboxTotals:
+    """One mailbox's summed sends/complaints over an aggregation window."""
+
+    mailbox: MailboxRef
+    sends: int
+    complaints: int
+
+
+def aggregate_mailbox_stats(day_stats: Iterable[MailboxDayStats]) -> list[MailboxTotals]:
+    """Sum sends/bounces per mailbox across a driver's daily stats.
+
+    A `DISCONNECTED` day is an outage, not evidence (see
+    `providers.base.MailboxStatus`), and is excluded from the aggregate
+    entirely rather than folded in as 0 sends/0 bounces -- the same
+    missing-data-as-zero coercion AGENTS.md prohibits everywhere else in
+    this project. Returned sorted by mailbox id for stable, diffable
+    output regardless of the order a driver happens to report stats in.
+    """
+    totals: dict[MailboxRef, tuple[int, int]] = {}
+    for stat in day_stats:
+        if stat.status is MailboxStatus.DISCONNECTED:
+            continue
+        prior_sends, prior_complaints = totals.get(stat.mailbox, (0, 0))
+        totals[stat.mailbox] = (prior_sends + stat.sends, prior_complaints + stat.bounces)
+    return [
+        MailboxTotals(mailbox=mailbox, sends=sends, complaints=complaints)
+        for mailbox, (sends, complaints) in sorted(totals.items(), key=lambda kv: kv[0].mailbox_id)
+    ]
+
+
+def evaluate_all_mailboxes(
+    *,
+    driver: ProviderDriver,
+    since: date,
+    prior: BetaDistribution,
+    thresholds: ThresholdLadder,
+    state_store: BreakerStateStore,
+    dry_run: bool,
+    now: datetime,
+) -> list[BreakerEvaluation]:
+    """Pull every mailbox's stats since `since`, aggregate, and evaluate
+    each one through the breaker.
+
+    This is the shared pull-based evaluation path used by both `cli.cmd_check`
+    (one-shot) and `loops.controller`'s fast tick (continuous polling), so
+    the two cannot drift apart from each other the way a hand-duplicated
+    aggregation loop in each caller eventually would.
+    """
+    totals = aggregate_mailbox_stats(driver.read_mailbox_stats(since))
+    return [
+        evaluate(
+            driver=driver,
+            mailbox=total.mailbox,
+            sends=total.sends,
+            complaints=total.complaints,
+            prior=prior,
+            thresholds=thresholds,
+            state_store=state_store,
+            dry_run=dry_run,
+            now=now,
+        )
+        for total in totals
+    ]

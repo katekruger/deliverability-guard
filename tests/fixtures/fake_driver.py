@@ -30,6 +30,10 @@ def _no_throttle_calls() -> list[tuple[str, int]]:
     return []
 
 
+def _no_read_calls() -> list[date]:
+    return []
+
+
 @dataclass
 class FakeDriver:
     name: str = "fake"
@@ -41,8 +45,10 @@ class FakeDriver:
 
     pause_calls: list[MailboxRef | CampaignRef] = field(default_factory=_no_pause_calls)
     throttle_calls: list[tuple[str, int]] = field(default_factory=_no_throttle_calls)
+    read_calls: list[date] = field(default_factory=_no_read_calls)
 
     def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        self.read_calls.append(since)
         return self.stats_to_return
 
     def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:

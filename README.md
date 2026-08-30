@@ -4,7 +4,7 @@
 [![PyPI](https://img.shields.io/pypi/v/deliverability-guard.svg)](https://pypi.org/project/deliverability-guard/)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 
-A sending circuit breaker for outbound email — it evaluates reputation, bounce and complaint signals per mailbox (run it on a schedule via `deliverability-guard check` and it watches continuously) and throttles or pauses before a domain burns, and it refuses to trip on statistically meaningless data.
+A sending circuit breaker for outbound email — it watches reputation, bounce and complaint signals per mailbox and throttles or pauses before a domain burns, and it refuses to trip on statistically meaningless data. Run `deliverability-guard run` to watch continuously, or `check` on a cron schedule for the same evaluation one-shot.
 
 ## The honest limits
 
@@ -45,7 +45,17 @@ cp config/thresholds.example.yml config/thresholds.yml
 uv run deliverability-guard check                # evaluate every mailbox once, print verdicts
 ```
 
-`check` is the single-shot form of the fast loop — the smallest thing you can put in cron to get a running system, not just a library. It reads `config/thresholds.yml`, pulls each mailbox's stats from the provider named there, evaluates every one through the exact same `engine.breaker.evaluate` shown below, appends a decision record per mailbox to the decision log, and exits non-zero if any mailbox's verdict isn't `OK` — so a cron job's failure alerting just works. `status <mailbox>` prints a mailbox's current breaker state, and `resume <mailbox>` is the only way a paused mailbox becomes active again (see [ADR 0003](docs/decisions/0003-never-auto-resume-after-pause.md) — there is no automatic path back from `PAUSED`).
+`check` is the single-shot form of the fast loop — the smallest thing you can put in cron to get a running system, not just a library. It reads `config/thresholds.yml`, pulls each mailbox's stats from the provider named there, evaluates every one through the exact same `engine.breaker.evaluate` shown below, appends a decision record per mailbox to the decision log, and exits non-zero if any mailbox's verdict isn't `OK` — so a cron job's failure alerting just works.
+
+`run` is the always-on form: the same evaluation, on a loop, forever (Ctrl-C to stop).
+
+```bash
+uv run deliverability-guard run                  # watches continuously until stopped
+```
+
+Every `fast_interval_seconds` (default 300 = 5 minutes) it re-pulls stats and re-evaluates every mailbox, exactly like `check` — they share one code path (`loops.fast.evaluate_all_mailboxes`), so the two can't drift apart. Every `slow_interval_seconds` (default 86400 = 24h) it looks at its own recent evidence and tightens the ladder if the last several evaluations have been creeping toward `warn` without crossing it — the same "your thresholds were too loose for the last few days" logic BUILD-PLAN.md §5 describes, sourced from the daemon's own history rather than a live Postmaster feed. See [ADR 0004](docs/decisions/0004-polling-daemon-and-self-sourced-slow-loop-evidence.md) for exactly what this does and doesn't implement yet — most importantly, this polls on an interval rather than receiving pushed webhooks.
+
+`status <mailbox>` prints a mailbox's current breaker state, and `resume <mailbox>` is the only way a paused mailbox becomes active again (see [ADR 0003](docs/decisions/0003-never-auto-resume-after-pause.md) — there is no automatic path back from `PAUSED`, whether it was `check` or `run` that paused it).
 
 ```bash
 uv run deliverability-guard status sender@yourdomain.com
@@ -80,7 +90,7 @@ result = evaluate(
 print(result.verdict)  # Verdict.OK -- one complaint in 50 sends isn't evidence of anything yet
 ```
 
-The always-running two-loop daemon controller described in [`BUILD-PLAN.md`](BUILD-PLAN.md) §5 isn't built yet — `check` is its single-shot equivalent, sufficient for a cron-based deployment today. The full public surface is the CLI (`cli.py`) plus the `engine`, `providers`, `signals`, and `identity` modules directly; `examples/demo.py` is the fastest way to see the engine run without any provider credentials at all.
+The full public surface is the CLI (`cli.py`) plus the `engine`, `providers`, `signals`, and `identity` modules directly; `examples/demo.py` is the fastest way to see the engine run without any provider credentials at all.
 
 ## Provider capability matrix
 

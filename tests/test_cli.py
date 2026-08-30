@@ -10,7 +10,7 @@ definition of done for this item.
 
 import io
 from collections.abc import Mapping
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
 import pytest
@@ -23,11 +23,17 @@ from deliverability_guard.cli import (
     build_parser,
     cmd_check,
     cmd_resume,
+    cmd_run,
     cmd_status,
     main,
 )
 from deliverability_guard.config import load_config
-from deliverability_guard.engine.breaker import BreakerStateStore, MailboxBreakerStatus, Verdict
+from deliverability_guard.engine.breaker import (
+    BreakerStateStore,
+    MailboxBreakerStatus,
+    ThresholdStore,
+    Verdict,
+)
 from deliverability_guard.providers.base import MailboxDayStats, MailboxRef, MailboxStatus
 from fixtures.fake_driver import FakeDriver
 
@@ -311,5 +317,147 @@ def test_main_check_end_to_end_with_a_fake_driver(
 
     config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
     exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
+
+
+# --- run: the always-on two-loop daemon -----------------------------------
+
+
+class _FakeClock:
+    """Same shape as loops/test_controller.py's clock: `sleep` advances the
+    clock instead of actually sleeping, so a daemon test never waits."""
+
+    def __init__(self, start: datetime) -> None:
+        self.current = start
+
+    def now(self) -> datetime:
+        return self.current
+
+    def sleep(self, seconds: float) -> None:
+        self.current += timedelta(seconds=seconds)
+
+
+def test_cmd_run_ticks_the_daemon_and_appends_decision_records(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    config_path = _config(tmp_path, decision_log=str(log_path))
+    config = load_config(config_path)
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+    clock = _FakeClock(_NOW)
+    out = io.StringIO()
+
+    exit_code = cmd_run(
+        driver=driver,
+        config=config,
+        state_store=BreakerStateStore(),
+        threshold_store=ThresholdStore(config.thresholds),
+        now=clock.now,
+        sleep=clock.sleep,
+        out=out,
+        max_ticks=3,
+    )
+
+    assert exit_code == 0
+    assert len(driver.read_calls) == 3
+    assert "[fast] a@example.com: OK" in out.getvalue()
+    records = read_records(log_path)
+    assert len(records) == 3
+
+
+def test_cmd_run_prints_slow_tick_adjustments(tmp_path: Path) -> None:
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    config = load_config(config_path)
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    # 15 complaints in 20,000 sends sits just under `warn` without crossing
+    # it -- the same "close to warn" evidence used in test_controller.py.
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 20_000, 15)])
+    clock = _FakeClock(_NOW)
+    out = io.StringIO()
+
+    cmd_run(
+        driver=driver,
+        config=config,
+        state_store=BreakerStateStore(),
+        threshold_store=ThresholdStore(config.thresholds),
+        now=clock.now,
+        sleep=clock.sleep,
+        out=out,
+        max_ticks=1,
+    )
+
+    # A single tick can't cross the (24h default) slow interval, so no
+    # adjustment is expected here -- this just proves cmd_run wires the
+    # slow-tick callback at all, exercised properly in test_controller.py.
+    assert "[slow]" not in out.getvalue()
+
+
+def test_cmd_run_prints_slow_tick_adjustments_once_the_interval_elapses(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nfast_interval_seconds: 3600\nslow_interval_seconds: 21600\n"
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+    config = load_config(config_path)
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 20_000, 15)])
+    clock = _FakeClock(_NOW)
+    out = io.StringIO()
+
+    cmd_run(
+        driver=driver,
+        config=config,
+        state_store=BreakerStateStore(),
+        threshold_store=ThresholdStore(config.thresholds),
+        now=clock.now,
+        sleep=clock.sleep,
+        out=out,
+        max_ticks=8,  # 8 hours of simulated uptime -> the slow loop must run
+    )
+
+    assert "[slow] tightened thresholds:" in out.getvalue()
+
+
+def test_main_run_end_to_end_with_a_fake_driver(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    fake_driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return fake_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    def _no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module.time, "sleep", _no_sleep)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "2"])
+
+    assert exit_code == 0
+    assert len(fake_driver.read_calls) == 2
+
+
+def test_main_run_reports_an_unknown_provider_cleanly(tmp_path: Path) -> None:
+    text = _VALID_YAML.replace("provider: fake", "provider: not-a-real-provider")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+    assert exit_code == 2
+
+
+def test_main_run_handles_keyboard_interrupt_cleanly(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return FakeDriver()
+
+    def _raise_keyboard_interrupt(*args: object, **kwargs: object) -> None:
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    monkeypatch.setattr(cli_module.controller, "run", _raise_keyboard_interrupt)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "run"])
 
     assert exit_code == 0

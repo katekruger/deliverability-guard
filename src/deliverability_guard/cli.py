@@ -1,24 +1,24 @@
 """Command-line entry point.
 
-BUILD-PLAN.md §10 describes the intended shape; this module ships the
-minimum viable slice of it (audit finding ENG-6): `check` is the
-single-shot form of the fast loop and the smallest thing a user can put in
-cron to get a real, running system rather than a library nobody invokes.
-`status` and `resume` are the read and human-review-gate paths (ADR 0003)
--- `resume` is the ONLY way a paused mailbox becomes callable again.
+BUILD-PLAN.md §10 describes the intended shape. `check` is the single-shot
+form of the fast loop -- the smallest thing a user can put in cron to get a
+real, running system rather than a library nobody invokes. `run` is the
+full always-on form: the two-loop daemon (`loops/controller.py`) running
+until stopped. `status` and `resume` are the read and human-review-gate
+paths (ADR 0003) -- `resume` is the ONLY way a paused mailbox becomes
+callable again.
 
 Provider credentials are read from the environment (`AGENTS.md`: no
 secrets in the repo, ever) -- never from the YAML config `config.py` loads.
-The full two-loop daemon controller (`loops/fast.py`, `loops/slow.py`, run
-continuously) is out of scope for this slice; `check` deliberately reuses
-`loops.fast`'s underlying `engine.breaker.evaluate` so the eventual daemon
-and this command cannot drift apart.
+`check` and `run`'s fast tick both call `loops.fast.evaluate_all_mailboxes`,
+so the one-shot and continuous forms cannot drift apart from each other.
 """
 
 import argparse
 import os
 import sys
-from collections.abc import Mapping, Sequence
+import time
+from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
@@ -26,13 +26,17 @@ from typing import TextIO
 from deliverability_guard.audit.log import DecisionRecord, append_record
 from deliverability_guard.config import AppConfig, ConfigError, load_config
 from deliverability_guard.engine.breaker import (
+    BreakerEvaluation,
     BreakerStateStore,
     BreakerStateStoreLoadError,
     MailboxBreakerStatus,
+    ThresholdStore,
     Verdict,
-    evaluate,
 )
-from deliverability_guard.providers.base import MailboxRef, MailboxStatus, ProviderDriver
+from deliverability_guard.loops import controller
+from deliverability_guard.loops.fast import evaluate_all_mailboxes
+from deliverability_guard.loops.slow import ThresholdAdjustment
+from deliverability_guard.providers.base import MailboxRef, ProviderDriver
 from deliverability_guard.providers.instantly import InstantlyDriver
 
 _DEFAULT_CONFIG_PATH = Path("config/thresholds.yml")
@@ -77,47 +81,88 @@ def cmd_check(
     any mailbox's verdict is not OK -- WARN included, since "notify only"
     is still something a cron job's caller should see, not silently absorb.
 
-    Aggregates each mailbox's stats over the last day. A `DISCONNECTED` day
-    (see `providers.base.MailboxStatus`) is an outage, not evidence, and is
-    excluded from the aggregate entirely rather than folded in as 0
-    sends/0 bounces -- the same missing-data-as-zero coercion AGENTS.md
-    prohibits everywhere else in this project.
+    Aggregates each mailbox's stats over the last day via
+    `loops.fast.evaluate_all_mailboxes` -- the same aggregation-and-
+    evaluation path `loops.controller`'s fast tick uses, so this command
+    and the continuous daemon cannot drift apart from each other.
     """
     since = now.date() - timedelta(days=1)
-    day_stats = driver.read_mailbox_stats(since)
+    results = evaluate_all_mailboxes(
+        driver=driver,
+        since=since,
+        prior=config.prior,
+        thresholds=config.thresholds,
+        state_store=state_store,
+        dry_run=config.dry_run,
+        now=now,
+    )
 
-    totals: dict[MailboxRef, tuple[int, int]] = {}
-    for stat in day_stats:
-        if stat.status is MailboxStatus.DISCONNECTED:
-            continue
-        prior_sends, prior_complaints = totals.get(stat.mailbox, (0, 0))
-        totals[stat.mailbox] = (prior_sends + stat.sends, prior_complaints + stat.bounces)
-
-    if not totals:
+    if not results:
         print("no mailboxes reported any stats", file=out)
         return _EXIT_OK
 
     exit_code = _EXIT_OK
-    for mailbox, (sends, complaints) in sorted(totals.items(), key=lambda kv: kv[0].mailbox_id):
-        result = evaluate(
-            driver=driver,
-            mailbox=mailbox,
-            sends=sends,
-            complaints=complaints,
-            prior=config.prior,
-            thresholds=config.thresholds,
-            state_store=state_store,
-            dry_run=config.dry_run,
-            now=now,
-        )
+    for result in results:
         append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
         print(
-            f"{mailbox.mailbox_id}: {result.verdict.name} (sends={sends}, complaints={complaints})",
+            f"{result.mailbox.mailbox_id}: {result.verdict.name} "
+            f"(sends={result.sends}, complaints={result.complaints})",
             file=out,
         )
         if result.verdict is not Verdict.OK:
             exit_code = _EXIT_BREACH_OR_REFUSED
     return exit_code
+
+
+def cmd_run(
+    *,
+    driver: ProviderDriver,
+    config: AppConfig,
+    state_store: BreakerStateStore,
+    threshold_store: ThresholdStore,
+    now: Callable[[], datetime],
+    sleep: Callable[[float], None],
+    out: TextIO,
+    max_ticks: int | None = None,
+) -> int:
+    """The always-on form of `check`: runs `loops.controller.run` with this
+    process's real config, printing one line per fast-tick verdict and one
+    line per slow-tick threshold adjustment, and appending a decision
+    record for every fast-tick evaluation exactly like `check` does.
+
+    `max_ticks=None` (the default; `main` never passes anything else) runs
+    until the caller interrupts it -- `main` catches `KeyboardInterrupt`
+    around this call so Ctrl-C is a clean shutdown, not a traceback. Tests
+    pass a small `max_ticks` instead of relying on an interrupt.
+    """
+
+    def on_fast_tick(results: list[BreakerEvaluation]) -> None:
+        for result in results:
+            append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
+            print(
+                f"[fast] {result.mailbox.mailbox_id}: {result.verdict.name} "
+                f"(sends={result.sends}, complaints={result.complaints})",
+                file=out,
+            )
+
+    def on_slow_tick(adjustment: ThresholdAdjustment) -> None:
+        print(f"[slow] tightened thresholds: {adjustment.reason}", file=out)
+
+    controller.run(
+        driver=driver,
+        prior=config.prior,
+        dry_run=config.dry_run,
+        state_store=state_store,
+        threshold_store=threshold_store,
+        fast_interval=timedelta(seconds=config.fast_interval_seconds),
+        slow_interval=timedelta(seconds=config.slow_interval_seconds),
+        now=now,
+        sleep=sleep,
+        max_ticks=max_ticks,
+        on_fast_tick=on_fast_tick,
+        on_slow_tick=on_slow_tick,
+    )
+    return _EXIT_OK
 
 
 def cmd_status(
@@ -164,6 +209,16 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers.add_parser("check", help="evaluate every mailbox once and print verdicts")
 
+    run_parser = subparsers.add_parser(
+        "run", help="run the two-loop daemon continuously (Ctrl-C to stop)"
+    )
+    run_parser.add_argument(
+        "--ticks",
+        type=int,
+        default=None,
+        help="stop after this many fast-loop ticks instead of running until interrupted",
+    )
+
     status_parser = subparsers.add_parser("status", help="print current breaker state per mailbox")
     status_parser.add_argument("mailbox_id", nargs="+", help="one or more mailbox addresses")
 
@@ -204,6 +259,27 @@ def main(argv: Sequence[str] | None = None) -> int:
             now=datetime.now(UTC),
             out=sys.stdout,
         )
+
+    if args.command == "run":
+        try:
+            driver = build_driver(config.provider, env=os.environ)
+        except CliError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_CONFIG_OR_SETUP_ERROR
+        try:
+            return cmd_run(
+                driver=driver,
+                config=config,
+                state_store=state_store,
+                threshold_store=ThresholdStore(config.thresholds),
+                now=lambda: datetime.now(UTC),
+                sleep=time.sleep,
+                out=sys.stdout,
+                max_ticks=args.ticks,
+            )
+        except KeyboardInterrupt:
+            print("stopped", file=sys.stdout)
+            return _EXIT_OK
 
     if args.command == "status":
         mailboxes = [MailboxRef(provider=config.provider, mailbox_id=m) for m in args.mailbox_id]
