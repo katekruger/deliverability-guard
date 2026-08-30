@@ -110,6 +110,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   call) that caught a real gap in the initial implementation: offline
   parsing leaves `source.base_domain` unset, which is why
   `_source_identifier` falls back to the raw IP address.
+- **`identity/warmup_advisor.py`: warmup curve adherence, explicitly
+  labeled as folklore** (BUILD-PLAN.md §4 item #19). `check_adherence`
+  compares a mailbox's actual observed daily sends against a piecewise-
+  linear-interpolated ramp curve and classifies the result as
+  `ON_SCHEDULE`/`AHEAD_OF_SCHEDULE`/`BEHIND_SCHEDULE` (within a
+  configurable `tolerance` fraction) or `PAST_CURVE` once the mailbox is
+  older than the curve's last defined checkpoint -- deliberately not a
+  "bad" outcome, since the curve has nothing more to recommend past that
+  point. `DEFAULT_WARMUP_CURVE` is documented, per BUILD-PLAN.md §8's own
+  instruction, as vendor consensus with no RFC, M3AAWG document, or
+  independent research behind it -- "presenting folklore as authoritative
+  is the project's most likely credibility failure" -- and every function
+  accepts a `curve` override so a caller is never stuck with it. No
+  enforcement of any kind: this is a comparison against a baseline with no
+  ground truth, never a verdict.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
