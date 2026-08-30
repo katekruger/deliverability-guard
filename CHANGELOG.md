@@ -9,6 +9,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: THROTTLE was not idempotent and could reach a
+  de-facto pause without ever passing through the human-review gate**
+  (audit finding ENG-5a). Six identical THROTTLE evaluations halved a
+  mailbox's daily limit six times (50 -> 25 -> 12 -> 6 -> 3 -> 1) without
+  ever entering `PAUSED`. `MailboxBreakerStatus` gained a `THROTTLED`
+  member; repeat THROTTLE verdicts are now idempotent, keyed on the
+  verdict rather than the numeric limit, and a throttle that would drop
+  below the floor now escalates to `PAUSE` instead of floor-clamping
+  forever. See the ADR 0003 addendum.
 - **`engine/posterior.py`: hierarchical pooling was complete pooling, not
   partial pooling, and could mask a genuinely breaching mailbox behind a
   large healthy peer group** (audit finding ENG-4). `pooled_prior` weighted

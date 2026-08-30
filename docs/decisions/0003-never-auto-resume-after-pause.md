@@ -119,6 +119,39 @@ scope here rather than bolted on half-thought-through.
 - Bad, because it requires a human in the loop and has no built-in
   mechanism yet to make sure that human shows up (see "Known limitation")
 
+## Addendum (2026-08-30): THROTTLE was not idempotent, and could reach a de-facto pause without ever going through this gate
+
+An external audit (ENG-5a) found that while PAUSE was guarded against
+repeat application (the whole point of this ADR), THROTTLE was not. Every
+evaluation tick that reached the THROTTLE rung halved the mailbox's daily
+limit again -- six identical ticks took a limit of 50 down to 1
+(`50 -> 25 -> 12 -> 6 -> 3 -> 1`) without the mailbox ever entering
+`PAUSED`, and therefore without ever passing through the human-review gate
+this ADR exists to enforce. `_MIN_THROTTLED_DAILY_LIMIT`'s own comment
+already named the failure mode ("a mailbox throttled all the way to 0/day
+is a pause wearing a different hat") and the code walked into it anyway,
+one halving at a time.
+
+**Fix:** `MailboxBreakerStatus` gained a `THROTTLED` member. `_act`'s
+THROTTLE branch is now idempotent the same way PAUSE's is: a mailbox
+already `THROTTLED` when the verdict is still THROTTLE is a no-op, keyed on
+the *verdict*, not the numeric limit. Separately, `evaluate` now escalates
+a THROTTLE verdict to PAUSE *before* acting on it whenever halving the
+current daily limit would fall below the floor
+(`_MIN_THROTTLED_DAILY_LIMIT`) -- so a mailbox that would otherwise be
+floor-clamped forever is routed through PAUSE, and therefore through
+`resume_after_human_review`, instead.
+
+### Confirmation
+
+`tests/test_breaker.py::test_repeated_throttle_verdict_does_not_re_halve_the_daily_limit`
+asserts six identical THROTTLE evaluations produce exactly one `throttle()`
+call. `test_throttle_that_would_drop_below_the_floor_escalates_to_pause`
+asserts a limit of 1 produces `Verdict.PAUSE` and a real `pause()` call,
+not a floor-clamped throttle -- this replaces an old assertion
+(`driver.throttle_calls == [("a@example.com", 1)]`) that encoded the exact
+bug this fixes.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and

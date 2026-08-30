@@ -116,18 +116,22 @@ def rung(lower_bound: float, thresholds: ThresholdLadder) -> Verdict:
 
 class MailboxBreakerStatus(Enum):
     ACTIVE = auto()
+    THROTTLED = auto()
     PAUSE_IN_FLIGHT = auto()
     PAUSED = auto()
 
 
 class BreakerStateStore:
-    """Tracks per-mailbox pause status, in memory, injectable for tests.
+    """Tracks per-mailbox pause/throttle status, in memory, injectable for
+    tests.
 
     This is what makes a repeat PAUSE verdict idempotent (BUILD-PLAN.md §5:
     "breaker trips while a previous trip is still in flight -> idempotent,
-    no double-pause") and what lets a lost provider response get reconciled
-    on the next tick instead of either silently giving up or blindly
-    assuming success.
+    no double-pause"), what makes a repeat THROTTLE verdict idempotent
+    (ENG-5a: six identical THROTTLE evaluations must not compound into
+    50 -> 25 -> 12 -> 6 -> 3 -> 1), and what lets a lost provider response
+    get reconciled on the next tick instead of either silently giving up or
+    blindly assuming success.
 
     `resume_after_human_review` is the ONLY path back from PAUSED to ACTIVE
     in this entire class. Nothing in `evaluate()` below calls it. See ADR
@@ -139,6 +143,9 @@ class BreakerStateStore:
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)
+
+    def mark_throttled(self, mailbox: MailboxRef) -> None:
+        self._status[mailbox] = MailboxBreakerStatus.THROTTLED
 
     def mark_pause_in_flight(self, mailbox: MailboxRef) -> None:
         self._status[mailbox] = MailboxBreakerStatus.PAUSE_IN_FLIGHT
@@ -297,6 +304,17 @@ def evaluate(
     lower_bound = posterior.lower_bound(confidence)
     verdict = rung(lower_bound, thresholds)
 
+    if (
+        verdict is Verdict.THROTTLE
+        and current_daily_limit is not None
+        and current_daily_limit // 2 < _MIN_THROTTLED_DAILY_LIMIT
+    ):
+        # Escalate: a throttle that would floor-clamp is a pause wearing a
+        # different hat (see `_MIN_THROTTLED_DAILY_LIMIT`'s docstring). Route
+        # it through PAUSE -- and therefore through the human-review gate
+        # (ADR 0003) -- instead of silently clamping at the floor forever.
+        verdict = Verdict.PAUSE
+
     action: ActionResult | None = None
     if verdict in (Verdict.THROTTLE, Verdict.PAUSE):
         action = _act(
@@ -354,6 +372,17 @@ def _act(
     effective_driver: ProviderDriver = DryRunDriver(inner=driver) if dry_run else driver
 
     if verdict is Verdict.THROTTLE:
+        if state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
+            # Idempotent, keyed on the VERDICT, not the limit (ENG-5a): a
+            # mailbox already throttled for this same verdict is a no-op --
+            # otherwise every repeat evaluation halves the limit again
+            # (50 -> 25 -> 12 -> ...) until it silently becomes a pause with
+            # no human ever seeing it happen.
+            return ActionResult(
+                outcome=ActionOutcome.PERFORMED,
+                detail="mailbox already throttled at this verdict; no action taken (idempotent)",
+                capability=Capability.THROTTLE,
+            )
         if current_daily_limit is None:
             return ActionResult(
                 outcome=ActionOutcome.UNSUPPORTED,
@@ -364,7 +393,10 @@ def _act(
                 capability=Capability.THROTTLE,
             )
         new_limit = max(_MIN_THROTTLED_DAILY_LIMIT, current_daily_limit // 2)
-        return effective_driver.throttle(mailbox.mailbox_id, new_limit)
+        result = effective_driver.throttle(mailbox.mailbox_id, new_limit)
+        if result.outcome is ActionOutcome.PERFORMED:
+            state_store.mark_throttled(mailbox)
+        return result
 
     # PAUSE.
     status = state_store.status_of(mailbox)
