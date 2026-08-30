@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`loops/controller.py`, `deliverability-guard run`: the always-on
+  two-loop daemon.** `run` executes `check`'s evaluation on a loop until
+  stopped (`fast_interval_seconds`, default 300) and, on a much longer
+  cadence (`slow_interval_seconds`, default 86400), tunes the shared
+  threshold ladder from its own rolling window of recent posterior lower
+  bounds via the existing (unmodified) `loops.slow.tune_thresholds`. The
+  fast tick and `check` share one evaluation path
+  (`loops.fast.evaluate_all_mailboxes`), so the one-shot and continuous
+  forms can't drift apart. This is a polling fast loop, not a webhook
+  receiver, and the slow loop's evidence is self-sourced rather than a
+  live Postmaster feed -- see ADR 0004 for exactly what that does and
+  doesn't implement of BUILD-PLAN.md §5's original architecture, and why.
+  New config keys `fast_interval_seconds`/`slow_interval_seconds` (both
+  optional, with the defaults above).
 - **`cli.py`, `config.py`: a real running system** (audit finding ENG-6).
   `deliverability-guard check` is the single-shot form of the fast loop —
   the minimum viable thing a user can put in cron: it loads

@@ -57,3 +57,13 @@ provider: instantly
 # from this file, so it must persist across restarts -- back it up like you
 # would any other state.
 decision_log_path: var/decisions.jsonl
+
+# How often `deliverability-guard run` (the always-on daemon,
+# loops/controller.py) re-pulls stats and re-evaluates every mailbox (the
+# fast loop) and how often it re-examines its own recent evidence to
+# propose tighter thresholds (the slow loop). See ADR 0004 for why the fast
+# loop polls on this interval rather than receiving pushed webhooks, and
+# why the slow loop's evidence is sourced from its own history rather than
+# a live Postmaster feed.
+fast_interval_seconds: 300 # 5 minutes
+slow_interval_seconds: 86400 # 24 hours

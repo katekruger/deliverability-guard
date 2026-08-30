@@ -75,6 +75,49 @@ def test_decision_log_path_is_configurable(tmp_path: Path) -> None:
     assert load_config(path).decision_log_path == custom
 
 
+def test_fast_and_slow_interval_seconds_have_defaults(tmp_path: Path) -> None:
+    path = _write(tmp_path, _VALID_YAML)
+    config = load_config(path)
+    assert config.fast_interval_seconds == 300
+    assert config.slow_interval_seconds == 86400
+
+
+def test_fast_and_slow_interval_seconds_are_configurable(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nfast_interval_seconds: 30\nslow_interval_seconds: 3600\n"
+    path = _write(tmp_path, text)
+    config = load_config(path)
+    assert config.fast_interval_seconds == 30
+    assert config.slow_interval_seconds == 3600
+
+
+def test_non_integer_fast_interval_seconds_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nfast_interval_seconds: not-a-number\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="fast_interval_seconds"):
+        load_config(path)
+
+
+def test_nonpositive_fast_interval_seconds_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nfast_interval_seconds: 0\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="fast_interval_seconds"):
+        load_config(path)
+
+
+def test_non_integer_slow_interval_seconds_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nslow_interval_seconds: not-a-number\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="slow_interval_seconds"):
+        load_config(path)
+
+
+def test_nonpositive_slow_interval_seconds_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nslow_interval_seconds: -1\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="slow_interval_seconds"):
+        load_config(path)
+
+
 def test_missing_file_raises_config_error(tmp_path: Path) -> None:
     with pytest.raises(ConfigError, match=r"thresholds\.yml"):
         load_config(tmp_path / "does-not-exist" / "thresholds.yml")

@@ -25,6 +25,14 @@ from deliverability_guard.engine.posterior import BetaDistribution
 _DEFAULT_PROVIDER = "instantly"
 _DEFAULT_DECISION_LOG_PATH = "var/decisions.jsonl"
 
+# Defaults for `deliverability-guard run` (loops/controller.py). Fast: 5
+# minutes -- short enough to be a meaningful stand-in for "seconds-to-
+# minutes reaction to leading indicators" (BUILD-PLAN.md §5) without
+# hammering a provider's API. Slow: 24 hours, matching the daily cadence
+# BUILD-PLAN.md §5 describes for threshold tuning.
+_DEFAULT_FAST_INTERVAL_SECONDS = 300
+_DEFAULT_SLOW_INTERVAL_SECONDS = 86400
+
 
 class ConfigError(Exception):
     """The config file is missing, unreadable, not valid YAML, or has a
@@ -40,6 +48,8 @@ class AppConfig:
     dry_run: bool
     provider: str
     decision_log_path: Path
+    fast_interval_seconds: int
+    slow_interval_seconds: int
 
 
 def load_config(path: Path) -> AppConfig:
@@ -102,12 +112,21 @@ def load_config(path: Path) -> AppConfig:
         )
     decision_log_path = Path(decision_log_raw)
 
+    fast_interval_seconds = _require_positive_int(
+        config_data, "fast_interval_seconds", _DEFAULT_FAST_INTERVAL_SECONDS, path
+    )
+    slow_interval_seconds = _require_positive_int(
+        config_data, "slow_interval_seconds", _DEFAULT_SLOW_INTERVAL_SECONDS, path
+    )
+
     return AppConfig(
         thresholds=thresholds,
         prior=prior,
         dry_run=dry_run,
         provider=provider,
         decision_log_path=decision_log_path,
+        fast_interval_seconds=fast_interval_seconds,
+        slow_interval_seconds=slow_interval_seconds,
     )
 
 
@@ -127,3 +146,12 @@ def _require_number(mapping: dict[str, object], dotted_key: str, path: Path) -> 
     if isinstance(value, bool) or not isinstance(value, int | float):
         raise ConfigError(f"{path}: '{dotted_key}' must be a number, got {type(value).__name__}")
     return float(value)
+
+
+def _require_positive_int(data: dict[str, object], key: str, default: int, path: Path) -> int:
+    value = data.get(key, default)
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise ConfigError(f"{path}: '{key}' must be an integer, got {type(value).__name__}")
+    if value <= 0:
+        raise ConfigError(f"{path}: '{key}' must be > 0, got {value}")
+    return value
