@@ -26,8 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own in-process `list_tools`/`call_tool`, still with no network of any
   kind. Adds `mcp` (the official Model Context Protocol SDK) as a runtime
   dependency.
-
-
+- **`providers/lemlist.py`: the lemlist driver** (BUILD-PLAN.md §3 v0.3).
+  `READ_STATS` via the `activities` export, aggregated client-side into
+  per-mailbox daily send/bounce counts; `PAUSE` at campaign granularity
+  only (no per-mailbox pause endpoint exists), relying on lemlist's own
+  documented server-side idempotency rather than adding a client-side
+  guard. `THROTTLE` and `WEBHOOKS` are not claimed -- lemlist has no
+  daily-limit primitive, and BUILD-PLAN.md flags its webhook support as
+  unverified. Endpoint shapes are hand-authored from public documentation
+  (no live lemlist account in this environment), same caveat as
+  `providers/instantly.py` -- see `tests/fixtures/lemlist/README.md`.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
