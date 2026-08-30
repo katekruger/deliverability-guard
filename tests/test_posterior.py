@@ -13,6 +13,7 @@ from hypothesis import given, settings
 from hypothesis import strategies as st
 
 from deliverability_guard.engine.posterior import (
+    DEFAULT_MAX_POOLED_ESS,
     DEFAULT_PRIOR,
     BetaDistribution,
     GroupObservation,
@@ -231,3 +232,88 @@ def test_evaluate_mailbox_rejects_complaints_greater_than_sends() -> None:
 
 def test_pooled_prior_with_no_peers_returns_prior_unchanged() -> None:
     assert pooled_prior(DEFAULT_PRIOR, []) == DEFAULT_PRIOR
+
+
+def test_pooled_prior_rejects_nonpositive_max_ess() -> None:
+    with pytest.raises(ValueError, match="max_ess"):
+        pooled_prior(DEFAULT_PRIOR, [], max_ess=0.0)
+
+
+# --- ESS cap: partial, not complete, pooling (ADR 0002 addendum) ----------
+#
+# Reproduction (audit finding ENG-4, 2026-08-30): a mailbox burning at 16x
+# Gmail's ceiling, sitting on a domain of 99 healthy peers, was judged
+# healthy by the pooled posterior -- its own weight in its own posterior was
+# 1%. That is complete pooling (the group swamps the individual no matter
+# how much evidence the individual has), not partial pooling, and it is the
+# exact failure mode this module exists to prevent.
+
+
+def test_pooled_posterior_breaches_despite_ninety_nine_healthy_peers() -> None:
+    """The audit's reproduction, verbatim: 99 peers at 5,000 sends/0.1% each,
+    target at 5,000 sends/5.0% (16x Gmail's ceiling). Before the ESS cap, the
+    pooled posterior read this as healthy. It must not."""
+    healthy_peers = [GroupObservation(sends=5000, complaints=5) for _ in range(99)]
+    pooled = pooled_posterior(DEFAULT_PRIOR, healthy_peers, own_sends=5000, own_complaints=250)
+    assert breaches(pooled, GMAIL_CEILING)
+    assert breaches(pooled, PAUSE)
+
+
+def test_monotonicity_more_healthy_peers_never_masks_a_breaching_mailbox() -> None:
+    """A mailbox with enough of its own evidence to breach on its own must
+    keep breaching no matter how many additional healthy peers are added to
+    its group -- more (healthy) company can never make a bad mailbox look
+    better."""
+    own_sends, own_complaints = 5000, 250  # 5%, breaches on its own evidence alone
+    for n_peers in (0, 1, 10, 50, 99, 500):
+        peers = [GroupObservation(sends=5000, complaints=5) for _ in range(n_peers)]
+        pooled = pooled_posterior(
+            DEFAULT_PRIOR, peers, own_sends=own_sends, own_complaints=own_complaints
+        )
+        assert breaches(pooled, GMAIL_CEILING), f"masked by pooling at {n_peers} healthy peers"
+
+
+def test_pooled_prior_ess_never_exceeds_the_cap() -> None:
+    """`pooled_prior`'s effective sample size (alpha + beta, relative to the
+    base prior) must never exceed `max_ess`, no matter how large or how many
+    peers are in the group -- this is the mechanism that makes pooling
+    partial rather than complete."""
+    base_ess = DEFAULT_PRIOR.alpha + DEFAULT_PRIOR.beta
+    for n_peers in (0, 1, 10, 99, 1000):
+        peers = [GroupObservation(sends=5000, complaints=5) for _ in range(n_peers)]
+        pooled = pooled_prior(DEFAULT_PRIOR, peers)
+        assert pooled.alpha + pooled.beta <= base_ess + DEFAULT_MAX_POOLED_ESS + 1e-6
+
+
+def test_own_contribution_has_a_floor_regardless_of_peer_group_size() -> None:
+    """A mailbox's own weight in its pooled posterior -- own_sends relative
+    to (own_sends + the group's capped effective sample size) -- must not
+    fall below a floor set by `max_ess`, however many healthy peers exist.
+    Without the cap, this floor is zero: an unbounded peer group can dilute
+    a mailbox's own evidence to nothing."""
+    own_sends = 5000
+    base_ess = DEFAULT_PRIOR.alpha + DEFAULT_PRIOR.beta
+    floor = own_sends / (own_sends + base_ess + DEFAULT_MAX_POOLED_ESS)
+    for n_peers in (1, 10, 99, 10_000):
+        peers = [GroupObservation(sends=5000, complaints=5) for _ in range(n_peers)]
+        group_prior = pooled_prior(DEFAULT_PRIOR, peers)
+        own_weight = own_sends / (own_sends + group_prior.alpha + group_prior.beta)
+        assert own_weight >= floor - 1e-9
+
+
+def test_small_own_volume_still_shrinks_strongly_toward_the_group() -> None:
+    """The ESS cap must not break the legitimate use of pooling: a mailbox
+    with very little of its own data (n=1, n=10) should still be dominated
+    by a large, healthy peer group -- the cap bounds the group's influence,
+    it doesn't remove it."""
+    healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
+    for own_sends, own_complaints in ((1, 0), (10, 0)):
+        pooled = pooled_posterior(
+            DEFAULT_PRIOR, healthy_peers, own_sends=own_sends, own_complaints=own_complaints
+        )
+        unpooled = update(DEFAULT_PRIOR, sends=own_sends, complaints=own_complaints)
+        # Dominated by the (much larger, healthy) group: pooling should pull
+        # the posterior mean noticeably below the tiny mailbox's own-data-only
+        # estimate, which on its own is barely different from the bare prior.
+        assert pooled.mean < unpooled.mean or pooled.mean == pytest.approx(unpooled.mean, rel=0.2)
+        assert pooled.alpha + pooled.beta > own_sends + (DEFAULT_PRIOR.alpha + DEFAULT_PRIOR.beta)

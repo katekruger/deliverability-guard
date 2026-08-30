@@ -43,7 +43,7 @@ from enum import Enum, auto
 
 import httpx
 
-from deliverability_guard.engine.state import DataState
+from deliverability_guard.engine.state import DailyReport, DataState, evaluate_stream
 from deliverability_guard.providers._parsing import (
     require_dict,
     require_int,
@@ -157,11 +157,7 @@ def coverage_over_range(
     until: date,
 ) -> list[DayAvailability]:
     """Per-day OK/INSUFFICIENT_DATA/STALE for one metric over a date range,
-    treating a present-to-absent transition as its own alert -- the same
-    shape as `engine.state.evaluate_stream` (Prompt 1), reimplemented here
-    because Postmaster rows carry a bare rate value rather than
-    sends/complaints counts, so `engine.state.DailyReport` doesn't apply
-    directly.
+    treating a present-to-absent transition as its own alert.
 
     This exists for the landmine BUILD-PLAN.md §8 and §9 both call out: a
     domain that gets throttled sends less, can drop below Postmaster's
@@ -169,31 +165,36 @@ def coverage_over_range(
     from `domainStats:query` results entirely -- monitoring goes dark
     exactly when things are worst. A missing day is never coerced to "0%,
     therefore healthy"; a transition into missing days is its own alert.
+
+    Delegates the actual OK/INSUFFICIENT_DATA/STALE transition logic to
+    `engine.state.evaluate_stream` rather than reimplementing it: a
+    Postmaster row carries a bare rate value with no sends/complaints count,
+    so it's translated into a placeholder `DailyReport` (`sends=1` when
+    present, `sends=None` when absent) purely to signal presence/absence --
+    `evaluate_stream` only ever looks at `DailyReport.has_data`, never the
+    counts themselves, so the placeholder values are never a lossy stand-in
+    for real data.
     """
     if since > until:
         raise ValueError(f"since ({since}) must not be after until ({until})")
     present_days = {
         row.day for row in rows if row.metric_name == metric_name and row.day is not None
     }
-    results: list[DayAvailability] = []
-    previously_had_data = False
+    reports: list[DailyReport] = []
     current = since
     one_day = timedelta(days=1)
     while current <= until:
         has_data = current in present_days
-        if has_data:
-            state = DataState.OK
-            transition_alert = False
-        elif previously_had_data:
-            state = DataState.STALE
-            transition_alert = True
-        else:
-            state = DataState.INSUFFICIENT_DATA
-            transition_alert = False
-        results.append(DayAvailability(day=current, state=state, transition_alert=transition_alert))
-        previously_had_data = has_data
+        reports.append(
+            DailyReport(
+                day=current, sends=1 if has_data else None, complaints=0 if has_data else None
+            )
+        )
         current += one_day
-    return results
+    return [
+        DayAvailability(day=e.day, state=e.state, transition_alert=e.transition_alert)
+        for e in evaluate_stream(reports)
+    ]
 
 
 class PostmasterClient:

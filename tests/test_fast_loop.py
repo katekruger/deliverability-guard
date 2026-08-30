@@ -4,8 +4,13 @@
 from datetime import UTC, datetime
 
 from deliverability_guard.engine.breaker import DEFAULT_LADDER, BreakerStateStore, Verdict
+from deliverability_guard.engine.changepoint import CusumState
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
-from deliverability_guard.loops.fast import FastLoopSignal, evaluate_signal
+from deliverability_guard.loops.fast import (
+    FastLoopSignal,
+    evaluate_signal,
+    evaluate_signal_with_trend,
+)
 from deliverability_guard.providers.base import MailboxRef, WebhookEvent, WebhookLedger
 from fixtures.fake_driver import FakeDriver
 
@@ -116,3 +121,85 @@ def test_a_different_event_id_for_the_same_mailbox_is_still_evaluated() -> None:
 
     assert first is not None
     assert second is not None
+
+
+# --- evaluate_signal_with_trend: CUSUM wired into the fast loop -----------
+
+
+def test_evaluate_signal_with_trend_runs_cusum_alongside_the_breaker() -> None:
+    """This is `cusum_step`'s first production caller: a real upward shift
+    in one period (5 complaints in 50 sends, far above `target_rate`) must
+    alarm."""
+    driver = FakeDriver()
+    signal = FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-1"))
+
+    evaluation, trend = evaluate_signal_with_trend(
+        signal,
+        driver=driver,
+        ledger=WebhookLedger(),
+        cumulative_sends=50,
+        cumulative_complaints=5,
+        period_sends=50,
+        period_complaints=5,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        cusum_state=CusumState(),
+        target_rate=0.001,
+        slack=0.001,
+        threshold=1.0,
+    )
+
+    assert evaluation is not None
+    assert trend.alarmed is True
+
+
+def test_evaluate_signal_with_trend_skips_cusum_on_a_redelivered_event() -> None:
+    """A redelivered webhook carries no new period evidence -- CUSUM must
+    not be re-run on it, exactly like the breaker evaluation itself."""
+    driver = FakeDriver()
+    ledger = WebhookLedger()
+    signal = FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-1"))
+
+    evaluate_signal_with_trend(
+        signal,
+        driver=driver,
+        ledger=ledger,
+        cumulative_sends=50,
+        cumulative_complaints=0,
+        period_sends=50,
+        period_complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        cusum_state=CusumState(),
+        target_rate=0.001,
+        slack=0.001,
+        threshold=1.0,
+    )
+    evaluation, trend = evaluate_signal_with_trend(
+        signal,  # redelivered
+        driver=driver,
+        ledger=ledger,
+        cumulative_sends=50,
+        cumulative_complaints=0,
+        period_sends=999,
+        period_complaints=999,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        cusum_state=CusumState(),
+        target_rate=0.001,
+        slack=0.001,
+        threshold=1.0,
+    )
+
+    assert evaluation is None
+    assert trend.alarmed is False
+    assert trend.state.cumulative == 0.0

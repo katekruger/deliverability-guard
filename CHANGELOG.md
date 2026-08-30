@@ -7,6 +7,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`cli.py`, `config.py`: a real running system** (audit finding ENG-6).
+  `deliverability-guard check` is the single-shot form of the fast loop —
+  the minimum viable thing a user can put in cron: it loads
+  `config/thresholds.yml` (which no code previously read, despite `pyyaml`
+  being a declared runtime dependency and the README's quickstart telling
+  users to `cp` it into place), pulls each mailbox's stats from the
+  configured provider, evaluates every mailbox through
+  `engine.breaker.evaluate`, appends a decision record per mailbox, and
+  exits non-zero if any mailbox's verdict isn't OK. `status <mailbox>`
+  prints current breaker state; `resume <mailbox>` is the only way a
+  paused mailbox becomes active again (ADR 0003). Provider credentials are
+  read from the environment, never the YAML config. `[project.scripts]`
+  now registers a real `deliverability-guard` entry point. The full
+  always-running two-loop daemon controller (BUILD-PLAN.md §5) is still
+  future work; `check` is its cron-friendly single-shot equivalent.
+
+### Fixed
+
+- **`engine/breaker.py`: THROTTLE was not idempotent and could reach a
+  de-facto pause without ever passing through the human-review gate**
+  (audit finding ENG-5a). Six identical THROTTLE evaluations halved a
+  mailbox's daily limit six times (50 -> 25 -> 12 -> 6 -> 3 -> 1) without
+  ever entering `PAUSED`. `MailboxBreakerStatus` gained a `THROTTLED`
+  member; repeat THROTTLE verdicts are now idempotent, keyed on the
+  verdict rather than the numeric limit, and a throttle that would drop
+  below the floor now escalates to `PAUSE` instead of floor-clamping
+  forever. See the ADR 0003 addendum.
+- **`engine/breaker.py`: `BreakerStateStore` was in-memory only, so a
+  process restart silently un-paused every paused mailbox** (audit finding
+  ENG-5b). `BreakerStateStore.from_log(path)` now rebuilds pause/throttle
+  state from `audit.log`'s append-only decision log; a log that exists but
+  can't be read or parsed now raises `BreakerStateStoreLoadError` instead
+  of silently falling back to an empty (every-mailbox-ACTIVE) store. See
+  the ADR 0003 addendum.
+- **`engine/posterior.py`: hierarchical pooling was complete pooling, not
+  partial pooling, and could mask a genuinely breaching mailbox behind a
+  large healthy peer group** (audit finding ENG-4). `pooled_prior` weighted
+  a peer group by raw total volume with no cap, so a large enough group
+  swamped any individual mailbox's own evidence regardless of how bad that
+  evidence was -- reproduced as a mailbox at 16x Gmail's ceiling reading as
+  healthy behind 99 healthy peers. `pooled_prior`/`pooled_posterior` now
+  cap the group's effective sample size at `DEFAULT_MAX_POOLED_ESS` (5,000),
+  which bounds the group's influence while leaving legitimate low-volume
+  pooling unaffected. See the ADR 0002 addendum.
+- `pooled_prior`/`pooled_posterior` and `engine.state.evaluate_stream` had
+  zero production callers; `engine.changepoint.cusum_step` likewise.
+  `engine.breaker.evaluate` now accepts an optional `peer_group` to use the
+  (capped) pooled posterior; `loops.fast.evaluate_signal_with_trend` wires
+  CUSUM sequential change detection alongside the breaker's own evaluation;
+  `signals.postmaster.coverage_over_range` now imports `evaluate_stream`
+  instead of reimplementing its transition logic.
+
 ### Changed
 
 - `ci.yml`: expanded from a single job to a Python 3.12/3.13 matrix, now

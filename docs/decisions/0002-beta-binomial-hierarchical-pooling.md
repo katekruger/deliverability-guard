@@ -154,6 +154,62 @@ not eliminate it.
 - Bad, because it requires a `scipy` dependency and a moderately more
   sophisticated mental model to audit than "look at the percentage"
 
+## Addendum (2026-08-30): capping the pooled effective sample size
+
+An external audit (ENG-4) found that `pooled_prior` as originally shipped
+weighted the peer group by its **raw total volume**, with no cap. That is
+complete pooling, not partial pooling: a peer group's influence on an
+individual mailbox's posterior grows without bound as the group grows, so a
+large enough healthy peer group can dilute *any* individual mailbox's own
+evidence to irrelevance, no matter how bad that mailbox's own evidence is.
+
+Reproduction: 99 peers at 5,000 sends/0.1% complaints each, target mailbox
+at 5,000 sends/5.0% complaints (16x Gmail's 0.3% ceiling). The pooled
+posterior read the target as healthy -- its own weight in its own posterior
+was 1%. The module-level docstring above ("a mailbox with 5,000 sends of
+its own... dominates that same aggregate") was simply wrong about what the
+code did.
+
+**Fix:** `pooled_prior` and `pooled_posterior` now take a `max_ess`
+parameter (`DEFAULT_MAX_POOLED_ESS = 5000.0`) that caps the peer group's
+total effective sample size -- its contribution to alpha + beta -- before
+it's folded into the prior. If the group's raw total volume exceeds
+`max_ess`, both the total sends and total complaints are scaled down by the
+same factor, which preserves the group's observed rate exactly while
+bounding how much weight it can carry. This is what a full multilevel
+hierarchical model would do implicitly (the shared hyperprior's own
+variance limits how far any one group can pull an individual toward it);
+capping the ESS is the minimal correct analogue for the sequential-
+conditioning approximation this module already uses (see "Assumption this
+relies on," above).
+
+**Why 5,000:** it is not an arbitrary round number. It is the volume this
+module's own tests (`test_forty_complaints_in_five_thousand_sends_does_trip`)
+and `docs/statistics.md` already treat as "enough of a mailbox's own data to
+be confident on its own." Capping the peer group's ESS at that same number
+means a mailbox with 5,000 or more sends of its own evidence is guaranteed a
+weight in its own posterior at least equal to the (bounded) peer group's,
+regardless of how large that peer group grows.
+
+**Consequence:** the legitimate use of pooling -- a mailbox with almost no
+data of its own (n=1, n=10) inheriting its domain's posterior -- is
+unaffected, because the cap only bounds the group's contribution, not the
+individual's. `tests/test_posterior.py` encodes the corrected property set:
+the original reproduction as a regression test, a monotonicity property
+(more healthy peers can never mask a mailbox with enough of its own bad
+evidence), an explicit ESS-cap-is-never-exceeded property, and a floor on a
+mailbox's own posterior weight as the peer group grows without bound.
+
+**Wiring:** `pooled_posterior`/`pooled_prior` had zero production callers as
+of the same audit -- `engine.breaker.evaluate` computed a flat, unpooled
+posterior regardless of the group's existence. `evaluate` now accepts an
+optional `peer_group` parameter; when supplied, it uses the (now-capped)
+pooled posterior instead. `peer_group=None` (the default) reproduces the
+flat posterior every existing caller relied on before this parameter
+existed. Populating a mailbox's actual peer group at each call site (from
+its domain's other mailboxes) is left to the caller building the fast/slow
+loop wiring -- this ADR only commits to the engine-level contract.
+
 ## More Information
 
 See `docs/statistics.md` for the full worked example and rationale in
