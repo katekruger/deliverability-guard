@@ -6,6 +6,12 @@ deciders: "Kate Kruger"
 
 # Beta-binomial posterior with hierarchical pooling, not fixed-window rates
 
+> **Status note (August 2026):** the pooling implemented in
+> `engine/posterior.py` is complete pooling weighted by raw volume, not the
+> partial pooling this ADR describes. It is not currently called from
+> `breaker.evaluate()`. See ENG-4. Until that lands, every production verdict
+> comes from the flat per-mailbox posterior described in ADR 0001.
+
 ## Context and Problem Statement
 
 At cold-outbound volume (e.g. 50 sends/day/mailbox), Gmail's 0.3% complaint
