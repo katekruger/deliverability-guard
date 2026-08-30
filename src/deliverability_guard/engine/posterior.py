@@ -168,18 +168,68 @@ class GroupObservation:
     label: str = ""
 
 
-def pooled_prior(prior: BetaDistribution, group: Iterable[GroupObservation]) -> BetaDistribution:
+# The cap on how much effective sample size (alpha + beta, contributed on
+# top of the base prior) a peer group is allowed to inject into an
+# individual member's prior in `pooled_prior` below.
+#
+# This is what makes the pooling PARTIAL rather than COMPLETE. Without a
+# cap, `pooled_prior` weights the group by its raw total volume, which grows
+# without bound as the group grows -- a peer group large enough eventually
+# swamps ANY individual mailbox's own evidence, no matter how much evidence
+# that mailbox has of its own. That is complete pooling (the individual
+# reduces to the group mean) wearing hierarchical-pooling's name, and it was
+# an ENG-4 audit finding (2026-08-30): a mailbox sending at 16x Gmail's
+# ceiling, sitting on 99 healthy peers, was read as healthy -- its own
+# weight in its own posterior was 1%.
+#
+# 5,000 is not an arbitrary round number: it is the volume `docs/statistics.md`
+# and this module's own tests (`test_forty_complaints_in_five_thousand_sends_does_trip`)
+# already treat as "enough of a mailbox's own data to be confident on its
+# own" -- a mailbox at or above this many sends of its own evidence is
+# guaranteed a group-relative weight no smaller than
+# `own_sends / (own_sends + DEFAULT_MAX_POOLED_ESS + base_prior_ess)`,
+# regardless of how large the peer group grows. See ADR 0002.
+DEFAULT_MAX_POOLED_ESS = 5000.0
+
+
+def pooled_prior(
+    prior: BetaDistribution,
+    group: Iterable[GroupObservation],
+    *,
+    max_ess: float = DEFAULT_MAX_POOLED_ESS,
+) -> BetaDistribution:
     """The group-level posterior, formed by aggregating every member's data.
 
     This becomes the PRIOR for an individual member in `pooled_posterior`
     below. Pass only the OTHER members here (leave-one-out) -- including a
     member's own data would count it twice once `pooled_posterior` adds it
     again on top.
+
+    The group's total effective sample size (its contribution to alpha +
+    beta) is capped at `max_ess`: if the group's raw total volume exceeds
+    it, both `total_sends` and `total_complaints` are scaled down by the
+    same factor before being folded into `prior`, which preserves the
+    group's observed rate exactly while bounding how much weight it can
+    carry. This is what makes this partial rather than complete pooling --
+    see the module-level docstring at `DEFAULT_MAX_POOLED_ESS` for why the
+    uncapped version was wrong. The property this must satisfy, and does: a
+    mailbox with enough of its own evidence to breach a threshold on that
+    evidence alone must keep breaching regardless of how many healthy peers
+    exist (`test_monotonicity_more_healthy_peers_never_masks_a_breaching_mailbox`).
     """
+    if max_ess <= 0:
+        raise ValueError(f"max_ess must be > 0, got {max_ess}")
     observations = list(group)
-    total_sends = sum(obs.sends for obs in observations)
-    total_complaints = sum(obs.complaints for obs in observations)
-    return update(prior, total_sends, total_complaints)
+    total_sends: float = sum(obs.sends for obs in observations)
+    total_complaints: float = sum(obs.complaints for obs in observations)
+    if total_sends > max_ess:
+        scale = max_ess / total_sends
+        total_sends *= scale
+        total_complaints *= scale
+    return BetaDistribution(
+        alpha=prior.alpha + total_complaints,
+        beta=prior.beta + total_sends - total_complaints,
+    )
 
 
 def pooled_posterior(
@@ -187,15 +237,19 @@ def pooled_posterior(
     other_members: Iterable[GroupObservation],
     own_sends: int,
     own_complaints: int,
+    *,
+    max_ess: float = DEFAULT_MAX_POOLED_ESS,
 ) -> BetaDistribution:
     """Partial pooling: a member's own data updates its group's posterior.
 
     This is the mathematically correct answer to "a single mailbox never has
     enough data" (BUILD-PLAN.md §6): a mailbox with 50 sends of its own is
     dominated by its domain's aggregate (a large effective sample size
-    contributed by other mailboxes); a mailbox with 5,000 sends of its own
-    dominates that same aggregate, because `update()` adds its own counts on
-    top of it.
+    contributed by other mailboxes, capped at `max_ess`); a mailbox with
+    `max_ess` or more sends of its own is guaranteed a weight in its own
+    posterior at least equal to the peer group's -- own evidence is never
+    added under a cap, only the group's is, so enough of it always
+    outweighs whatever the (bounded) group contributes.
 
     This is an empirical-Bayes / sequential-conditioning approximation of a
     full multilevel hierarchical model -- it plugs the group's own posterior
@@ -204,5 +258,5 @@ def pooled_posterior(
     fit). See ADR 0002 for why that tradeoff is the right one here, and what
     it does and doesn't assume.
     """
-    group_posterior = pooled_prior(prior, other_members)
+    group_posterior = pooled_prior(prior, other_members, max_ess=max_ess)
     return update(group_posterior, own_sends, own_complaints)

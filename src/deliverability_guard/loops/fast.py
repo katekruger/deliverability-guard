@@ -25,6 +25,7 @@ from deliverability_guard.engine.breaker import (
     ThresholdLadder,
     evaluate,
 )
+from deliverability_guard.engine.changepoint import CusumResult, CusumState, cusum_step
 from deliverability_guard.engine.posterior import BetaDistribution
 from deliverability_guard.providers.base import (
     MailboxRef,
@@ -77,3 +78,64 @@ def evaluate_signal(
         now=now,
         current_daily_limit=current_daily_limit,
     )
+
+
+def evaluate_signal_with_trend(
+    signal: FastLoopSignal,
+    *,
+    driver: ProviderDriver,
+    ledger: WebhookLedger,
+    cumulative_sends: int,
+    cumulative_complaints: int,
+    period_sends: int,
+    period_complaints: int,
+    prior: BetaDistribution,
+    thresholds: ThresholdLadder,
+    state_store: BreakerStateStore,
+    dry_run: bool,
+    now: datetime,
+    cusum_state: CusumState,
+    target_rate: float,
+    slack: float,
+    threshold: float,
+    current_daily_limit: int | None = None,
+) -> tuple[BreakerEvaluation | None, CusumResult]:
+    """`evaluate_signal` plus sequential change detection (`engine.changepoint`)
+    on the same period's evidence -- BUILD-PLAN.md §6's "catches a trend
+    shift faster than any fixed-window rate" running alongside, not instead
+    of, the breaker's own posterior-based ladder.
+
+    `period_sends`/`period_complaints` are this evaluation's own slice of
+    volume (e.g. today's count), distinct from `cumulative_sends`/
+    `cumulative_complaints` which the breaker's posterior update needs --
+    CUSUM tracks a running deviation period over period, so it needs the
+    period's own count, not a lifetime total.
+
+    On a redelivered event (nothing new to evaluate), CUSUM is skipped
+    entirely and `cusum_state` is returned unchanged -- a redelivery carries
+    no new evidence for either half of this function.
+    """
+    evaluation = evaluate_signal(
+        signal,
+        driver=driver,
+        ledger=ledger,
+        cumulative_sends=cumulative_sends,
+        cumulative_complaints=cumulative_complaints,
+        prior=prior,
+        thresholds=thresholds,
+        state_store=state_store,
+        dry_run=dry_run,
+        now=now,
+        current_daily_limit=current_daily_limit,
+    )
+    if evaluation is None:
+        return None, CusumResult(state=cusum_state, alarmed=False)
+    trend = cusum_step(
+        cusum_state,
+        period_sends,
+        period_complaints,
+        target_rate=target_rate,
+        slack=slack,
+        threshold=threshold,
+    )
+    return evaluation, trend

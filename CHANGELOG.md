@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`engine/posterior.py`: hierarchical pooling was complete pooling, not
+  partial pooling, and could mask a genuinely breaching mailbox behind a
+  large healthy peer group** (audit finding ENG-4). `pooled_prior` weighted
+  a peer group by raw total volume with no cap, so a large enough group
+  swamped any individual mailbox's own evidence regardless of how bad that
+  evidence was -- reproduced as a mailbox at 16x Gmail's ceiling reading as
+  healthy behind 99 healthy peers. `pooled_prior`/`pooled_posterior` now
+  cap the group's effective sample size at `DEFAULT_MAX_POOLED_ESS` (5,000),
+  which bounds the group's influence while leaving legitimate low-volume
+  pooling unaffected. See the ADR 0002 addendum.
+- `pooled_prior`/`pooled_posterior` and `engine.state.evaluate_stream` had
+  zero production callers; `engine.changepoint.cusum_step` likewise.
+  `engine.breaker.evaluate` now accepts an optional `peer_group` to use the
+  (capped) pooled posterior; `loops.fast.evaluate_signal_with_trend` wires
+  CUSUM sequential change detection alongside the breaker's own evaluation;
+  `signals.postmaster.coverage_over_range` now imports `evaluate_stream`
+  instead of reimplementing its transition logic.
+
 ### Changed
 
 - `ci.yml`: expanded from a single job to a Python 3.12/3.13 matrix, now

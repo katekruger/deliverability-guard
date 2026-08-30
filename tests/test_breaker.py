@@ -14,7 +14,7 @@ from deliverability_guard.engine.breaker import (
     evaluate,
     rung,
 )
-from deliverability_guard.engine.posterior import DEFAULT_PRIOR
+from deliverability_guard.engine.posterior import DEFAULT_PRIOR, GroupObservation
 from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
@@ -497,6 +497,87 @@ def test_compliance_gate_false_does_not_change_normal_behavior() -> None:
     )
     assert result.verdict == Verdict.OK
     assert driver.pause_calls == []
+
+
+# --- Hierarchical pooling wired into evaluate() (ENG-4 part 3) ------------
+
+
+def test_evaluate_with_peer_group_uses_pooled_posterior() -> None:
+    """Wiring check: passing `peer_group` pulls a marginal mailbox's verdict
+    toward its healthy peers' posterior -- proving `evaluate()` actually
+    calls `engine.posterior.pooled_posterior` rather than `update()` alone."""
+    driver = FakeDriver()
+    healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
+    pooled_result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=50,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    flat_result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=50,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert pooled_result.posterior != flat_result.posterior
+    assert pooled_result.lower_bound is not None
+    assert flat_result.lower_bound is not None
+    assert pooled_result.lower_bound < flat_result.lower_bound
+
+
+def test_evaluate_peer_group_does_not_mask_a_mailbox_with_enough_of_its_own_evidence() -> None:
+    """ENG-4's reproduction, at the breaker level: even wired through
+    `evaluate()`, a mailbox with enough of its own bad evidence must still
+    trip PAUSE, regardless of how many healthy peers it has."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    healthy_peers = [GroupObservation(sends=5000, complaints=5) for _ in range(99)]
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=250,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    assert result.verdict == Verdict.PAUSE
+    assert driver.pause_calls == [_MAILBOX]
+
+
+def test_evaluate_without_peer_group_is_unchanged_flat_behavior() -> None:
+    """`peer_group` defaults to `None`, which must reproduce the exact flat,
+    non-pooled posterior every other test in this file relies on."""
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    from deliverability_guard.engine.posterior import update
+
+    assert result.posterior == update(DEFAULT_PRIOR, sends=5000, complaints=40)
 
 
 def test_compliance_gate_is_idempotent_like_any_other_pause() -> None:

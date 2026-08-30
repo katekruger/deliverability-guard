@@ -32,11 +32,18 @@ driver is passed in -- never as a separate branch of logic in this module.
 False; only the driver object passed to the provider call differs.
 """
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum, auto
 
-from deliverability_guard.engine.posterior import BetaDistribution, update
+from deliverability_guard.engine.posterior import (
+    DEFAULT_MAX_POOLED_ESS,
+    BetaDistribution,
+    GroupObservation,
+    pooled_posterior,
+    update,
+)
 from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
@@ -198,8 +205,20 @@ def evaluate(
     confidence: float = 0.95,
     current_daily_limit: int | None = None,
     compliance_gate_tripped: bool = False,
+    peer_group: Iterable[GroupObservation] | None = None,
+    max_pooled_ess: float = DEFAULT_MAX_POOLED_ESS,
 ) -> BreakerEvaluation:
     """Evaluate one mailbox and, if warranted, attempt an action.
+
+    `peer_group` is the mailbox's OTHER same-domain (or same-tenant) members
+    -- leave-one-out, matching `engine.posterior.pooled_posterior`'s own
+    contract. When given, the posterior is computed via hierarchical partial
+    pooling instead of this mailbox's own data alone: a mailbox with little
+    of its own evidence borrows strength from a healthy or unhealthy peer
+    group, capped at `max_pooled_ess` so a large peer group can never dilute
+    a mailbox with enough of its own evidence into looking healthy (ADR
+    0002). `None` (the default) reproduces the flat, non-pooled posterior
+    every caller used before this parameter existed.
 
     `thresholds` must be a value already snapshotted by the caller (e.g.
     `ThresholdStore.current` read once before calling) -- this function
@@ -227,7 +246,11 @@ def evaluate(
         raise ValueError(f"complaints must be between 0 and sends ({sends}), got {complaints}")
 
     if compliance_gate_tripped:
-        posterior = update(prior, sends, complaints) if sends > 0 else None
+        posterior = (
+            _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
+            if sends > 0
+            else None
+        )
         lower_bound = posterior.lower_bound(confidence) if posterior is not None else None
         action = _act(
             driver,
@@ -270,7 +293,7 @@ def evaluate(
             action=None,
         )
 
-    posterior = update(prior, sends, complaints)
+    posterior = _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
     lower_bound = posterior.lower_bound(confidence)
     verdict = rung(lower_bound, thresholds)
 
@@ -299,6 +322,23 @@ def evaluate(
         verdict=verdict,
         dry_run=dry_run,
         action=action,
+    )
+
+
+def _posterior_for(
+    prior: BetaDistribution,
+    sends: int,
+    complaints: int,
+    peer_group: Iterable[GroupObservation] | None,
+    max_pooled_ess: float,
+) -> BetaDistribution:
+    """Flat `update()` when there's no peer group; hierarchical partial
+    pooling (`engine.posterior.pooled_posterior`) when there is. See
+    `evaluate`'s `peer_group` parameter and ADR 0002."""
+    if peer_group is None:
+        return update(prior, sends, complaints)
+    return pooled_posterior(
+        prior, peer_group, own_sends=sends, own_complaints=complaints, max_ess=max_pooled_ess
     )
 
 
