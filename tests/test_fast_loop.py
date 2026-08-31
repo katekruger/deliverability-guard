@@ -327,9 +327,11 @@ def test_evaluate_all_mailboxes_throttles_a_mailbox_given_a_current_daily_limit(
 
 def test_evaluate_all_mailboxes_pools_peers_on_the_same_domain() -> None:
     """A marginal mailbox (n=50, 1 complaint) on a domain with 40 other
-    healthy, real-volume mailboxes must be judged more confidently healthy
-    than it would be alone -- proof `evaluate_all_mailboxes` actually
-    builds and passes a same-domain `peer_group`, not `None`."""
+    healthy, real-volume mailboxes gets a different POSTERIOR than it would
+    alone -- proof `evaluate_all_mailboxes` actually builds and passes a
+    same-domain `peer_group`, not `None` (the `.posterior` field is
+    unaffected by CLOSE-2's worse-of-two lower-bound fix; only the
+    resulting verdict/lower_bound is)."""
     domain = "example.com"
     marginal = MailboxRef(provider="fake", mailbox_id=f"marginal@{domain}")
     stats = [
@@ -367,9 +369,6 @@ def test_evaluate_all_mailboxes_pools_peers_on_the_same_domain() -> None:
     )
 
     assert marginal_result.posterior != flat_result.posterior
-    assert marginal_result.lower_bound is not None
-    assert flat_result.lower_bound is not None
-    assert marginal_result.lower_bound < flat_result.lower_bound
 
 
 def test_evaluate_all_mailboxes_does_not_pool_across_different_domains() -> None:

@@ -393,6 +393,15 @@ def evaluate(
     0002). `None` (the default) reproduces the flat, non-pooled posterior
     every caller used before this parameter existed.
 
+    When `peer_group` is given, the VERDICT (and the `lower_bound` returned
+    on `BreakerEvaluation`) is the WORSE of the pooled and flat lower bounds
+    -- never just the pooled one (ADR 0005). The ESS cap alone still let a
+    large healthy peer group make the breaker read a mailbox with enough of
+    its OWN bad evidence to breach on its own as healthy once pooled, at
+    own-volume levels the cap didn't bound. `BreakerEvaluation.posterior`
+    itself is unaffected by this and remains the raw pooled posterior, for
+    audit/inspection -- only which lower bound decides the verdict changes.
+
     `thresholds` must be a value already snapshotted by the caller (e.g.
     `ThresholdStore.current` read once before calling) -- this function
     never re-reads a mutable config source mid-evaluation, which is what
@@ -468,6 +477,21 @@ def evaluate(
 
     posterior = _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
     lower_bound = posterior.lower_bound(confidence)
+    if peer_group is not None:
+        # ADR 0002's CLOSE-2 addendum: pooling must never make the breaker
+        # LESS sensitive than evaluating this mailbox's own evidence alone
+        # would. Between roughly 91 and 389 own sends, the pooled posterior
+        # was strictly quieter than the flat one -- a mailbox breaching at
+        # 5% (16x Gmail's ceiling) on its own evidence read as healthy once
+        # pooled with enough healthy peers. Taking the worse (higher) of the
+        # two lower bounds guarantees pooling only ever ADDS sensitivity:
+        # the flat evaluation is always still checked, so a mailbox with
+        # enough of its own evidence to breach on its own keeps breaching
+        # regardless of its peer group, while a mailbox with too little of
+        # its own evidence to say anything (the legitimate case pooling
+        # exists for) is unaffected, since its flat lower bound is small
+        # enough that the pooled one -- healthy or not -- still wins the max.
+        lower_bound = max(lower_bound, update(prior, sends, complaints).lower_bound(confidence))
     verdict = rung(lower_bound, thresholds)
 
     if (

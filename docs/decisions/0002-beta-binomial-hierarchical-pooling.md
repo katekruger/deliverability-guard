@@ -210,6 +210,17 @@ existed. Populating a mailbox's actual peer group at each call site (from
 its domain's other mailboxes) is left to the caller building the fast/slow
 loop wiring -- this ADR only commits to the engine-level contract.
 
+## Addendum (2026-08-31): pooling could still reduce sensitivity at moderate volume
+
+Wiring pooling into production (the next addendum, below) surfaced a
+follow-up correctness bug: even with the ESS cap, pooling could make the
+breaker's decision LESS sensitive than evaluating a mailbox's own evidence
+alone, at own-volume levels between roughly 91 and 389 sends. See
+[ADR 0005](0005-pooling-never-reduces-breaker-sensitivity.md) for the full
+reproduction and fix -- `evaluate()` now takes the worse of the pooled and
+flat lower bounds whenever pooling is used, guaranteeing pooling only ever
+adds sensitivity, never removes it.
+
 ## Addendum (2026-08-31): wiring pooling and CUSUM into the production chokepoint (CLOSE-1)
 
 A follow-up audit found that the ESS-cap fix above, and `cusum_step`

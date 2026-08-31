@@ -843,9 +843,20 @@ def test_compliance_gate_false_does_not_change_normal_behavior() -> None:
 
 
 def test_evaluate_with_peer_group_uses_pooled_posterior() -> None:
-    """Wiring check: passing `peer_group` pulls a marginal mailbox's verdict
-    toward its healthy peers' posterior -- proving `evaluate()` actually
-    calls `engine.posterior.pooled_posterior` rather than `update()` alone."""
+    """Wiring check: passing `peer_group` pulls a marginal mailbox's
+    POSTERIOR toward its healthy peers' posterior -- proving `evaluate()`
+    actually calls `engine.posterior.pooled_posterior` rather than
+    `update()` alone.
+
+    This does NOT assert `pooled_result.lower_bound < flat_result.lower_bound`
+    (the old version of this test did): CLOSE-2 fixed a bug where pooling
+    could make the breaker's EFFECTIVE decision quieter than the flat
+    evaluation alone, so `evaluate()` now takes the worse of the pooled and
+    flat lower bounds when `peer_group` is given -- see
+    `test_evaluate_peer_group_lower_bound_is_never_below_the_flat_one`
+    below. The `.posterior` FIELD (used for audit/inspection) is still the
+    raw pooled `BetaDistribution`, unaffected by that -- which is what this
+    test checks instead."""
     driver = FakeDriver()
     healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
     pooled_result = evaluate(
@@ -872,9 +883,40 @@ def test_evaluate_with_peer_group_uses_pooled_posterior() -> None:
         now=_NOW,
     )
     assert pooled_result.posterior != flat_result.posterior
+    from deliverability_guard.engine.posterior import pooled_posterior
+
+    assert pooled_result.posterior == pooled_posterior(
+        DEFAULT_PRIOR, healthy_peers, own_sends=50, own_complaints=1
+    )
+
+
+def test_evaluate_peer_group_lower_bound_is_never_below_the_flat_one() -> None:
+    """CLOSE-2: pooling must never make the breaker's effective decision
+    LESS sensitive than evaluating this mailbox's own evidence alone would
+    -- `evaluate()` takes the worse (higher) of the pooled and flat lower
+    bounds whenever `peer_group` is given. Here the peer group is healthy
+    enough that the POOLED posterior alone would read this mailbox as
+    quieter than its own evidence -- the effective lower bound must still
+    match (or exceed) the flat one."""
+    driver = FakeDriver()
+    healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
+    pooled_result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=50,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    from deliverability_guard.engine.posterior import update
+
+    flat_lower_bound = update(DEFAULT_PRIOR, sends=50, complaints=1).lower_bound()
     assert pooled_result.lower_bound is not None
-    assert flat_result.lower_bound is not None
-    assert pooled_result.lower_bound < flat_result.lower_bound
+    assert pooled_result.lower_bound >= flat_lower_bound
 
 
 def test_evaluate_peer_group_does_not_mask_a_mailbox_with_enough_of_its_own_evidence() -> None:
@@ -898,6 +940,75 @@ def test_evaluate_peer_group_does_not_mask_a_mailbox_with_enough_of_its_own_evid
     )
     assert result.verdict == Verdict.PAUSE
     assert driver.pause_calls == [_MAILBOX]
+
+
+# --- CLOSE-2: pooling never masks a breach the flat evaluation would catch -
+
+
+@pytest.mark.parametrize("own_sends", [1, 10, 50, 100, 200, 500, 1000, 5000])
+def test_pooled_breach_at_the_verdict_level_is_true_wherever_flat_breach_is_true(
+    own_sends: int,
+) -> None:
+    """The CLOSE-2 reproduction, as a property: a mailbox sending at a true
+    5% complaint rate (16x Gmail's ceiling) against 999 HEALTHY peers must
+    breach through `evaluate()`'s pooled path at every own-volume level
+    tested, wherever it would breach evaluated flat/alone -- before this
+    fix, pooling masked the breach at 100 and 200 own sends specifically
+    (a healthy-looking pooled posterior diluted a genuinely bad mailbox's
+    own evidence)."""
+    own_complaints = round(own_sends * 0.05)
+    healthy_peers = [GroupObservation(sends=5000, complaints=5) for _ in range(999)]  # 0.1% each
+
+    flat = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=own_sends,
+        complaints=own_complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    pooled = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=own_sends,
+        complaints=own_complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+
+    if flat.verdict is not Verdict.OK:
+        assert pooled.verdict is not Verdict.OK, (
+            f"pooling masked a breach at own_sends={own_sends}: "
+            f"flat={flat.verdict.name} pooled={pooled.verdict.name}"
+        )
+
+
+def test_n1_at_100_percent_against_999_healthy_peers_still_does_not_breach() -> None:
+    """The legitimate case pooling exists for must survive CLOSE-2's fix:
+    one complaint in one send, against a domain of 999 perfectly healthy
+    peers, still must not breach -- n=1 is not enough evidence to say
+    anything, no matter how the peer group looks."""
+    healthy_peers = [GroupObservation(sends=5000, complaints=0) for _ in range(999)]
+    result = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=1,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    assert result.verdict == Verdict.OK
 
 
 def test_evaluate_without_peer_group_is_unchanged_flat_behavior() -> None:

@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: pooling could still make the breaker LESS sensitive
+  than evaluating a mailbox alone, at moderate own-volume** (external audit
+  finding CLOSE-2, a follow-up on the ESS-cap fix below). Between roughly 91
+  and 389 own sends, a mailbox breaching at 5% (16x Gmail's ceiling) on its
+  own evidence alone read as healthy once pooled with a large, healthy
+  peer group -- the ESS cap bounds how much weight the group carries, but
+  not how far it can pull the posterior itself. `evaluate()` now takes the
+  worse (higher) of the pooled and flat lower bounds whenever `peer_group`
+  is given: pooling can only ever add sensitivity, never remove it. See
+  [ADR 0005](docs/decisions/0005-pooling-never-reduces-breaker-sensitivity.md).
+
 - **`loops/fast.py`: `pooled_posterior` and `cusum_step` had callers that
   nothing itself called in production** (external audit finding CLOSE-1).
   `evaluate_all_mailboxes` -- the shared chokepoint `cli.cmd_check` and
