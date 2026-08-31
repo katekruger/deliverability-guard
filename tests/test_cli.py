@@ -291,6 +291,40 @@ def test_build_driver_instantly_with_api_key_builds_a_driver() -> None:
     assert driver.name == "instantly"
 
 
+def test_build_driver_smartlead_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SMARTLEAD_API_KEY"):
+        build_driver("smartlead", env={})
+
+
+def test_build_driver_smartlead_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SMARTLEAD_CAMPAIGN_ID"):
+        build_driver("smartlead", env={"SMARTLEAD_API_KEY": "test-key"})
+
+
+def test_build_driver_smartlead_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "smartlead",
+        env={"SMARTLEAD_API_KEY": "test-key", "SMARTLEAD_CAMPAIGN_ID": "camp-1"},
+    )
+    assert driver.name == "smartlead"
+
+
+def test_build_driver_noop_needs_no_credentials() -> None:
+    driver = build_driver("noop", env={})
+    assert driver.name == "noop"
+    assert driver.read_mailbox_stats(date(2025, 12, 31)) == []
+
+
+def test_build_driver_noop_reports_throttle_and_pause_as_unsupported() -> None:
+    driver = build_driver("noop", env={})
+    throttle_result = driver.throttle("a@example.com", 100)
+    pause_result = driver.pause(MailboxRef(provider="noop", mailbox_id="a@example.com"))
+    from deliverability_guard.providers.base import ActionOutcome
+
+    assert throttle_result.outcome is ActionOutcome.UNSUPPORTED
+    assert pause_result.outcome is ActionOutcome.UNSUPPORTED
+
+
 # --- argument parsing / main() --------------------------------------------
 
 
@@ -327,6 +361,102 @@ def test_main_check_reports_an_unknown_provider_cleanly(tmp_path: Path) -> None:
     config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
     exit_code = main(["--config", str(config_path), "check"])
     assert exit_code == 2
+
+
+# --- CLOSE-5b: transport failures get their own exit code, no traceback ---
+
+
+class _TransportFailingDriver:
+    """A driver whose `read_mailbox_stats` raises a transport-level error --
+    standing in for a real network failure (e.g. `httpx.ProxyError`)
+    without any actual network access."""
+
+    name = "fake"
+    capabilities: frozenset[object] = frozenset()
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        raise self._exc
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> object:
+        raise AssertionError("not reached")
+
+    def pause(self, target: object) -> object:
+        raise AssertionError("not reached")
+
+
+def test_main_check_reports_an_httpx_transport_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE-5b's reproduction: a network failure must not traceback and
+    must not exit 1 -- exit 1 already means "ran fine, found a breach," and
+    a cron wrapper can't tell those apart otherwise."""
+    import httpx
+
+    failing_driver = _TransportFailingDriver(httpx.ProxyError("proxy connection refused"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+def test_main_check_reports_a_provider_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other transport-failure family: this project's own
+    `ProviderError` subclasses (rate-limit exhaustion, a malformed
+    response), not just raw `httpx` errors."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    failing_driver = _TransportFailingDriver(RateLimitExceededError("429s all the way down"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+def test_main_run_reports_a_transport_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    failing_driver = _TransportFailingDriver(httpx.ConnectError("connection refused"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+
+
+# --- CLOSE-5a: the noop driver end to end -----------------------------------
+
+
+def test_main_check_with_the_noop_driver_needs_no_credentials(tmp_path: Path) -> None:
+    text = _VALID_YAML.replace("provider: fake", "provider: noop")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
 
 
 def test_main_reports_an_unreadable_decision_log_cleanly(tmp_path: Path) -> None:

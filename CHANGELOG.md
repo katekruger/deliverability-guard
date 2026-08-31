@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: only Instantly was selectable, and a transport failure
+  tracebacked with the same exit code as "ran fine, found a breach"**
+  (external audit finding CLOSE-5). `build_driver` now also registers
+  `smartlead` (via the new `providers.smartlead.SmartleadCampaignDriver`,
+  which pins Smartlead's per-campaign statistics endpoint to one
+  `SMARTLEAD_CAMPAIGN_ID` so it satisfies the generic `ProviderDriver`
+  Protocol) and `noop` (`providers/noop.py`, a credential-free driver that
+  reports no mailboxes, so the CLI's own wiring can be exercised end to
+  end without a live account — previously only possible by calling
+  `cmd_check` directly with a Python `FakeDriver`). `main()` now catches
+  `httpx.HTTPError`/`providers.base.ProviderError` around `check`/`run` and
+  exits `3` with a clean message instead of a raw traceback and exit `1`.
+
 - **`engine/breaker.py`: pooling could still make the breaker LESS sensitive
   than evaluating a mailbox alone, at moderate own-volume** (external audit
   finding CLOSE-2, a follow-up on the ESS-cap fix below). Between roughly 91

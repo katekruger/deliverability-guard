@@ -27,11 +27,23 @@ process, and `Referer` headers on any request the response might trigger.
 error message here is built from a hardcoded path description, never from
 `response.request.url` or `str(response.url)`. Keep it that way in any
 future edit to this file. See SECURITY.md.
+
+`SmartleadDriver.read_mailbox_stats` takes a required `campaign_id` keyword
+argument, which the base `providers.base.ProviderDriver` Protocol's
+`read_mailbox_stats(self, since)` has no room for -- Smartlead's statistics
+endpoint really is per-campaign, not global (see the module docstring
+above), so there is no single implementation of the generic method that
+would be correct without a campaign pinned somewhere. `SmartleadCampaignDriver`
+below is that pinning: it adapts a `SmartleadDriver` plus one campaign id
+into something that satisfies `ProviderDriver` exactly, for `cli.build_driver`
+to construct (CLOSE-5a). Every other method passes straight through to
+`inner`, unchanged.
 """
 
 import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 from typing import cast
 
@@ -172,6 +184,33 @@ class SmartleadDriver:
             detail=f"{_PROVIDER}: campaign {campaign_id} set to {status}",
             capability=Capability.PAUSE,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SmartleadCampaignDriver:
+    """See module docstring: adapts `SmartleadDriver` to the generic
+    `ProviderDriver` Protocol by pinning `read_mailbox_stats` to one
+    campaign id. `throttle`/`pause` pass straight through to `inner`."""
+
+    inner: SmartleadDriver
+    campaign_id: str
+
+    @property
+    def name(self) -> str:
+        return self.inner.name
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self.inner.capabilities
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        return self.inner.read_mailbox_stats(since, campaign_id=self.campaign_id)
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        return self.inner.throttle(mailbox_id, daily_limit)
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        return self.inner.pause(target)
 
 
 def _extract_rows(response: httpx.Response) -> list[object]:

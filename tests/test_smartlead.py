@@ -14,7 +14,7 @@ from deliverability_guard.providers.base import (
     MalformedResponseError,
     RateLimitExceededError,
 )
-from deliverability_guard.providers.smartlead import SmartleadDriver
+from deliverability_guard.providers.smartlead import SmartleadCampaignDriver, SmartleadDriver
 from fixtures.http import recording_client, response
 
 
@@ -199,3 +199,41 @@ def test_malformed_response_error_never_contains_the_api_key() -> None:
         _driver(client).read_mailbox_stats(since=date(2026, 8, 1), campaign_id="camp-1")
     assert "super-secret-key" not in str(exc_info.value)
     assert requests[0].url.params.get("api_key") == "super-secret-key"
+
+
+# --- SmartleadCampaignDriver: the ProviderDriver adapter (CLOSE-5a) --------
+
+
+def test_campaign_driver_pins_read_mailbox_stats_to_its_campaign_id() -> None:
+    client = recording_client(
+        [response(200, "smartlead/campaign_statistics_200.json")],
+        base_url="https://server.smartlead.ai/api/v1",
+    )[0]
+    driver = SmartleadCampaignDriver(inner=_driver(client), campaign_id="camp-1")
+    stats = driver.read_mailbox_stats(date(2026, 8, 1))
+    assert len(stats) > 0
+
+
+def test_campaign_driver_passes_through_name_and_capabilities() -> None:
+    inner = _driver(recording_client([], base_url="https://server.smartlead.ai/api/v1")[0])
+    driver = SmartleadCampaignDriver(inner=inner, campaign_id="camp-1")
+    assert driver.name == inner.name
+    assert driver.capabilities == inner.capabilities
+
+
+def test_campaign_driver_throttle_passes_through() -> None:
+    client, _ = recording_client(
+        [httpx.Response(200, json={})], base_url="https://server.smartlead.ai/api/v1"
+    )
+    driver = SmartleadCampaignDriver(inner=_driver(client), campaign_id="camp-1")
+    result = driver.throttle("acct-1", 25)
+    assert result.outcome == ActionOutcome.PERFORMED
+
+
+def test_campaign_driver_pause_passes_through() -> None:
+    client, _ = recording_client(
+        [httpx.Response(200, json={})], base_url="https://server.smartlead.ai/api/v1"
+    )
+    driver = SmartleadCampaignDriver(inner=_driver(client), campaign_id="camp-1")
+    result = driver.pause(CampaignRef(provider="smartlead", campaign_id="camp-1"))
+    assert result.outcome == ActionOutcome.PERFORMED

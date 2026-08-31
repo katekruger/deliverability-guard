@@ -57,6 +57,10 @@ Every `fast_interval_seconds` (default 300 = 5 minutes) it re-pulls stats and re
 
 `status <mailbox>` prints a mailbox's current breaker state, and `resume <mailbox>` is the only way a paused mailbox becomes active again (see [ADR 0003](docs/decisions/0003-never-auto-resume-after-pause.md) — there is no automatic path back from `PAUSED`, whether it was `check` or `run` that paused it).
 
+Exit codes: `0` all clear, `1` `check` found a breach (or `resume` was refused), `2` a config/setup error (bad YAML, unknown provider, missing credential), `3` a provider transport failure (network error, rate limit exhausted, malformed response) — distinct from `1` so a cron wrapper can tell "the fleet is healthy" apart from "we couldn't even ask the provider."
+
+Selectable providers: `instantly` (needs `INSTANTLY_API_KEY`), `smartlead` (needs `SMARTLEAD_API_KEY` and `SMARTLEAD_CAMPAIGN_ID` — its stats endpoint is per-campaign, not global), and `noop`, which needs no credentials at all and reports no mailboxes — set `provider: noop` in `config/thresholds.yml` to exercise `check`/`run` end to end (config loading, the decision log, exit codes) without a live account.
+
 ```bash
 uv run deliverability-guard status sender@yourdomain.com
 uv run deliverability-guard resume sender@yourdomain.com   # only after a human has looked
@@ -99,7 +103,7 @@ Capability declaration is the whole design of the provider driver interface (`pr
 | Provider | Status in this repo | Read stats | Pause | Throttle | Bounce webhook |
 |---|---|:--:|:--:|:--:|:--:|
 | **Instantly** | ✅ Implemented (reference driver) | per-mailbox daily | ✅ mailbox or campaign | ❌ no primitive | yes |
-| **Smartlead** | ✅ Implemented (proves the throttle path) | per-campaign | campaign only, not per-mailbox | ✅ per-mailbox daily limit | yes |
+| **Smartlead** | ✅ Implemented and CLI-selectable (proves the throttle path) | per-campaign | campaign only, not per-mailbox | ✅ per-mailbox daily limit | yes |
 | Lemlist | Researched, not yet implemented | activities | idempotent, campaign-level | ❌ | unverified |
 | Apollo | Researched, not yet implemented | email stats | list only | ❌ | polling only |
 | Outreach | Researched, not yet implemented | yes | likely (unverified) | likely (unverified) | best-in-class |

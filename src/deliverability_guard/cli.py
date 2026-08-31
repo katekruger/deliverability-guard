@@ -12,6 +12,12 @@ Provider credentials are read from the environment (`AGENTS.md`: no
 secrets in the repo, ever) -- never from the YAML config `config.py` loads.
 `check` and `run`'s fast tick both call `loops.fast.evaluate_all_mailboxes`,
 so the one-shot and continuous forms cannot drift apart from each other.
+
+Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
+was refused), 2 a config/setup error (bad YAML, unknown provider, missing
+credential), 3 a provider transport failure (network error, rate limit
+exhausted, malformed response) -- distinct from 1 so a cron wrapper can tell
+"the fleet is healthy" apart from "we couldn't even ask the provider."
 """
 
 import argparse
@@ -22,6 +28,8 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
+
+import httpx
 
 from deliverability_guard.audit.log import (
     DecisionRecord,
@@ -41,18 +49,19 @@ from deliverability_guard.engine.breaker import (
 from deliverability_guard.loops import controller
 from deliverability_guard.loops.fast import evaluate_all_mailboxes
 from deliverability_guard.loops.slow import ThresholdAdjustment
-from deliverability_guard.providers.base import MailboxRef, ProviderDriver
+from deliverability_guard.providers.base import MailboxRef, ProviderDriver, ProviderError
 from deliverability_guard.providers.instantly import InstantlyDriver
+from deliverability_guard.providers.noop import NoopDriver
+from deliverability_guard.providers.smartlead import SmartleadCampaignDriver, SmartleadDriver
 
 _DEFAULT_CONFIG_PATH = Path("config/thresholds.yml")
 
-# Exit codes. 0: success, nothing to report. 1: `check` found a breaching
-# mailbox, or `resume` was refused (both are "the command ran fine but the
-# answer is bad news" -- distinct from 2, "the command itself couldn't
-# run").
+# Exit codes. See the module docstring's "Exit codes" paragraph above for
+# what each one means to a caller.
 _EXIT_OK = 0
 _EXIT_BREACH_OR_REFUSED = 1
 _EXIT_CONFIG_OR_SETUP_ERROR = 2
+_EXIT_PROVIDER_TRANSPORT_FAILURE = 3
 
 
 class CliError(Exception):
@@ -62,14 +71,32 @@ class CliError(Exception):
 
 
 def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
-    """The provider registry. Currently just Instantly -- see
-    BUILD-PLAN.md §3's v0.1 scope. Extend this, not `main()`, to add a
-    provider."""
+    """The provider registry. Extend this, not `main()`, to add a provider.
+
+    `smartlead` proves the THROTTLE path (BUILD-PLAN.md §5's capability
+    matrix) -- it was fully implemented in `providers/smartlead.py` but
+    unreachable from the CLI until CLOSE-5a registered it here. `noop`
+    requires no credential and reports no mailboxes; it exists so `check`/
+    `run` can be exercised end to end -- config loading, the decision log,
+    exit codes -- without a live provider account (CLOSE-5a).
+    """
     if provider == "instantly":
         api_key = env.get("INSTANTLY_API_KEY")
         if not api_key:
             raise CliError("INSTANTLY_API_KEY is not set (see .env.example)")
         return InstantlyDriver(api_key=api_key)
+    if provider == "smartlead":
+        api_key = env.get("SMARTLEAD_API_KEY")
+        if not api_key:
+            raise CliError("SMARTLEAD_API_KEY is not set (see .env.example)")
+        campaign_id = env.get("SMARTLEAD_CAMPAIGN_ID")
+        if not campaign_id:
+            raise CliError("SMARTLEAD_CAMPAIGN_ID is not set (see .env.example)")
+        return SmartleadCampaignDriver(
+            inner=SmartleadDriver(api_key=api_key), campaign_id=campaign_id
+        )
+    if provider == "noop":
+        return NoopDriver()
     raise CliError(f"unknown provider {provider!r}")
 
 
@@ -292,13 +319,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         except CliError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return _EXIT_CONFIG_OR_SETUP_ERROR
-        return cmd_check(
-            driver=driver,
-            config=config,
-            state_store=state_store,
-            now=datetime.now(UTC),
-            out=sys.stdout,
-        )
+        try:
+            return cmd_check(
+                driver=driver,
+                config=config,
+                state_store=state_store,
+                now=datetime.now(UTC),
+                out=sys.stdout,
+            )
+        except (httpx.HTTPError, ProviderError) as exc:
+            print(f"error: provider request failed: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "run":
         try:
@@ -320,6 +351,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("stopped", file=sys.stdout)
             return _EXIT_OK
+        except (httpx.HTTPError, ProviderError) as exc:
+            print(f"error: provider request failed: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "status":
         mailboxes = [MailboxRef(provider=config.provider, mailbox_id=m) for m in args.mailbox_id]
