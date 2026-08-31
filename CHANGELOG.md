@@ -157,6 +157,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`/`audit/log.py`: `from_log` forgot the daily limit it
+  had just applied, so a process that restarts between every evaluation
+  (e.g. `check` run from cron) re-halved on every single invocation instead
+  of staying idempotent** (external audit finding CLOSE3-1 — "the cron
+  cascade"). Six identical `check` invocations against one mailbox used to
+  compound `50 -> 25 -> 12 -> 6 -> 3 -> PAUSE`; in-process they correctly
+  stayed at one throttle call, because `BreakerStateStore._throttled_at_limit`
+  survived within a single process but was never persisted. `DecisionRecord`
+  now carries `applied_daily_limit` for a PERFORMED throttle, and
+  `BreakerStateStore.from_log` restores `_throttled_at_limit` from it
+  alongside status — six separate `check` invocations now produce exactly
+  one provider throttle call and a final limit of 25.
+
 - **`cli.py`: only Instantly was selectable, and a transport failure
   tracebacked with the same exit code as "ran fine, found a breach"**
   (external audit finding CLOSE-5). `build_driver` now also registers

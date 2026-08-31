@@ -162,7 +162,11 @@ class BreakerStateStore:
     0003: never auto-resume a paused mailbox.
     """
 
-    def __init__(self, initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None) -> None:
+    def __init__(
+        self,
+        initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None,
+        initial_throttled_at_limit: Mapping[MailboxRef, int] | None = None,
+    ) -> None:
         self._status: dict[MailboxRef, MailboxBreakerStatus] = dict(initial) if initial else {}
         # The `current_daily_limit` INPUT that was in force the last time
         # this mailbox was actually throttled (not the halved result) --
@@ -172,7 +176,9 @@ class BreakerStateStore:
         # a PAUSE attempt that FAILS (see `mark_pause_failed`): CLOSE-3c's
         # bug was exactly that a failed pause erased this memory, letting
         # the next THROTTLE re-halve an already-throttled limit.
-        self._throttled_at_limit: dict[MailboxRef, int] = {}
+        self._throttled_at_limit: dict[MailboxRef, int] = (
+            dict(initial_throttled_at_limit) if initial_throttled_at_limit else {}
+        )
 
     @classmethod
     def from_log(cls, path: Path) -> "BreakerStateStore":
@@ -208,17 +214,18 @@ class BreakerStateStore:
         written. Only a log path that doesn't exist AT ALL is genuinely "no
         history yet" (see the `not path.exists()` branch above).
 
-        Known limitation: a rebuilt THROTTLED mailbox's `throttled_at_limit`
-        memo (CLOSE-3b's idempotency key) is NOT restored -- `DecisionRecord`
-        doesn't currently persist the `current_daily_limit` input a throttle
-        was computed against. The first THROTTLE evaluation after a restart
-        will therefore re-act once (computing a fresh, still-correct
-        `new_limit` from whatever `current_daily_limit` actually is, not a
-        stale or corrupted one) rather than staying idempotent immediately.
-        This is a real, deliberate gap, not a silent one: unlike the pause/
-        resume state this method exists to protect, one extra throttle call
-        against real, current data is not the ENG-5a-style cascade this
-        module guards against.
+            A rebuilt THROTTLED mailbox's `throttled_at_limit` memo (CLOSE-3b's
+        idempotency key) IS restored, from `DecisionRecord.applied_daily_limit`
+        (CLOSE3-1): every `DecisionRecord` for a PERFORMED throttle now
+        persists the `current_daily_limit` input the halving was computed
+        against, so a process that restarts between every single evaluation
+        -- e.g. `deliverability-guard check` run from cron, where every
+        invocation genuinely is a fresh process -- stays idempotent from the
+        very first re-evaluation after the first throttle, instead of
+        re-acting once per restart. Before this, six separate `check`
+        invocations against one mailbox compounded 50 -> 25 -> 12 -> 6 -> 3
+        -> an unearned PAUSE, because every invocation's `from_log` forgot
+        the limit it had just applied.
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
@@ -247,10 +254,12 @@ class BreakerStateStore:
             ) from exc
 
         status: dict[MailboxRef, MailboxBreakerStatus] = {}
+        throttled_at_limit: dict[MailboxRef, int] = {}
         for event in events:
             if isinstance(event, ResumeRecord):
                 mailbox = MailboxRef(provider=event.provider, mailbox_id=event.mailbox_id)
                 status[mailbox] = MailboxBreakerStatus.ACTIVE
+                throttled_at_limit.pop(mailbox, None)
                 continue
             record = event
             if record.dry_run:
@@ -267,17 +276,19 @@ class BreakerStateStore:
                 else:
                     status[mailbox] = MailboxBreakerStatus.ACTIVE
             elif record.verdict is Verdict.THROTTLE:
-                status[mailbox] = (
-                    MailboxBreakerStatus.THROTTLED
-                    if record.action_outcome is ActionOutcome.PERFORMED
-                    else MailboxBreakerStatus.ACTIVE
-                )
+                if record.action_outcome is ActionOutcome.PERFORMED:
+                    status[mailbox] = MailboxBreakerStatus.THROTTLED
+                    if record.applied_daily_limit is not None:
+                        throttled_at_limit[mailbox] = record.applied_daily_limit
+                else:
+                    status[mailbox] = MailboxBreakerStatus.ACTIVE
+                    throttled_at_limit.pop(mailbox, None)
             # OK or WARN: notify-only or nothing happened -- leave whatever
             # status this mailbox already had alone. In particular, a
             # PAUSED mailbox reporting healthy-looking evidence later stays
             # PAUSED; only `resume_after_human_review` (via a `ResumeRecord`
             # above) can change that.
-        return cls(status)
+        return cls(status, throttled_at_limit)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)
@@ -362,6 +373,17 @@ class BreakerEvaluation:
     verdict: Verdict
     dry_run: bool
     action: ActionResult | None
+    applied_daily_limit: int | None = None
+    """Set exactly when `verdict is THROTTLE` and `action.outcome is
+    PERFORMED` (fresh throttle, idempotent repeat, or re-throttle after
+    growth alike): the `current_daily_limit` INPUT the mailbox is currently
+    locked to, i.e. `state_store.throttled_at_limit(mailbox)` immediately
+    after `_act` runs. `None` otherwise. This is what
+    `audit.log.DecisionRecord.applied_daily_limit` persists, and what
+    `BreakerStateStore.from_log` restores `_throttled_at_limit` from
+    (CLOSE3-1) -- without it, a process that restarts between every
+    evaluation (e.g. `check` run from cron) has no memory of what it already
+    applied and re-halves on every single invocation."""
 
 
 def evaluate(
@@ -518,6 +540,7 @@ def evaluate(
         state_store.mark_active(mailbox)
 
     action: ActionResult | None = None
+    applied_daily_limit: int | None = None
     if verdict in (Verdict.THROTTLE, Verdict.PAUSE):
         action = _act(
             driver,
@@ -527,6 +550,8 @@ def evaluate(
             dry_run=dry_run,
             current_daily_limit=current_daily_limit,
         )
+        if verdict is Verdict.THROTTLE and action.outcome is ActionOutcome.PERFORMED:
+            applied_daily_limit = state_store.throttled_at_limit(mailbox)
 
     return BreakerEvaluation(
         evaluated_at=now,
@@ -542,6 +567,7 @@ def evaluate(
         verdict=verdict,
         dry_run=dry_run,
         action=action,
+        applied_daily_limit=applied_daily_limit,
     )
 
 

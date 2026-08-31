@@ -16,7 +16,13 @@ from pathlib import Path
 import pytest
 
 import deliverability_guard.cli as cli_module
-from deliverability_guard.audit.log import ResumeRecord, read_events, read_records
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    read_events,
+    read_records,
+)
 from deliverability_guard.cli import (
     CliError,
     build_driver,
@@ -29,12 +35,24 @@ from deliverability_guard.cli import (
 )
 from deliverability_guard.config import load_config
 from deliverability_guard.engine.breaker import (
+    DEFAULT_LADDER,
     BreakerStateStore,
     MailboxBreakerStatus,
     ThresholdStore,
     Verdict,
+    evaluate,
 )
-from deliverability_guard.providers.base import MailboxDayStats, MailboxRef, MailboxStatus
+from deliverability_guard.engine.posterior import DEFAULT_PRIOR
+from deliverability_guard.providers.base import (
+    ActionOutcome,
+    ActionResult,
+    CampaignRef,
+    Capability,
+    MailboxDayStats,
+    MailboxRef,
+    MailboxStatus,
+    unsupported,
+)
 from fixtures.fake_driver import FakeDriver
 
 _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -486,6 +504,133 @@ def test_main_check_end_to_end_with_a_fake_driver(
     exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 0
+
+
+class _ReducingDriver:
+    """Reports a `current_daily_limit` that reflects its own most recent
+    `throttle()` call, and identical sends/complaints on every read --
+    simulating a real provider account queried by six separate `check`
+    invocations against the SAME mailbox (CLOSE3-1's cron-cascade
+    reproduction). Unlike `FakeDriver`, whose `throttle_calls` list is a
+    pure recorder, this one's `read_mailbox_stats` actually reflects the
+    reduction the way a real provider would."""
+
+    name = "fake"
+
+    def __init__(self, *, initial_limit: int) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.current_limit = initial_limit
+        self.throttle_calls: list[tuple[str, int]] = []
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=20_000,
+                bounces=30,
+                current_daily_limit=self.current_limit,
+            )
+        ]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        self.current_limit = daily_limit
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        return unsupported(Capability.PAUSE, self.name, "fake: not exercised in this test")
+
+
+_LIVE_YAML = """
+provider: fake
+complaint_rate_ladder:
+  warn: 0.0005
+  throttle: 0.0010
+  pause: 0.0020
+prior:
+  alpha: 0.5
+  beta: 500
+dry_run: false
+"""
+
+
+def test_six_separate_check_invocations_throttle_the_mailbox_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE3-1: `from_log` must restore `_throttled_at_limit`, not just
+    status, or every `check` invocation looks like a fresh restart with no
+    memory of the limit it already applied -- six identical evaluations
+    compound 50 -> 25 -> 12 -> 6 -> 3 -> PAUSE instead of throttling once and
+    staying idempotent. Six SEPARATE `cli.main` invocations, each of which
+    rebuilds `BreakerStateStore` via `from_log` internally (see
+    `cli.main`), against a driver whose reported `current_daily_limit`
+    reflects its own prior throttle call -- the shape of the documented cron
+    deployment, not an in-process loop."""
+    driver = _ReducingDriver(initial_limit=50)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _ReducingDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(6):
+        main(["--config", str(config_path), "check"])
+
+    assert driver.throttle_calls == [("a@example.com", 25)]
+    assert driver.current_limit == 25
+
+    state_store = BreakerStateStore.from_log(tmp_path / "decisions.jsonl")
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.THROTTLED
+
+
+def test_from_log_restart_between_tick_one_and_two_is_a_no_op(tmp_path: Path) -> None:
+    """A restart between the very first throttle and the second identical
+    evaluation specifically: tick 2 must be idempotent, not a fresh
+    halving."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver()
+    store1 = BreakerStateStore()
+    result1 = evaluate(
+        driver=driver,
+        mailbox=mailbox,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=store1,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(result1))
+    assert driver.throttle_calls == [("a@example.com", 25)]
+
+    # Restart: rebuild state purely from the log.
+    store2 = BreakerStateStore.from_log(log_path)
+    evaluate(
+        driver=driver,
+        mailbox=mailbox,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=store2,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    assert driver.throttle_calls == [("a@example.com", 25)]
 
 
 # --- run: the always-on two-loop daemon -----------------------------------
