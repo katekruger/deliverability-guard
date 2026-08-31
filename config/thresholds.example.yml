@@ -67,3 +67,14 @@ decision_log_path: var/decisions.jsonl
 # a live Postmaster feed.
 fast_interval_seconds: 300 # 5 minutes
 slow_interval_seconds: 86400 # 24 hours
+
+# Caps how much effective sample size a mailbox's same-domain peers can
+# contribute to its posterior when hierarchical pooling is in effect
+# (engine/posterior.py, ADR 0002). A mailbox with at least this many sends
+# of its own is guaranteed a weight in its own posterior at least equal to
+# its (bounded) peer group's, however large that group grows. 5,000 is the
+# volume this project's own tests and docs/statistics.md already treat as
+# "enough of a mailbox's own data to be confident on its own" -- lower it
+# if your deployment's mailboxes are smaller and you want individual
+# evidence to dominate sooner.
+max_pooled_ess: 5000

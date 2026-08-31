@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from deliverability_guard.audit.log import DecisionRecord, append_record
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    append_resume_record,
+)
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
     BreakerStateStore,
@@ -314,6 +319,232 @@ def test_throttle_idempotency_does_not_block_a_first_time_pause() -> None:
     assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
+# --- CLOSE-3: throttle recovery, re-throttle, floor escalation off-by-one --
+
+
+def test_throttle_then_ok_then_throttle_re_throttles() -> None:
+    """CLOSE-3b: a sustained OK verdict clears THROTTLED back to ACTIVE --
+    the ladder's own recovery path for THROTTLE, unlike PAUSE. A later
+    re-degradation must reach the provider again, not be swallowed as an
+    idempotent no-op against a status that never recovered."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+    ok_result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    assert ok_result.verdict == Verdict.OK
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    assert driver.throttle_calls == [("a@example.com", 50), ("a@example.com", 25)]
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+
+def test_throttle_re_throttles_when_the_current_limit_has_grown_past_what_was_applied() -> None:
+    """CLOSE-3b/ENG-5a: the idempotency key is (verdict, applied limit), not
+    just the status. A mailbox stays THROTTLED throughout here (no
+    intervening OK), but its current limit is later reported HIGHER than
+    what the breaker last applied -- evidence something restored it outside
+    the breaker's own bookkeeping. That must reach the provider again, not
+    be swallowed as idempotent."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,  # -> throttled to 50
+    )
+    assert driver.throttle_calls == [("a@example.com", 50)]
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+    # An identical re-evaluation with the SAME current_daily_limit (100) is
+    # still idempotent, exactly like the six-identical-ticks case.
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    assert driver.throttle_calls == [("a@example.com", 50)]
+
+    # Now the mailbox's real current limit is reported HIGHER than 100 --
+    # something restored it beyond where the breaker last found it.
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=150,
+    )
+    assert driver.throttle_calls == [("a@example.com", 50), ("a@example.com", 75)]
+
+
+def test_failed_pause_does_not_let_a_later_throttle_re_halve() -> None:
+    """CLOSE-3c's reproduction: THROTTLE -> 25; a PAUSE attempt in between
+    FAILS; the next THROTTLE (against the same, unchanged current limit)
+    must stay idempotent, not halve again (25 -> 12)."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,  # -> throttled to 25
+    )
+    assert driver.throttle_calls == [("a@example.com", 25)]
+
+    driver.pause_outcome = ActionOutcome.FAILED
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=25,
+    )
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSE_FAILED
+
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=25,
+    )
+    assert driver.throttle_calls == [("a@example.com", 25)]  # NOT halved again to 12
+
+
+def test_daily_limit_of_two_escalates_to_pause() -> None:
+    """CLOSE-3d: `2 // 2 == 1`, exactly the floor -- must escalate, not
+    silently clamp to a de-facto pause with no human gate."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=2,
+    )
+    assert result.verdict == Verdict.PAUSE
+    assert driver.throttle_calls == []
+    assert driver.pause_calls == [_MAILBOX]
+
+
+def test_daily_limit_of_three_escalates_to_pause() -> None:
+    """CLOSE-3d: `3 // 2 == 1`, also exactly the floor."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=3,
+    )
+    assert result.verdict == Verdict.PAUSE
+    assert driver.throttle_calls == []
+    assert driver.pause_calls == [_MAILBOX]
+
+
+def test_daily_limit_of_four_still_throttles_normally() -> None:
+    """`4 // 2 == 2`, meaningfully above the floor -- must NOT escalate."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=4,
+    )
+    assert result.verdict == Verdict.THROTTLE
+    assert driver.throttle_calls == [("a@example.com", 2)]
+    assert driver.pause_calls == []
+
+
 def test_pause_verdict_pauses_and_marks_state() -> None:
     driver = FakeDriver()
     state_store = BreakerStateStore()
@@ -356,7 +587,13 @@ def test_repeated_pause_verdict_does_not_call_pause_twice() -> None:
     assert driver.pause_calls == [_MAILBOX]  # only the first evaluation actually called pause()
 
 
-def test_pause_failure_reverts_status_to_active() -> None:
+def test_pause_failure_marks_pause_failed_not_active() -> None:
+    """CLOSE-3c: a FAILED pause is a definitive answer, but NOT "verified
+    healthy" -- it must not look like ACTIVE (pristine) to a later THROTTLE
+    evaluation. This deliberately changes the old assertion (`== ACTIVE`),
+    which encoded the exact bug this fixes: a failed pause reset a
+    mailbox's status such that a subsequent THROTTLE re-halved an
+    already-throttled limit instead of staying idempotent."""
     driver = FakeDriver(pause_outcome=ActionOutcome.FAILED)
     state_store = BreakerStateStore()
     evaluate(
@@ -370,7 +607,7 @@ def test_pause_failure_reverts_status_to_active() -> None:
         dry_run=False,
         now=_NOW,
     )
-    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSE_FAILED
 
 
 def test_pause_unsupported_reverts_status_to_active() -> None:
@@ -606,9 +843,20 @@ def test_compliance_gate_false_does_not_change_normal_behavior() -> None:
 
 
 def test_evaluate_with_peer_group_uses_pooled_posterior() -> None:
-    """Wiring check: passing `peer_group` pulls a marginal mailbox's verdict
-    toward its healthy peers' posterior -- proving `evaluate()` actually
-    calls `engine.posterior.pooled_posterior` rather than `update()` alone."""
+    """Wiring check: passing `peer_group` pulls a marginal mailbox's
+    POSTERIOR toward its healthy peers' posterior -- proving `evaluate()`
+    actually calls `engine.posterior.pooled_posterior` rather than
+    `update()` alone.
+
+    This does NOT assert `pooled_result.lower_bound < flat_result.lower_bound`
+    (the old version of this test did): CLOSE-2 fixed a bug where pooling
+    could make the breaker's EFFECTIVE decision quieter than the flat
+    evaluation alone, so `evaluate()` now takes the worse of the pooled and
+    flat lower bounds when `peer_group` is given -- see
+    `test_evaluate_peer_group_lower_bound_is_never_below_the_flat_one`
+    below. The `.posterior` FIELD (used for audit/inspection) is still the
+    raw pooled `BetaDistribution`, unaffected by that -- which is what this
+    test checks instead."""
     driver = FakeDriver()
     healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
     pooled_result = evaluate(
@@ -635,9 +883,40 @@ def test_evaluate_with_peer_group_uses_pooled_posterior() -> None:
         now=_NOW,
     )
     assert pooled_result.posterior != flat_result.posterior
+    from deliverability_guard.engine.posterior import pooled_posterior
+
+    assert pooled_result.posterior == pooled_posterior(
+        DEFAULT_PRIOR, healthy_peers, own_sends=50, own_complaints=1
+    )
+
+
+def test_evaluate_peer_group_lower_bound_is_never_below_the_flat_one() -> None:
+    """CLOSE-2: pooling must never make the breaker's effective decision
+    LESS sensitive than evaluating this mailbox's own evidence alone would
+    -- `evaluate()` takes the worse (higher) of the pooled and flat lower
+    bounds whenever `peer_group` is given. Here the peer group is healthy
+    enough that the POOLED posterior alone would read this mailbox as
+    quieter than its own evidence -- the effective lower bound must still
+    match (or exceed) the flat one."""
+    driver = FakeDriver()
+    healthy_peers = [GroupObservation(sends=500, complaints=0) for _ in range(40)]
+    pooled_result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=50,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    from deliverability_guard.engine.posterior import update
+
+    flat_lower_bound = update(DEFAULT_PRIOR, sends=50, complaints=1).lower_bound()
     assert pooled_result.lower_bound is not None
-    assert flat_result.lower_bound is not None
-    assert pooled_result.lower_bound < flat_result.lower_bound
+    assert pooled_result.lower_bound >= flat_lower_bound
 
 
 def test_evaluate_peer_group_does_not_mask_a_mailbox_with_enough_of_its_own_evidence() -> None:
@@ -661,6 +940,75 @@ def test_evaluate_peer_group_does_not_mask_a_mailbox_with_enough_of_its_own_evid
     )
     assert result.verdict == Verdict.PAUSE
     assert driver.pause_calls == [_MAILBOX]
+
+
+# --- CLOSE-2: pooling never masks a breach the flat evaluation would catch -
+
+
+@pytest.mark.parametrize("own_sends", [1, 10, 50, 100, 200, 500, 1000, 5000])
+def test_pooled_breach_at_the_verdict_level_is_true_wherever_flat_breach_is_true(
+    own_sends: int,
+) -> None:
+    """The CLOSE-2 reproduction, as a property: a mailbox sending at a true
+    5% complaint rate (16x Gmail's ceiling) against 999 HEALTHY peers must
+    breach through `evaluate()`'s pooled path at every own-volume level
+    tested, wherever it would breach evaluated flat/alone -- before this
+    fix, pooling masked the breach at 100 and 200 own sends specifically
+    (a healthy-looking pooled posterior diluted a genuinely bad mailbox's
+    own evidence)."""
+    own_complaints = round(own_sends * 0.05)
+    healthy_peers = [GroupObservation(sends=5000, complaints=5) for _ in range(999)]  # 0.1% each
+
+    flat = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=own_sends,
+        complaints=own_complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    pooled = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=own_sends,
+        complaints=own_complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+
+    if flat.verdict is not Verdict.OK:
+        assert pooled.verdict is not Verdict.OK, (
+            f"pooling masked a breach at own_sends={own_sends}: "
+            f"flat={flat.verdict.name} pooled={pooled.verdict.name}"
+        )
+
+
+def test_n1_at_100_percent_against_999_healthy_peers_still_does_not_breach() -> None:
+    """The legitimate case pooling exists for must survive CLOSE-2's fix:
+    one complaint in one send, against a domain of 999 perfectly healthy
+    peers, still must not breach -- n=1 is not enough evidence to say
+    anything, no matter how the peer group looks."""
+    healthy_peers = [GroupObservation(sends=5000, complaints=0) for _ in range(999)]
+    result = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=1,
+        complaints=1,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+        peer_group=healthy_peers,
+    )
+    assert result.verdict == Verdict.OK
 
 
 def test_evaluate_without_peer_group_is_unchanged_flat_behavior() -> None:
@@ -751,7 +1099,9 @@ def test_state_store_rebuilds_throttled_status_from_the_decision_log(tmp_path: P
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
 
 
-def test_state_store_rebuild_reverts_to_active_on_a_failed_pause_attempt(tmp_path: Path) -> None:
+def test_state_store_rebuild_marks_pause_failed_on_a_failed_pause_attempt(tmp_path: Path) -> None:
+    """Mirrors the live-path behavior (CLOSE-3c): a FAILED pause rebuilds as
+    PAUSE_FAILED, not ACTIVE -- it was never verified healthy."""
     log_path = tmp_path / "decisions.jsonl"
     driver = FakeDriver(pause_outcome=ActionOutcome.FAILED)
     state_store = BreakerStateStore()
@@ -769,7 +1119,7 @@ def test_state_store_rebuild_reverts_to_active_on_a_failed_pause_attempt(tmp_pat
     append_record(log_path, DecisionRecord.from_evaluation(evaluation))
 
     restored = BreakerStateStore.from_log(log_path)
-    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSE_FAILED
 
 
 def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_later_healthy_evaluations(
@@ -811,6 +1161,32 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_later_healthy
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
+def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(
+    tmp_path: Path,
+) -> None:
+    """A definitively UNSUPPORTED pause -- the provider can never pause this
+    target -- rebuilds as ACTIVE, distinct from PAUSE_FAILED (which is for a
+    transient FAILED outcome, not a structural one)."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver(capabilities=frozenset({Capability.READ_STATS}))
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
 def test_state_store_from_log_with_no_file_yet_is_an_empty_active_store(tmp_path: Path) -> None:
     """No log file at all is a genuinely new deployment -- every mailbox
     correctly defaults to ACTIVE. This is the "no record" case, distinct
@@ -827,5 +1203,154 @@ def test_state_store_from_log_fails_closed_on_an_unreadable_log(tmp_path: Path) 
     PAUSED. Fail loudly instead."""
     log_path = tmp_path / "decisions.jsonl"
     log_path.write_text("not valid json\n")
+    with pytest.raises(BreakerStateStoreLoadError):
+        BreakerStateStore.from_log(log_path)
+
+
+# --- CLOSE-4: resume durability, dry-run non-persistence, empty log --------
+
+
+def test_state_store_rebuilds_active_status_from_a_resume_record_after_pause(
+    tmp_path: Path,
+) -> None:
+    """The CLOSE-4 reproduction, at the breaker level: a paused mailbox with
+    a `ResumeRecord` after it in the log must rebuild as ACTIVE."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+    append_resume_record(
+        log_path,
+        ResumeRecord(
+            resumed_at=_NOW, provider="fake", mailbox_id="a@example.com", resumed_by="kate"
+        ),
+    )
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_rebuild_re_pauses_after_a_later_resume_if_evaluated_again(
+    tmp_path: Path,
+) -> None:
+    """A resume is a point-in-time event, not a permanent exemption: a
+    mailbox resumed and then paused AGAIN later must rebuild as PAUSED --
+    `from_log` must apply events strictly in file order, not just check
+    "was there ever a resume record."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    first_pause = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(first_pause))
+    append_resume_record(
+        log_path,
+        ResumeRecord(
+            resumed_at=_NOW, provider="fake", mailbox_id="a@example.com", resumed_by="kate"
+        ),
+    )
+    second_pause = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(second_pause))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_from_log_skips_a_dry_run_pause_record(tmp_path: Path) -> None:
+    """CLOSE-4b's reproduction: a dry-run PAUSE record must never rebuild as
+    PAUSED -- the real (fake) driver was never touched."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert evaluation.verdict == Verdict.PAUSE
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_from_log_dry_run_pause_then_real_pause_of_another_mailbox(
+    tmp_path: Path,
+) -> None:
+    """A dry-run pause of one mailbox must not affect a real pause of a
+    different mailbox recorded in the same log."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    other_mailbox = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    dry_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(dry_eval))
+    real_eval = evaluate(
+        driver=driver,
+        mailbox=other_mailbox,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(real_eval))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert restored.status_of(other_mailbox) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_from_log_fails_closed_on_an_empty_log(tmp_path: Path) -> None:
+    """A log that EXISTS but is zero bytes is ambiguous between "nothing has
+    ever happened" and "the log was truncated" -- fail loudly, the same as
+    any other unreadable log, rather than rebuilding an all-ACTIVE store."""
+    log_path = tmp_path / "decisions.jsonl"
+    log_path.write_text("")
     with pytest.raises(BreakerStateStoreLoadError):
         BreakerStateStore.from_log(log_path)

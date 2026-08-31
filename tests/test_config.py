@@ -90,6 +90,35 @@ def test_fast_and_slow_interval_seconds_are_configurable(tmp_path: Path) -> None
     assert config.slow_interval_seconds == 3600
 
 
+def test_max_pooled_ess_has_a_default(tmp_path: Path) -> None:
+    from deliverability_guard.engine.posterior import DEFAULT_MAX_POOLED_ESS
+
+    path = _write(tmp_path, _VALID_YAML)
+    config = load_config(path)
+    assert config.max_pooled_ess == DEFAULT_MAX_POOLED_ESS
+
+
+def test_max_pooled_ess_is_configurable(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nmax_pooled_ess: 100\n"
+    path = _write(tmp_path, text)
+    config = load_config(path)
+    assert config.max_pooled_ess == 100.0
+
+
+def test_non_numeric_max_pooled_ess_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nmax_pooled_ess: not-a-number\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="max_pooled_ess"):
+        load_config(path)
+
+
+def test_nonpositive_max_pooled_ess_raises_config_error(tmp_path: Path) -> None:
+    text = _VALID_YAML + "\nmax_pooled_ess: 0\n"
+    path = _write(tmp_path, text)
+    with pytest.raises(ConfigError, match="max_pooled_ess"):
+        load_config(path)
+
+
 def test_non_integer_fast_interval_seconds_raises_config_error(tmp_path: Path) -> None:
     text = _VALID_YAML + "\nfast_interval_seconds: not-a-number\n"
     path = _write(tmp_path, text)

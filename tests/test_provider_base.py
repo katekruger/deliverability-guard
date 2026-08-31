@@ -47,6 +47,17 @@ def test_mailbox_day_stats_rejects_negative_bounces() -> None:
         )
 
 
+def test_mailbox_day_stats_rejects_a_negative_current_daily_limit() -> None:
+    with pytest.raises(ValueError, match="current_daily_limit"):
+        MailboxDayStats(
+            mailbox=MailboxRef(provider="x", mailbox_id="a@example.com"),
+            day=datetime(2026, 1, 1, tzinfo=UTC).date(),
+            sends=5,
+            bounces=0,
+            current_daily_limit=-1,
+        )
+
+
 def _event(event_id: str, occurred_at: datetime) -> WebhookEvent:
     return WebhookEvent(
         event_id=event_id, provider="instantly", event_type="bounce", occurred_at=occurred_at

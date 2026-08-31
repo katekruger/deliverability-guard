@@ -21,10 +21,17 @@ the threshold -- i.e. only when the data supports real confidence that the
 true rate is that high, not merely that a single unlucky (or lucky) draw
 landed there.
 
-STATUS (August 2026): the pooling implemented in this module is complete
-pooling weighted by raw volume, not the partial pooling ADR 0002 describes,
-and it is not called from breaker.evaluate(). Every production verdict comes
-from the flat per-mailbox posterior described in ADR 0001. See ENG-4.
+STATUS (August 2026, updated): both halves of the earlier status note here
+are now fixed. `pooled_prior`/`pooled_posterior` cap the peer group's
+effective sample size at `DEFAULT_MAX_POOLED_ESS`, making this genuinely
+partial pooling rather than complete pooling weighted by raw volume (ADR
+0002's addendum, ENG-4) -- and, separately, `engine.breaker.evaluate` now
+calls `pooled_posterior` via its `peer_group` parameter, and
+`loops.fast.evaluate_all_mailboxes` -- the chokepoint both `cli.cmd_check`
+and `loops.controller.run`'s fast tick share -- builds each mailbox's
+same-domain peer group and passes it through, so a real `check`/`run`
+actually pools in production rather than only in tests that call this
+module directly (CLOSE-1). See ADR 0002 for the full history of both fixes.
 """
 
 from collections.abc import Iterable
@@ -263,11 +270,16 @@ def pooled_posterior(
     fit). See ADR 0002 for why that tradeoff is the right one here, and what
     it does and doesn't assume.
 
-    STATUS (August 2026): despite the name, what this implements is complete
-    pooling weighted by raw volume, not the partial pooling described above. A
-    mailbox with 5,000 sends does not dominate the aggregate: against 99 peers
-    it contributes roughly 1 percent of its own posterior. This function is
-    also not called from breaker.evaluate(). See ADR 0002 and ENG-4.
+    STATUS (August 2026, updated): both gaps the earlier version of this
+    note described are closed. The `max_ess` cap (ADR 0002's addendum,
+    ENG-4) makes this genuinely partial pooling: a mailbox with 5,000 sends
+    of its own is now guaranteed a weight in its own posterior at least
+    equal to the (bounded) peer group's, however large that group grows.
+    And `engine.breaker.evaluate` calls this function whenever its
+    `peer_group` parameter is given, with `loops.fast.evaluate_all_mailboxes`
+    building and passing each mailbox's real same-domain peer group in
+    production (CLOSE-1) -- this is no longer reachable only from tests.
+    See ADR 0002 for the full history.
     """
     group_posterior = pooled_prior(prior, other_members, max_ess=max_ess)
     return update(group_posterior, own_sends, own_complaints)

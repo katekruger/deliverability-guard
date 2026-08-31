@@ -8,7 +8,10 @@ import pytest
 from deliverability_guard.audit.log import (
     CorruptDecisionRecordError,
     DecisionRecord,
+    ResumeRecord,
     append_record,
+    append_resume_record,
+    read_events,
     read_records,
     replay,
 )
@@ -59,12 +62,36 @@ def _record_insufficient_data() -> DecisionRecord:
 
 
 def test_from_evaluation_captures_the_pause_verdict_and_action() -> None:
+    """`_record_with_action()` evaluates with `dry_run=True` -- the recorded
+    `action_outcome` is `DRY_RUN`, not `PERFORMED`: CLOSE-4b, the record must
+    never claim a real provider call happened when dry-run means it didn't.
+    (`BreakerEvaluation.action.outcome` itself, at the engine level, stays
+    PERFORMED either way -- see `providers.base.ActionOutcome.DRY_RUN`.)"""
     record = _record_with_action()
     assert record.verdict == Verdict.PAUSE
     assert record.data_state == DataState.OK
-    assert record.action_outcome == ActionOutcome.PERFORMED
+    assert record.action_outcome == ActionOutcome.DRY_RUN
     assert record.action_capability == Capability.PAUSE
     assert record.posterior_alpha is not None
+
+
+def test_from_evaluation_of_a_live_pause_records_performed() -> None:
+    """The live (non-dry-run) counterpart to the test above: a real action
+    is recorded as PERFORMED, exactly as before -- the DRY_RUN distinction
+    only ever applies to a dry-run evaluation."""
+    evaluation = evaluate(
+        driver=FakeDriver(),
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    record = DecisionRecord.from_evaluation(evaluation)
+    assert record.action_outcome == ActionOutcome.PERFORMED
 
 
 def test_from_evaluation_handles_insufficient_data_with_no_posterior() -> None:
@@ -246,3 +273,66 @@ def test_the_whole_evaluation_is_reproducible_from_the_log_alone(tmp_path: Path)
 
     (record,) = read_records(path)
     assert replay(record) == record.verdict == Verdict.PAUSE
+
+
+# --- ResumeRecord --------------------------------------------------------
+
+
+def _resume_record() -> ResumeRecord:
+    return ResumeRecord(
+        resumed_at=_NOW, provider="fake", mailbox_id="a@example.com", resumed_by="kate"
+    )
+
+
+def test_resume_record_to_dict_from_dict_round_trip() -> None:
+    original = _resume_record()
+    round_tripped = ResumeRecord.from_dict(original.to_dict())
+    assert round_tripped == original
+
+
+def test_resume_record_from_dict_rejects_a_missing_field() -> None:
+    data = _resume_record().to_dict()
+    del data["resumed_by"]
+    with pytest.raises(CorruptDecisionRecordError):
+        ResumeRecord.from_dict(data)
+
+
+def test_read_records_skips_resume_records(tmp_path: Path) -> None:
+    """`read_records` (decision records only) must not choke on -- or
+    include -- a resume record interleaved in the same log."""
+    path = tmp_path / "decisions.jsonl"
+    decision = _record_with_action()
+    append_record(path, decision)
+    append_resume_record(path, _resume_record())
+    append_record(path, decision)
+    assert read_records(path) == [decision, decision]
+
+
+def test_read_events_returns_decision_and_resume_records_in_file_order(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    decision = _record_with_action()
+    resume = _resume_record()
+    append_record(path, decision)
+    append_resume_record(path, resume)
+
+    events = read_events(path)
+
+    assert events == [decision, resume]
+
+
+def test_read_records_rejects_a_non_object_line(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    path.write_text("5\n")
+    with pytest.raises(CorruptDecisionRecordError):
+        read_records(path)
+
+
+def test_read_events_skips_blank_lines(tmp_path: Path) -> None:
+    path = tmp_path / "decisions.jsonl"
+    decision = _record_with_action()
+    append_record(path, decision)
+    with path.open("a", encoding="utf-8") as f:
+        f.write("\n")
+    append_resume_record(path, _resume_record())
+
+    assert read_events(path) == [decision, _resume_record()]

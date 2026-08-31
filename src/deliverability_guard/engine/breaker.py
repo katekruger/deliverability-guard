@@ -120,6 +120,14 @@ class MailboxBreakerStatus(Enum):
     THROTTLED = auto()
     PAUSE_IN_FLIGHT = auto()
     PAUSED = auto()
+    # A pause attempt got a definitive FAILED from the provider. Distinct
+    # from ACTIVE (CLOSE-3c): ACTIVE means "verified healthy," and treating a
+    # failed pause as ACTIVE let a subsequent THROTTLE verdict see a mailbox
+    # that still needed a real limit reduction as if it were pristine,
+    # re-halving an already-throttled limit (25 -> 12) instead of staying
+    # idempotent against what was already applied. See `_act`'s PAUSE branch
+    # and `BreakerStateStore.mark_pause_failed`.
+    PAUSE_FAILED = auto()
 
 
 class BreakerStateStoreLoadError(Exception):
@@ -156,6 +164,15 @@ class BreakerStateStore:
 
     def __init__(self, initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None) -> None:
         self._status: dict[MailboxRef, MailboxBreakerStatus] = dict(initial) if initial else {}
+        # The `current_daily_limit` INPUT that was in force the last time
+        # this mailbox was actually throttled (not the halved result) --
+        # CLOSE-3b's "(verdict, applied limit)" idempotency key. A THROTTLE
+        # verdict is only a repeat, not a new event, when the mailbox's
+        # current limit hasn't grown past this since. Deliberately survives
+        # a PAUSE attempt that FAILS (see `mark_pause_failed`): CLOSE-3c's
+        # bug was exactly that a failed pause erased this memory, letting
+        # the next THROTTLE re-halve an already-throttled limit.
+        self._throttled_at_limit: dict[MailboxRef, int] = {}
 
     @classmethod
     def from_log(cls, path: Path) -> "BreakerStateStore":
@@ -170,38 +187,85 @@ class BreakerStateStore:
         store, which would be indistinguishable from "no history" and could
         silently un-pause a mailbox that the log actually says is PAUSED.
 
-        Known limitation: `resume_after_human_review` doesn't itself write a
-        decision record (it isn't a `BreakerEvaluation`), so a mailbox that
-        was resumed by a human and never evaluated again before a restart
-        will be rebuilt as PAUSED rather than ACTIVE. This is a real gap,
-        but an intentionally fail-safe one, consistent with ADR 0003: on
-        ambiguity, this class errs toward PAUSED, never toward ACTIVE.
+        `resume_after_human_review` now writes its own `ResumeRecord` to the
+        same log (see `cli.cmd_resume`), replayed here in file order
+        alongside decision records -- a mailbox resumed by a human and never
+        evaluated again before a restart correctly rebuilds as ACTIVE.
+
+        A record whose `dry_run` is `True` is skipped entirely when deriving
+        status: a dry-run action never touched the real provider (AGENTS.md:
+        dry-run must be a no-op), so it must never be read back as having
+        actually paused or throttled a mailbox -- that would let a dry-run
+        deployment accumulate persistent PAUSED state for mailboxes it was
+        explicitly configured never to touch, exactly the failure the
+        default-dry-run non-negotiable exists to prevent.
+
+        An existing-but-empty log file is treated the same as an unreadable
+        one, raising `BreakerStateStoreLoadError` rather than silently
+        producing the empty (every-mailbox-ACTIVE) store: a zero-byte log is
+        indistinguishable from "the log was truncated mid-write" and could
+        just as easily mean history was lost as mean nothing was ever
+        written. Only a log path that doesn't exist AT ALL is genuinely "no
+        history yet" (see the `not path.exists()` branch above).
+
+        Known limitation: a rebuilt THROTTLED mailbox's `throttled_at_limit`
+        memo (CLOSE-3b's idempotency key) is NOT restored -- `DecisionRecord`
+        doesn't currently persist the `current_daily_limit` input a throttle
+        was computed against. The first THROTTLE evaluation after a restart
+        will therefore re-act once (computing a fresh, still-correct
+        `new_limit` from whatever `current_daily_limit` actually is, not a
+        stale or corrupted one) rather than staying idempotent immediately.
+        This is a real, deliberate gap, not a silent one: unlike the pause/
+        resume state this method exists to protect, one extra throttle call
+        against real, current data is not the ENG-5a-style cascade this
+        module guards against.
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
         # from this module.
         import json
 
-        from deliverability_guard.audit.log import CorruptDecisionRecordError, read_records
+        from deliverability_guard.audit.log import (
+            CorruptDecisionRecordError,
+            ResumeRecord,
+            read_events,
+        )
 
         if not path.exists():
             return cls()
         try:
-            records = read_records(path)
+            if path.stat().st_size == 0:
+                raise BreakerStateStoreLoadError(
+                    f"decision log {path} exists but is empty -- ambiguous between "
+                    "'nothing has ever been recorded' and 'the log was truncated', "
+                    "so refusing to rebuild an all-ACTIVE store from it"
+                )
+            events = read_events(path)
         except (OSError, json.JSONDecodeError, CorruptDecisionRecordError) as exc:
             raise BreakerStateStoreLoadError(
                 f"could not rebuild breaker state from {path}: {exc}"
             ) from exc
 
         status: dict[MailboxRef, MailboxBreakerStatus] = {}
-        for record in records:
+        for event in events:
+            if isinstance(event, ResumeRecord):
+                mailbox = MailboxRef(provider=event.provider, mailbox_id=event.mailbox_id)
+                status[mailbox] = MailboxBreakerStatus.ACTIVE
+                continue
+            record = event
+            if record.dry_run:
+                # Never actually touched the provider -- see docstring above.
+                continue
             mailbox = MailboxRef(provider=record.provider, mailbox_id=record.mailbox_id)
             if record.verdict is Verdict.PAUSE:
-                status[mailbox] = (
-                    MailboxBreakerStatus.PAUSED
-                    if record.action_outcome is ActionOutcome.PERFORMED
-                    else MailboxBreakerStatus.ACTIVE
-                )
+                if record.action_outcome is ActionOutcome.PERFORMED:
+                    status[mailbox] = MailboxBreakerStatus.PAUSED
+                elif record.action_outcome is ActionOutcome.FAILED:
+                    # Mirrors `_act`'s live-path distinction (CLOSE-3c): a
+                    # FAILED pause is not "verified healthy."
+                    status[mailbox] = MailboxBreakerStatus.PAUSE_FAILED
+                else:
+                    status[mailbox] = MailboxBreakerStatus.ACTIVE
             elif record.verdict is Verdict.THROTTLE:
                 status[mailbox] = (
                     MailboxBreakerStatus.THROTTLED
@@ -211,14 +275,23 @@ class BreakerStateStore:
             # OK or WARN: notify-only or nothing happened -- leave whatever
             # status this mailbox already had alone. In particular, a
             # PAUSED mailbox reporting healthy-looking evidence later stays
-            # PAUSED; only `resume_after_human_review` can change that.
+            # PAUSED; only `resume_after_human_review` (via a `ResumeRecord`
+            # above) can change that.
         return cls(status)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)
 
-    def mark_throttled(self, mailbox: MailboxRef) -> None:
+    def throttled_at_limit(self, mailbox: MailboxRef) -> int | None:
+        """The `current_daily_limit` input in force the last time this
+        mailbox was actually throttled, or `None` if it never has been (or
+        that memory has since been cleared by genuine recovery -- see
+        `mark_active`)."""
+        return self._throttled_at_limit.get(mailbox)
+
+    def mark_throttled(self, mailbox: MailboxRef, *, current_daily_limit: int) -> None:
         self._status[mailbox] = MailboxBreakerStatus.THROTTLED
+        self._throttled_at_limit[mailbox] = current_daily_limit
 
     def mark_pause_in_flight(self, mailbox: MailboxRef) -> None:
         self._status[mailbox] = MailboxBreakerStatus.PAUSE_IN_FLIGHT
@@ -226,16 +299,36 @@ class BreakerStateStore:
     def mark_paused(self, mailbox: MailboxRef) -> None:
         self._status[mailbox] = MailboxBreakerStatus.PAUSED
 
+    def mark_pause_failed(self, mailbox: MailboxRef) -> None:
+        """A pause attempt got a definitive FAILED from the provider
+        (CLOSE-3c). Deliberately distinct from `mark_active`: this mailbox
+        has NOT been verified healthy, so it must not look pristine to a
+        subsequent THROTTLE evaluation. Unlike `mark_active`, this does
+        *not* clear `throttled_at_limit` -- that memory is exactly what
+        keeps a later THROTTLE idempotent instead of re-halving."""
+        self._status[mailbox] = MailboxBreakerStatus.PAUSE_FAILED
+
     def mark_active(self, mailbox: MailboxRef) -> None:
-        """For a pause attempt that definitively failed (provider said no),
-        not for "response lost" (which must stay PAUSE_IN_FLIGHT so the next
-        tick reconciles) and never for un-pausing a confirmed-paused mailbox."""
+        """For a pause attempt that's definitively UNSUPPORTED (the provider
+        structurally can't pause this target), for a genuine recovery (a
+        sustained OK verdict clearing a THROTTLED mailbox -- CLOSE-3b), and
+        for `resume_after_human_review` below. Not for "response lost"
+        (which must stay PAUSE_IN_FLIGHT so the next tick reconciles) or a
+        FAILED pause (see `mark_pause_failed`), and never for un-pausing a
+        confirmed-paused mailbox on its own.
+
+        Clears `throttled_at_limit`: ACTIVE means this mailbox is being
+        treated as pristine again, so a future THROTTLE must not be
+        compared against a limit from a throttle episode that's now over.
+        """
         self._status[mailbox] = MailboxBreakerStatus.ACTIVE
+        self._throttled_at_limit.pop(mailbox, None)
 
     def resume_after_human_review(self, mailbox: MailboxRef) -> None:
         """The only way back from PAUSED to ACTIVE. Not called anywhere in
         this module's automatic evaluation path. See ADR 0003."""
         self._status[mailbox] = MailboxBreakerStatus.ACTIVE
+        self._throttled_at_limit.pop(mailbox, None)
 
 
 # A mailbox throttled all the way to 0/day is a pause wearing a different
@@ -299,6 +392,15 @@ def evaluate(
     a mailbox with enough of its own evidence into looking healthy (ADR
     0002). `None` (the default) reproduces the flat, non-pooled posterior
     every caller used before this parameter existed.
+
+    When `peer_group` is given, the VERDICT (and the `lower_bound` returned
+    on `BreakerEvaluation`) is the WORSE of the pooled and flat lower bounds
+    -- never just the pooled one (ADR 0007). The ESS cap alone still let a
+    large healthy peer group make the breaker read a mailbox with enough of
+    its OWN bad evidence to breach on its own as healthy once pooled, at
+    own-volume levels the cap didn't bound. `BreakerEvaluation.posterior`
+    itself is unaffected by this and remains the raw pooled posterior, for
+    audit/inspection -- only which lower bound decides the verdict changes.
 
     `thresholds` must be a value already snapshotted by the caller (e.g.
     `ThresholdStore.current` read once before calling) -- this function
@@ -375,18 +477,45 @@ def evaluate(
 
     posterior = _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
     lower_bound = posterior.lower_bound(confidence)
+    if peer_group is not None:
+        # ADR 0002's CLOSE-2 addendum: pooling must never make the breaker
+        # LESS sensitive than evaluating this mailbox's own evidence alone
+        # would. Between roughly 91 and 389 own sends, the pooled posterior
+        # was strictly quieter than the flat one -- a mailbox breaching at
+        # 5% (16x Gmail's ceiling) on its own evidence read as healthy once
+        # pooled with enough healthy peers. Taking the worse (higher) of the
+        # two lower bounds guarantees pooling only ever ADDS sensitivity:
+        # the flat evaluation is always still checked, so a mailbox with
+        # enough of its own evidence to breach on its own keeps breaching
+        # regardless of its peer group, while a mailbox with too little of
+        # its own evidence to say anything (the legitimate case pooling
+        # exists for) is unaffected, since its flat lower bound is small
+        # enough that the pooled one -- healthy or not -- still wins the max.
+        lower_bound = max(lower_bound, update(prior, sends, complaints).lower_bound(confidence))
     verdict = rung(lower_bound, thresholds)
 
     if (
         verdict is Verdict.THROTTLE
         and current_daily_limit is not None
-        and current_daily_limit // 2 < _MIN_THROTTLED_DAILY_LIMIT
+        and current_daily_limit // 2 <= _MIN_THROTTLED_DAILY_LIMIT
     ):
-        # Escalate: a throttle that would floor-clamp is a pause wearing a
-        # different hat (see `_MIN_THROTTLED_DAILY_LIMIT`'s docstring). Route
-        # it through PAUSE -- and therefore through the human-review gate
-        # (ADR 0003) -- instead of silently clamping at the floor forever.
+        # Escalate: a throttle whose RESULT would be at or below the floor
+        # is a pause wearing a different hat (see
+        # `_MIN_THROTTLED_DAILY_LIMIT`'s docstring) -- not just one that
+        # would fall strictly below it. A limit of 2 or 3 halves to exactly
+        # 1 (the floor) without this `<=`, silently clamping a mailbox to a
+        # de-facto pause with no human gate (CLOSE-3d). Route it through
+        # PAUSE -- and therefore through the human-review gate (ADR 0003)
+        # -- instead.
         verdict = Verdict.PAUSE
+    elif verdict is Verdict.OK and state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
+        # CLOSE-3b: a sustained OK verdict is the ladder's own recovery path
+        # for THROTTLE (unlike PAUSE, which never auto-recovers -- ADR
+        # 0003). Without this, a mailbox that gets throttled once stays
+        # THROTTLED forever even after it's genuinely healthy again, and a
+        # later re-degradation reads as an idempotent no-op instead of a
+        # fresh throttle.
+        state_store.mark_active(mailbox)
 
     action: ActionResult | None = None
     if verdict in (Verdict.THROTTLE, Verdict.PAUSE):
@@ -445,15 +574,20 @@ def _act(
     effective_driver: ProviderDriver = DryRunDriver(inner=driver) if dry_run else driver
 
     if verdict is Verdict.THROTTLE:
-        if state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
-            # Idempotent, keyed on the VERDICT, not the limit (ENG-5a): a
-            # mailbox already throttled for this same verdict is a no-op --
-            # otherwise every repeat evaluation halves the limit again
-            # (50 -> 25 -> 12 -> ...) until it silently becomes a pause with
-            # no human ever seeing it happen.
+        # Idempotent, keyed on the (verdict, applied limit) pair, not just
+        # the status (CLOSE-3b/ENG-5a): a mailbox is a no-op repeat only if
+        # its current daily limit hasn't grown past what we last throttled
+        # it against. This survives an intervening FAILED pause attempt on
+        # purpose (`mark_pause_failed` doesn't clear this memory) -- that's
+        # CLOSE-3c: a failed pause must not make the next THROTTLE re-halve
+        # an already-throttled limit as if the mailbox were pristine.
+        recorded_limit = state_store.throttled_at_limit(mailbox)
+        if recorded_limit is not None and (
+            current_daily_limit is None or current_daily_limit <= recorded_limit
+        ):
             return ActionResult(
                 outcome=ActionOutcome.PERFORMED,
-                detail="mailbox already throttled at this verdict; no action taken (idempotent)",
+                detail="mailbox already throttled at this limit; no action taken (idempotent)",
                 capability=Capability.THROTTLE,
             )
         if current_daily_limit is None:
@@ -468,7 +602,7 @@ def _act(
         new_limit = max(_MIN_THROTTLED_DAILY_LIMIT, current_daily_limit // 2)
         result = effective_driver.throttle(mailbox.mailbox_id, new_limit)
         if result.outcome is ActionOutcome.PERFORMED:
-            state_store.mark_throttled(mailbox)
+            state_store.mark_throttled(mailbox, current_daily_limit=current_daily_limit)
         return result
 
     # PAUSE.
@@ -492,12 +626,20 @@ def _act(
     match result.outcome:
         case ActionOutcome.PERFORMED:
             state_store.mark_paused(mailbox)
-        case ActionOutcome.UNSUPPORTED | ActionOutcome.FAILED:
-            # A clean, definitive answer either way -- "this provider will
-            # never support pausing this target" or "the provider
-            # explicitly said no" -- so there's nothing ambiguous left to
-            # reconcile.
+        case ActionOutcome.UNSUPPORTED:
+            # A clean, definitive answer: this provider will never support
+            # pausing this target, so there's nothing ambiguous left to
+            # reconcile, and no reason to treat this mailbox as anything but
+            # pristine going forward.
             state_store.mark_active(mailbox)
+        case ActionOutcome.FAILED:
+            # CLOSE-3c: also a definitive answer -- the provider explicitly
+            # said no -- but NOT "verified healthy." Marking this ACTIVE let
+            # a subsequent THROTTLE verdict see a mailbox that still needed
+            # a real limit reduction as pristine, re-halving an
+            # already-throttled limit (25 -> 12) instead of staying
+            # idempotent against what was already applied.
+            state_store.mark_pause_failed(mailbox)
         case _:  # pragma: no cover
             raise AssertionError(f"unreachable: unhandled ActionOutcome {result.outcome!r}")
     # If the call raises instead of returning (e.g. RateLimitExceededError,

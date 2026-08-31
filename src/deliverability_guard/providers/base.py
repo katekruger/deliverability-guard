@@ -101,10 +101,23 @@ class MailboxDayStats:
     bounces: int
     status: MailboxStatus = MailboxStatus.ACTIVE
     source_day: str = ""
+    current_daily_limit: int | None = None
+    """The mailbox's sending cap as of this day, if the provider's response
+    happened to include one -- `None` when unknown, never coerced to a
+    guess. This is what `engine.breaker.evaluate`'s `current_daily_limit`
+    needs to compute a THROTTLE action (CLOSE-1/CLOSE-3a): without it, a
+    THROTTLE verdict can never actually reduce a mailbox's limit, only
+    report itself as `UNSUPPORTED`. `loops.fast.aggregate_mailbox_stats`
+    takes the most recent day's value per mailbox, since a daily limit is a
+    point-in-time setting, not something to sum across days like sends."""
 
     def __post_init__(self) -> None:
         if self.sends < 0:
             raise ValueError(f"sends must be >= 0, got {self.sends}")
+        if self.current_daily_limit is not None and self.current_daily_limit < 0:
+            raise ValueError(
+                f"current_daily_limit must be >= 0 or None, got {self.current_daily_limit}"
+            )
         if self.bounces < 0:
             raise ValueError(f"bounces must be >= 0, got {self.bounces}")
 
@@ -113,6 +126,16 @@ class ActionOutcome(Enum):
     PERFORMED = auto()
     FAILED = auto()
     UNSUPPORTED = auto()
+    # Audit-log-only: what a dry-run action would have done, distinct from
+    # PERFORMED so a persisted record never claims a real provider call
+    # happened when it didn't (see `audit.log.DecisionRecord.from_evaluation`).
+    # No `ProviderDriver`/`DryRunDriver` implementation ever returns this --
+    # `BreakerEvaluation.action.outcome` stays PERFORMED for a dry-run
+    # action, which is what AGENTS.md's "dry-run must produce decisions
+    # identical to the live path" requires at the engine level. Only the
+    # decision log, whose job is to tell a human/replay what actually
+    # happened in the world, distinguishes the two.
+    DRY_RUN = auto()
 
 
 @dataclass(frozen=True, slots=True)

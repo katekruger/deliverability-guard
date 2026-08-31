@@ -157,6 +157,103 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: only Instantly was selectable, and a transport failure
+  tracebacked with the same exit code as "ran fine, found a breach"**
+  (external audit finding CLOSE-5). `build_driver` now also registers
+  `smartlead` (via the new `providers.smartlead.SmartleadCampaignDriver`,
+  which pins Smartlead's per-campaign statistics endpoint to one
+  `SMARTLEAD_CAMPAIGN_ID` so it satisfies the generic `ProviderDriver`
+  Protocol) and `noop` (`providers/noop.py`, a credential-free driver that
+  reports no mailboxes, so the CLI's own wiring can be exercised end to
+  end without a live account — previously only possible by calling
+  `cmd_check` directly with a Python `FakeDriver`). `main()` now catches
+  `httpx.HTTPError`/`providers.base.ProviderError` around `check`/`run` and
+  exits `3` with a clean message instead of a raw traceback and exit `1`.
+
+- **`engine/breaker.py`: pooling could still make the breaker LESS sensitive
+  than evaluating a mailbox alone, at moderate own-volume** (external audit
+  finding CLOSE-2, a follow-up on the ESS-cap fix below). Between roughly 91
+  and 389 own sends, a mailbox breaching at 5% (16x Gmail's ceiling) on its
+  own evidence alone read as healthy once pooled with a large, healthy
+  peer group -- the ESS cap bounds how much weight the group carries, but
+  not how far it can pull the posterior itself. `evaluate()` now takes the
+  worse (higher) of the pooled and flat lower bounds whenever `peer_group`
+  is given: pooling can only ever add sensitivity, never remove it. See
+  [ADR 0007](docs/decisions/0007-pooling-never-reduces-breaker-sensitivity.md).
+
+- **`loops/fast.py`: `pooled_posterior` and `cusum_step` had callers that
+  nothing itself called in production** (external audit finding CLOSE-1).
+  `evaluate_all_mailboxes` -- the shared chokepoint `cli.cmd_check` and
+  `loops.controller.run`'s fast tick both use -- called `engine.breaker.evaluate`
+  with neither `peer_group` nor a CUSUM state, so a real `check`/`run` never
+  pooled and never ran the trend check, even though both mechanisms were
+  themselves correct. `evaluate_all_mailboxes` now builds each mailbox's
+  same-domain peer group (leave-one-out) and threads it through, and
+  accepts an optional `cusum_states` mapping so `cusum_step` runs alongside
+  the breaker's own posterior ladder every tick when a caller opts in
+  (`loops.controller.run` now does, persisting state for the daemon's
+  lifetime). `max_pooled_ess` is now a configurable value
+  (`config/thresholds.yml`'s `max_pooled_ess`). The zero-caller
+  `evaluate_signal_with_trend` was deleted rather than adopted for this --
+  CUSUM's per-period model fits this pull-based tick, not a per-webhook
+  signal nothing in this codebase receives yet. `signals.postmaster.
+  coverage_over_range`, the third function named in the same finding, moved
+  to `experimental.postmaster_coverage`: there is no Postmaster ingestion
+  pipeline anywhere in this codebase to wire it into yet, unlike
+  `get_compliance_status`/`forces_hard_gate`, which already feed a real
+  integration point. See the ADR 0002 addendum.
+- **`loops/fast.py`, `engine/breaker.py`: THROTTLE never reached the
+  provider on the real `check`/`run` path at all** (CLOSE-3a, the same
+  wiring gap as above). `evaluate_all_mailboxes` never passed
+  `current_daily_limit`, so every THROTTLE-worthy evaluation reported
+  itself `UNSUPPORTED` instead of actually reducing a mailbox's daily
+  limit. `providers.base.MailboxDayStats` gained an optional
+  `current_daily_limit` field; `loops.fast.aggregate_mailbox_stats` takes
+  each mailbox's most recently reported value and `evaluate_all_mailboxes`
+  passes it through.
+
+- **`engine/breaker.py`: the THROTTLE rung latched, reopened, and never
+  auto-recovered** (external audit finding CLOSE-3, points 3b-3d; 3a is the
+  same wiring fix as the `evaluate_all_mailboxes` commit below). Three
+  separate bugs, all in `_act`/`evaluate`: (1) once THROTTLED, nothing ever
+  cleared the status back to `ACTIVE` on recovery, and idempotency was keyed
+  purely on status rather than on the mailbox's actual daily limit, so
+  `THROTTLE -> OK -> THROTTLE` never reached the provider a second time, and
+  a human manually restoring a throttled limit was invisible to the
+  idempotency check; (2) a FAILED pause attempt was marked `ACTIVE`, the
+  same as a never-touched mailbox, so a subsequent THROTTLE re-halved an
+  already-throttled limit (25 -> 12) -- reopening the exact cascade the
+  ENG-5a fix above exists to prevent; (3) the floor-escalation guard used
+  `<` instead of `<=`, so a daily limit of 2 or 3 halved to exactly 1 (the
+  floor) without ever escalating to `PAUSE`, silently clamping to a
+  de-facto pause with no human gate. `evaluate()` now clears `THROTTLED` to
+  `ACTIVE` on a sustained `OK` verdict; `BreakerStateStore` now tracks the
+  daily limit a throttle was last applied against and keys idempotency on
+  it; `MailboxBreakerStatus` gained `PAUSE_FAILED`, distinct from `ACTIVE`,
+  which preserves that limit memory through a failed pause attempt; the
+  floor guard is now `<=`. See the ADR 0003 addendum.
+
+- **`cli.py`, `engine/breaker.py`: `resume` was a no-op across a restart, and
+  dry-run evaluations persisted as real `PAUSED` state** (external audit
+  finding CLOSE-4, the highest-severity item in the follow-up audit).
+  `resume_after_human_review` wrote nothing to the decision log, so a
+  restart after a resume silently rebuilt the mailbox as `PAUSED` again --
+  `resume` was the *only* documented way out of `PAUSED` (ADR 0003), so
+  there was in practice no way back short of hand-editing the log.
+  Separately, `BreakerStateStore.from_log` never inspected a record's
+  `dry_run` flag, so a dry-run deployment -- one explicitly configured to
+  never touch a real mailbox -- accumulated durable `PAUSED` state anyway, a
+  direct violation of AGENTS.md's dry-run non-negotiable. `cli.cmd_resume`
+  now appends an `audit.log.ResumeRecord` (who resumed it, and when) that
+  `from_log` replays in file order; `from_log` also now skips any decision
+  record whose `dry_run` is `True`; `DecisionRecord.from_evaluation` records
+  a dry-run action's outcome as the new `ActionOutcome.DRY_RUN`, distinct
+  from `PERFORMED`, in the log only -- `BreakerEvaluation.action.outcome`
+  itself is unchanged, preserving "dry-run must produce decisions identical
+  to the live path" at the engine level. An existing-but-empty decision log
+  now also raises `BreakerStateStoreLoadError` instead of being read as "no
+  history yet." See the ADR 0003 addendum.
+
 - **`engine/breaker.py`: THROTTLE was not idempotent and could reach a
   de-facto pause without ever passing through the human-review gate**
   (audit finding ENG-5a). Six identical THROTTLE evaluations halved a
@@ -186,10 +283,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pooled_prior`/`pooled_posterior` and `engine.state.evaluate_stream` had
   zero production callers; `engine.changepoint.cusum_step` likewise.
   `engine.breaker.evaluate` now accepts an optional `peer_group` to use the
-  (capped) pooled posterior; `loops.fast.evaluate_signal_with_trend` wires
-  CUSUM sequential change detection alongside the breaker's own evaluation;
-  `signals.postmaster.coverage_over_range` now imports `evaluate_stream`
-  instead of reimplementing its transition logic.
+  (capped) pooled posterior, and `signals.postmaster.coverage_over_range`
+  now imports `evaluate_stream` instead of reimplementing its transition
+  logic. (A follow-up audit, CLOSE-1, found neither `peer_group` nor
+  `cusum_step` actually had a caller in `check`/`run` yet at this point --
+  see the CLOSE-1 entry above for the wiring that closed that gap, which
+  superseded and removed the `evaluate_signal_with_trend` function this
+  entry originally described.)
 
 ### Changed
 

@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import deliverability_guard.cli as cli_module
-from deliverability_guard.audit.log import read_records
+from deliverability_guard.audit.log import ResumeRecord, read_events, read_records
 from deliverability_guard.cli import (
     CliError,
     build_driver,
@@ -211,29 +211,66 @@ def test_status_reflects_a_paused_mailbox() -> None:
 # --- resume ---------------------------------------------------------------
 
 
-def test_resume_moves_a_paused_mailbox_back_to_active() -> None:
+def test_resume_moves_a_paused_mailbox_back_to_active(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
     state_store = BreakerStateStore()
     state_store.mark_paused(mailbox)
 
-    exit_code = cmd_resume(mailbox=mailbox, state_store=state_store, out=out)
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
 
     assert exit_code == 0
     assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
     assert "resumed" in out.getvalue()
+    assert "kate" in out.getvalue()
 
 
-def test_resume_refuses_a_mailbox_that_is_not_paused() -> None:
+def test_resume_appends_a_resume_record_to_the_decision_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_paused(mailbox)
+
+    cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+    assert event.resumed_by == "kate"
+
+
+def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
     state_store = BreakerStateStore()
 
-    exit_code = cmd_resume(mailbox=mailbox, state_store=state_store, out=out)
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
 
     assert exit_code == 1
     assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
     assert "not paused" in out.getvalue()
+    assert not (tmp_path / "decisions.jsonl").exists()
 
 
 # --- build_driver: the provider registry -----------------------------
@@ -252,6 +289,40 @@ def test_build_driver_instantly_without_api_key_raises_cli_error() -> None:
 def test_build_driver_instantly_with_api_key_builds_a_driver() -> None:
     driver = build_driver("instantly", env={"INSTANTLY_API_KEY": "test-key"})
     assert driver.name == "instantly"
+
+
+def test_build_driver_smartlead_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SMARTLEAD_API_KEY"):
+        build_driver("smartlead", env={})
+
+
+def test_build_driver_smartlead_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SMARTLEAD_CAMPAIGN_ID"):
+        build_driver("smartlead", env={"SMARTLEAD_API_KEY": "test-key"})
+
+
+def test_build_driver_smartlead_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "smartlead",
+        env={"SMARTLEAD_API_KEY": "test-key", "SMARTLEAD_CAMPAIGN_ID": "camp-1"},
+    )
+    assert driver.name == "smartlead"
+
+
+def test_build_driver_noop_needs_no_credentials() -> None:
+    driver = build_driver("noop", env={})
+    assert driver.name == "noop"
+    assert driver.read_mailbox_stats(date(2025, 12, 31)) == []
+
+
+def test_build_driver_noop_reports_throttle_and_pause_as_unsupported() -> None:
+    driver = build_driver("noop", env={})
+    throttle_result = driver.throttle("a@example.com", 100)
+    pause_result = driver.pause(MailboxRef(provider="noop", mailbox_id="a@example.com"))
+    from deliverability_guard.providers.base import ActionOutcome
+
+    assert throttle_result.outcome is ActionOutcome.UNSUPPORTED
+    assert pause_result.outcome is ActionOutcome.UNSUPPORTED
 
 
 # --- argument parsing / main() --------------------------------------------
@@ -290,6 +361,102 @@ def test_main_check_reports_an_unknown_provider_cleanly(tmp_path: Path) -> None:
     config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
     exit_code = main(["--config", str(config_path), "check"])
     assert exit_code == 2
+
+
+# --- CLOSE-5b: transport failures get their own exit code, no traceback ---
+
+
+class _TransportFailingDriver:
+    """A driver whose `read_mailbox_stats` raises a transport-level error --
+    standing in for a real network failure (e.g. `httpx.ProxyError`)
+    without any actual network access."""
+
+    name = "fake"
+    capabilities: frozenset[object] = frozenset()
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        raise self._exc
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> object:
+        raise AssertionError("not reached")
+
+    def pause(self, target: object) -> object:
+        raise AssertionError("not reached")
+
+
+def test_main_check_reports_an_httpx_transport_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE-5b's reproduction: a network failure must not traceback and
+    must not exit 1 -- exit 1 already means "ran fine, found a breach," and
+    a cron wrapper can't tell those apart otherwise."""
+    import httpx
+
+    failing_driver = _TransportFailingDriver(httpx.ProxyError("proxy connection refused"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+def test_main_check_reports_a_provider_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The other transport-failure family: this project's own
+    `ProviderError` subclasses (rate-limit exhaustion, a malformed
+    response), not just raw `httpx` errors."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    failing_driver = _TransportFailingDriver(RateLimitExceededError("429s all the way down"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+def test_main_run_reports_a_transport_error_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import httpx
+
+    failing_driver = _TransportFailingDriver(httpx.ConnectError("connection refused"))
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+
+
+# --- CLOSE-5a: the noop driver end to end -----------------------------------
+
+
+def test_main_check_with_the_noop_driver_needs_no_credentials(tmp_path: Path) -> None:
+    text = _VALID_YAML.replace("provider: fake", "provider: noop")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
 
 
 def test_main_reports_an_unreadable_decision_log_cleanly(tmp_path: Path) -> None:
@@ -459,5 +626,162 @@ def test_main_run_handles_keyboard_interrupt_cleanly(
 
     config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
     exit_code = main(["--config", str(config_path), "run"])
+    assert exit_code == 0
+
+
+# --- CLOSE-4: resume durability, dry-run non-persistence -------------------
+
+
+def test_main_resume_survives_a_restart_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLOSE-4 reproduction: pause a mailbox, restart (a fresh
+    `BreakerStateStore.from_log`), resume it, restart again -- the mailbox
+    must come back ACTIVE, not PAUSED. Before this fix, `resume` wrote
+    nothing to the log and the second restart silently lost it."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="hot@example.com")
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 40)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    monkeypatch.setenv("USER", "kate")
+
+    exit_code = main(["--config", str(config_path), "check"])
+    assert exit_code == 1  # PAUSE
+
+    # --- restart: rebuild state purely from the log ---
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+
+    resume_exit_code = main(["--config", str(config_path), "resume", "hot@example.com"])
+    assert resume_exit_code == 0
+
+    # --- restart again: the resume must have survived ---
+    restored_again = BreakerStateStore.from_log(log_path)
+    assert restored_again.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+
+
+def test_main_check_dry_run_pause_does_not_survive_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE-4b's reproduction: a dry-run deployment (`dry_run: true`, the
+    config default) that would PAUSE a mailbox must never rebuild that
+    mailbox as PAUSED after a restart -- it never actually paused anything,
+    and AGENTS.md's dry-run non-negotiable means it must never accumulate
+    durable state a live deployment didn't ask for."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="hot@example.com")
+    log_path = tmp_path / "decisions.jsonl"
+    config_path = _config(tmp_path, decision_log=str(log_path))  # dry_run: true
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 40)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    exit_code = main(["--config", str(config_path), "check"])
+    assert exit_code == 1  # PAUSE verdict, but dry-run -- never actually paused
+
+    assert driver.pause_calls == []  # the real (fake) driver was never touched
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+
+
+# --- CLOSE-1: pooled_posterior and cusum_step actually execute during a real
+# `check`/`run`, proven by instrumentation, not by a unit test that calls
+# them directly. (An external audit drove a real cmd_check and a five-tick
+# cmd_run and found NEITHER function executed at all -- each had a caller,
+# but nothing called that caller in production.)
+
+
+def test_close1_check_actually_executes_pooled_posterior_and_cusum_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This test fails against the pre-CLOSE-1 `evaluate_all_mailboxes`,
+    which called `engine.breaker.evaluate` with neither `peer_group` nor a
+    CUSUM state to hand to `cusum_step`."""
+    import deliverability_guard.engine.breaker as breaker_module
+    import deliverability_guard.loops.fast as fast_module
+
+    pooled_posterior_calls: list[object] = []
+    real_pooled_posterior = breaker_module.pooled_posterior
+
+    def _spy_pooled_posterior(*args: object, **kwargs: object) -> object:
+        pooled_posterior_calls.append((args, kwargs))
+        return real_pooled_posterior(*args, **kwargs)  # type: ignore[arg-type]
+
+    cusum_step_calls: list[object] = []
+    real_cusum_step = fast_module.cusum_step
+
+    def _spy_cusum_step(*args: object, **kwargs: object) -> object:
+        cusum_step_calls.append((args, kwargs))
+        return real_cusum_step(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(breaker_module, "pooled_posterior", _spy_pooled_posterior)
+    monkeypatch.setattr(fast_module, "cusum_step", _spy_cusum_step)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    fake_driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return fake_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 0
+    assert len(pooled_posterior_calls) >= 1
+    assert len(cusum_step_calls) >= 1
+
+
+def test_close1_run_actually_executes_pooled_posterior_and_cusum_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The five-tick `cmd_run` half of the same reproduction."""
+    import deliverability_guard.engine.breaker as breaker_module
+    import deliverability_guard.loops.fast as fast_module
+
+    pooled_posterior_calls: list[object] = []
+    real_pooled_posterior = breaker_module.pooled_posterior
+
+    def _spy_pooled_posterior(*args: object, **kwargs: object) -> object:
+        pooled_posterior_calls.append((args, kwargs))
+        return real_pooled_posterior(*args, **kwargs)  # type: ignore[arg-type]
+
+    cusum_step_calls: list[object] = []
+    real_cusum_step = fast_module.cusum_step
+
+    def _spy_cusum_step(*args: object, **kwargs: object) -> object:
+        cusum_step_calls.append((args, kwargs))
+        return real_cusum_step(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(breaker_module, "pooled_posterior", _spy_pooled_posterior)
+    monkeypatch.setattr(fast_module, "cusum_step", _spy_cusum_step)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    fake_driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return fake_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    def _no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module.time, "sleep", _no_sleep)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "5"])
+
+    assert exit_code == 0
+    assert len(pooled_posterior_calls) == 5
+    assert len(cusum_step_calls) == 5

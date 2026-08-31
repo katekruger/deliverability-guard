@@ -206,6 +206,135 @@ requiring its own ADR, not a quiet extension of `mcp_server.py`.
 `tests/test_mcp_server.py::test_build_server_never_registers_a_pause_or_resume_tool`
 enforces this by inspecting the server's registered tool names directly.
 
+## Addendum (2026-08-31): the never-auto-resume guarantee still didn't survive a restart, in the other direction
+
+A second external audit (CLOSE-4) found that the ENG-5b fix above only
+closed half the gap it named as a known limitation: `resume_after_human_review`
+still wrote nothing to the decision log. End to end, through the CLI's own
+functions, a mailbox that was paused, resumed, and then restarted came back
+`PAUSED` -- the resume was silently lost, and `resume` was the *only*
+documented way out of `PAUSED` (ADR 0003's whole point), so in practice there
+was no way back short of hand-editing the JSONL.
+
+Worse, the same audit found `from_log` never inspected `record.dry_run`: a
+dry-run evaluation that reached `PAUSE` still wrote a record with
+`verdict=PAUSE, action_outcome=PERFORMED` (the engine's own action result,
+which AGENTS.md requires stay identical between dry-run and live -- see
+`providers.base.ActionOutcome.DRY_RUN`'s docstring), and `from_log` read that
+back as a real, persisted `PAUSED` state. A dry-run deployment -- one
+explicitly configured to never touch a real mailbox -- would therefore
+accumulate durable `PAUSED` state anyway, with no supported way back, which
+is a direct violation of AGENTS.md's dry-run non-negotiable.
+
+**Fix, three parts:**
+
+1. `audit.log.ResumeRecord` is a new record type, written by `cli.cmd_resume`
+   to the same JSONL log via `append_resume_record`, carrying who resumed and
+   when. `audit.log.read_events` reads decision and resume records back
+   together, in file order; `BreakerStateStore.from_log` replays both,
+   applying a `ResumeRecord` as an unconditional move to `ACTIVE` at the
+   point in the sequence it occurred. `resumed_by` is a required field on
+   both `cmd_resume` and `ResumeRecord` -- never defaulted to something
+   meaningless -- because this ADR's whole argument is that a specific human
+   is accountable for this decision.
+2. `DecisionRecord.from_evaluation` now records a dry-run action's outcome as
+   `ActionOutcome.DRY_RUN`, distinct from `PERFORMED`, in the LOG only --
+   `BreakerEvaluation.action.outcome` itself, and `engine.breaker._act`'s
+   idempotency logic, are untouched, preserving AGENTS.md's "dry-run must
+   produce decisions identical to the live path" at the engine level. Only
+   the persisted record, whose job is to tell a human or `replay()` what
+   actually happened in the world, needs to say "would have paused," not
+   "paused."
+3. `BreakerStateStore.from_log` now also skips any decision record whose
+   `dry_run` is `True` when deriving status, independent of (1) -- belt and
+   suspenders, since a future bug in (2) should not be able to reintroduce
+   dry-run-derived persisted state on its own.
+
+Separately, a zero-byte decision log (distinguishable from a genuinely
+missing one, but easy to produce by a crash mid-write, a `touch`, or a
+truncated filesystem) previously fell through to `read_records` returning an
+empty list, which `from_log` read as "no history yet" -- exactly as fail-open
+as the ENG-5b bug this ADR already exists to prevent, just via a different
+code path. `from_log` now raises `BreakerStateStoreLoadError` for an
+existing-but-empty log, the same as any other unreadable log.
+
+### Confirmation
+
+`tests/test_breaker.py::test_state_store_rebuilds_active_status_from_a_resume_record_after_pause`
+and `tests/test_cli.py::test_main_resume_survives_a_restart_end_to_end` are
+the restart reproductions for (1). `tests/test_breaker.py::
+test_state_store_from_log_skips_a_dry_run_pause_record` and
+`tests/test_cli.py::test_main_check_dry_run_pause_does_not_survive_a_restart`
+cover (2)/(3). `tests/test_breaker.py::test_state_store_from_log_fails_closed_on_an_empty_log`
+covers the zero-byte case.
+
+## Addendum (2026-08-31): the throttle rung latched, reopened, and never fired in production (CLOSE-3)
+
+A third finding from the same follow-up audit (CLOSE-3), specifically about
+the THROTTLE rung rather than PAUSE:
+
+1. **THROTTLE never reached the provider at all** on the real `check`/`run`
+   path, because `loops.fast.evaluate_all_mailboxes` never passed
+   `current_daily_limit`. Fixed as part of the CLOSE-1 wiring commit (see
+   ADR 0002's addendum for that).
+2. **Once THROTTLED, THROTTLE was a permanent no-op.** Nothing ever cleared
+   `THROTTLED` back to `ACTIVE` on recovery, and the ENG-5a idempotency fix
+   above was keyed purely on status, not on whether the mailbox's daily
+   limit had actually changed since. Concretely: `THROTTLE -> OK -> THROTTLE`
+   never reached the provider a second time, and a human manually restoring
+   a throttled mailbox's daily limit -- without an intervening `OK` verdict
+   -- was invisible to the idempotency check entirely.
+3. **A failed PAUSE reopened the THROTTLE cascade.** `_act` marked a FAILED
+   pause attempt `ACTIVE`, the same status as a mailbox that had never been
+   touched. A subsequent THROTTLE verdict against that "pristine-looking"
+   mailbox re-halved an already-throttled limit (25 -> 12), continuing the
+   exact cascade ENG-5a's idempotency fix was supposed to prevent.
+4. **Floor escalation had an off-by-one.** The guard was
+   `current_daily_limit // 2 < _MIN_THROTTLED_DAILY_LIMIT` (`< 1`). At a
+   limit of 2 or 3, `// 2` is exactly `1` -- the floor -- so the guard never
+   fired, and the mailbox was silently clamped to 1/day (a de-facto pause)
+   without ever passing through the human-review gate this ADR exists to
+   enforce.
+
+**Fix, matching the four numbered points above:**
+
+1. See ADR 0002's addendum on wiring.
+2. `engine.breaker.evaluate` now clears `THROTTLED` back to `ACTIVE` whenever
+   it computes a plain `OK` verdict (never on `WARN`). Idempotency is now
+   also keyed on the daily limit, not just the status:
+   `BreakerStateStore` tracks `throttled_at_limit(mailbox)`, the
+   `current_daily_limit` input in force the last time this mailbox was
+   actually throttled. A THROTTLE verdict is a no-op only when the mailbox's
+   *current* limit hasn't grown past that recorded value; if it has (a
+   human restored it, with no intervening `OK`), that's treated as a fresh
+   throttle event and acted on again.
+3. `MailboxBreakerStatus` gained `PAUSE_FAILED`, distinct from `ACTIVE`. A
+   FAILED pause attempt now marks `PAUSE_FAILED`, which -- unlike
+   `mark_active` -- does NOT clear `throttled_at_limit`, so a later THROTTLE
+   still compares against what was actually applied and stays idempotent.
+4. The floor-escalation guard is now `current_daily_limit // 2 <=
+   _MIN_THROTTLED_DAILY_LIMIT` -- escalates when the RESULT would be at or
+   below the floor, not only strictly below it.
+
+**Known limitation, carried forward deliberately:** a `BreakerStateStore`
+rebuilt via `from_log` does not restore `throttled_at_limit` -- the decision
+log doesn't currently persist the `current_daily_limit` input a throttle was
+computed against. The first THROTTLE evaluation after a restart will
+therefore act once more even if nothing has actually changed, recomputing a
+fresh (still correct) limit rather than a stale one. This is a real gap, but
+not the ENG-5a-style unbounded cascade this ADR guards against -- it's at
+most one extra, correctly-computed call per restart.
+
+### Confirmation
+
+`tests/test_breaker.py::test_throttle_then_ok_then_throttle_re_throttles`,
+`test_throttle_re_throttles_when_the_current_limit_has_grown_past_what_was_applied`,
+`test_failed_pause_does_not_let_a_later_throttle_re_halve`,
+`test_daily_limit_of_two_escalates_to_pause`, and
+`test_daily_limit_of_three_escalates_to_pause` cover points 2-4 above, and
+`test_repeated_throttle_verdict_does_not_re_halve_the_daily_limit` (unchanged)
+confirms the six-identical-ticks case still holds.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and

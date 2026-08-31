@@ -12,6 +12,12 @@ Provider credentials are read from the environment (`AGENTS.md`: no
 secrets in the repo, ever) -- never from the YAML config `config.py` loads.
 `check` and `run`'s fast tick both call `loops.fast.evaluate_all_mailboxes`,
 so the one-shot and continuous forms cannot drift apart from each other.
+
+Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
+was refused), 2 a config/setup error (bad YAML, unknown provider, missing
+credential), 3 a provider transport failure (network error, rate limit
+exhausted, malformed response) -- distinct from 1 so a cron wrapper can tell
+"the fleet is healthy" apart from "we couldn't even ask the provider."
 """
 
 import argparse
@@ -23,7 +29,14 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
-from deliverability_guard.audit.log import DecisionRecord, append_record
+import httpx
+
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    append_resume_record,
+)
 from deliverability_guard.config import AppConfig, ConfigError, load_config
 from deliverability_guard.engine.breaker import (
     BreakerEvaluation,
@@ -36,18 +49,19 @@ from deliverability_guard.engine.breaker import (
 from deliverability_guard.loops import controller
 from deliverability_guard.loops.fast import evaluate_all_mailboxes
 from deliverability_guard.loops.slow import ThresholdAdjustment
-from deliverability_guard.providers.base import MailboxRef, ProviderDriver
+from deliverability_guard.providers.base import MailboxRef, ProviderDriver, ProviderError
 from deliverability_guard.providers.instantly import InstantlyDriver
+from deliverability_guard.providers.noop import NoopDriver
+from deliverability_guard.providers.smartlead import SmartleadCampaignDriver, SmartleadDriver
 
 _DEFAULT_CONFIG_PATH = Path("config/thresholds.yml")
 
-# Exit codes. 0: success, nothing to report. 1: `check` found a breaching
-# mailbox, or `resume` was refused (both are "the command ran fine but the
-# answer is bad news" -- distinct from 2, "the command itself couldn't
-# run").
+# Exit codes. See the module docstring's "Exit codes" paragraph above for
+# what each one means to a caller.
 _EXIT_OK = 0
 _EXIT_BREACH_OR_REFUSED = 1
 _EXIT_CONFIG_OR_SETUP_ERROR = 2
+_EXIT_PROVIDER_TRANSPORT_FAILURE = 3
 
 
 class CliError(Exception):
@@ -57,14 +71,32 @@ class CliError(Exception):
 
 
 def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
-    """The provider registry. Currently just Instantly -- see
-    BUILD-PLAN.md §3's v0.1 scope. Extend this, not `main()`, to add a
-    provider."""
+    """The provider registry. Extend this, not `main()`, to add a provider.
+
+    `smartlead` proves the THROTTLE path (BUILD-PLAN.md §5's capability
+    matrix) -- it was fully implemented in `providers/smartlead.py` but
+    unreachable from the CLI until CLOSE-5a registered it here. `noop`
+    requires no credential and reports no mailboxes; it exists so `check`/
+    `run` can be exercised end to end -- config loading, the decision log,
+    exit codes -- without a live provider account (CLOSE-5a).
+    """
     if provider == "instantly":
         api_key = env.get("INSTANTLY_API_KEY")
         if not api_key:
             raise CliError("INSTANTLY_API_KEY is not set (see .env.example)")
         return InstantlyDriver(api_key=api_key)
+    if provider == "smartlead":
+        api_key = env.get("SMARTLEAD_API_KEY")
+        if not api_key:
+            raise CliError("SMARTLEAD_API_KEY is not set (see .env.example)")
+        campaign_id = env.get("SMARTLEAD_CAMPAIGN_ID")
+        if not campaign_id:
+            raise CliError("SMARTLEAD_CAMPAIGN_ID is not set (see .env.example)")
+        return SmartleadCampaignDriver(
+            inner=SmartleadDriver(api_key=api_key), campaign_id=campaign_id
+        )
+    if provider == "noop":
+        return NoopDriver()
     raise CliError(f"unknown provider {provider!r}")
 
 
@@ -84,7 +116,11 @@ def cmd_check(
     Aggregates each mailbox's stats over the last day via
     `loops.fast.evaluate_all_mailboxes` -- the same aggregation-and-
     evaluation path `loops.controller`'s fast tick uses, so this command
-    and the continuous daemon cannot drift apart from each other.
+    and the continuous daemon cannot drift apart from each other. That
+    includes hierarchical pooling and a CUSUM trend check (`max_pooled_ess`
+    from config; CUSUM state starts fresh each invocation, since `check` is
+    a one-shot process with nowhere to persist a running trend statistic
+    between invocations -- `run` is where CUSUM accumulates real history).
     """
     since = now.date() - timedelta(days=1)
     results = evaluate_all_mailboxes(
@@ -95,6 +131,8 @@ def cmd_check(
         state_store=state_store,
         dry_run=config.dry_run,
         now=now,
+        max_pooled_ess=config.max_pooled_ess,
+        cusum_states={},
     )
 
     if not results:
@@ -159,6 +197,7 @@ def cmd_run(
         now=now,
         sleep=sleep,
         max_ticks=max_ticks,
+        max_pooled_ess=config.max_pooled_ess,
         on_fast_tick=on_fast_tick,
         on_slow_tick=on_slow_tick,
     )
@@ -176,12 +215,26 @@ def cmd_status(
     return _EXIT_OK
 
 
-def cmd_resume(*, mailbox: MailboxRef, state_store: BreakerStateStore, out: TextIO) -> int:
+def cmd_resume(
+    *,
+    mailbox: MailboxRef,
+    state_store: BreakerStateStore,
+    decision_log_path: Path,
+    resumed_by: str,
+    now: datetime,
+    out: TextIO,
+) -> int:
     """The only path out of PAUSED (ADR 0003) -- a typed, explicit human
     action, never something `check` or any other command reaches on its
     own. Refuses (exit 1, not an error) for a mailbox that isn't currently
     PAUSED, so a mistyped mailbox id or an already-resumed mailbox doesn't
-    look like success."""
+    look like success.
+
+    Appends a `ResumeRecord` to the decision log so this survives a process
+    restart -- see `engine.breaker.BreakerStateStore.from_log`. `resumed_by`
+    is required, not defaulted, so a human is always named in the log: ADR
+    0003's whole point is that a human is on the hook for this decision.
+    """
     status = state_store.status_of(mailbox)
     if status is not MailboxBreakerStatus.PAUSED:
         print(
@@ -190,7 +243,16 @@ def cmd_resume(*, mailbox: MailboxRef, state_store: BreakerStateStore, out: Text
         )
         return _EXIT_BREACH_OR_REFUSED
     state_store.resume_after_human_review(mailbox)
-    print(f"{mailbox.mailbox_id} resumed after human review", file=out)
+    append_resume_record(
+        decision_log_path,
+        ResumeRecord(
+            resumed_at=now,
+            provider=mailbox.provider,
+            mailbox_id=mailbox.mailbox_id,
+            resumed_by=resumed_by,
+        ),
+    )
+    print(f"{mailbox.mailbox_id} resumed after human review (by {resumed_by})", file=out)
     return _EXIT_OK
 
 
@@ -226,6 +288,11 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="resume a paused mailbox after human review (ADR 0003)"
     )
     resume_parser.add_argument("mailbox_id", help="the mailbox address to resume")
+    resume_parser.add_argument(
+        "--by",
+        default=None,
+        help="who is resuming this mailbox, recorded in the decision log (default: $USER)",
+    )
 
     return parser
 
@@ -252,13 +319,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         except CliError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return _EXIT_CONFIG_OR_SETUP_ERROR
-        return cmd_check(
-            driver=driver,
-            config=config,
-            state_store=state_store,
-            now=datetime.now(UTC),
-            out=sys.stdout,
-        )
+        try:
+            return cmd_check(
+                driver=driver,
+                config=config,
+                state_store=state_store,
+                now=datetime.now(UTC),
+                out=sys.stdout,
+            )
+        except (httpx.HTTPError, ProviderError) as exc:
+            print(f"error: provider request failed: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "run":
         try:
@@ -280,6 +351,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("stopped", file=sys.stdout)
             return _EXIT_OK
+        except (httpx.HTTPError, ProviderError) as exc:
+            print(f"error: provider request failed: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "status":
         mailboxes = [MailboxRef(provider=config.provider, mailbox_id=m) for m in args.mailbox_id]
@@ -287,7 +361,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "resume":
         mailbox = MailboxRef(provider=config.provider, mailbox_id=args.mailbox_id)
-        return cmd_resume(mailbox=mailbox, state_store=state_store, out=sys.stdout)
+        resumed_by = args.by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        return cmd_resume(
+            mailbox=mailbox,
+            state_store=state_store,
+            decision_log_path=config.decision_log_path,
+            resumed_by=resumed_by,
+            now=datetime.now(UTC),
+            out=sys.stdout,
+        )
 
     raise AssertionError(  # pragma: no cover
         f"unreachable: argparse required a valid command, got {args.command!r}"
