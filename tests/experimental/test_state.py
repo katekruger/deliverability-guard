@@ -1,13 +1,15 @@
-"""Tests for engine/state.py -- the OK | INSUFFICIENT_DATA | STALE state machine."""
+"""Tests for experimental/state.py -- the multi-day STALE-transition machine
+built on `engine.state.DataState` (CLOSE3-5: moved out of `engine/state.py`
+along with its only production caller, `experimental.postmaster_coverage`)."""
 
 from datetime import date, timedelta
 
 from hypothesis import given
 from hypothesis import strategies as st
 
-from deliverability_guard.engine.state import (
+from deliverability_guard.engine.state import DataState
+from deliverability_guard.experimental.state import (
     DailyReport,
-    DataState,
     classify,
     evaluate_stream,
 )

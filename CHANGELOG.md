@@ -157,6 +157,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **Three functions with zero production callers, ten unimported modules,
+  and an unwired Postmaster hard gate** (external audit finding CLOSE3-5 --
+  the fourth round of the same finding on `loops.fast.evaluate_signal`,
+  `engine.state.evaluate_stream`, and `identity.warmup_advisor.
+  check_adherence`). `evaluate_signal`/`FastLoopSignal` moved to the new
+  `experimental.webhook_signal` (nothing in this codebase accepts an
+  inbound webhook yet). `evaluate_stream`/`DailyReport`/`classify`/
+  `StateEvaluation` moved to the new `experimental.state` (their only
+  production caller, `experimental.postmaster_coverage`, is itself
+  experimental — a production function whose sole consumer is
+  non-production belonged on one side or the other; `DataState` alone
+  stays in `engine/state.py` on the strength of `engine.breaker`/
+  `audit.log`'s real usage). `identity.warmup_advisor` moved to
+  `experimental.warmup_advisor` wholesale. `mcp_server.py` gained a real
+  `main()` and a `deliverability-guard-mcp` console script entry — it
+  previously had no caller anywhere outside its own test file. Most
+  importantly: `loops.fast.evaluate_all_mailboxes` gained
+  `compliance_gate_tripped_for`, so `signals.postmaster.forces_hard_gate`'s
+  verdict can now actually reach the shared `check`/`run` chokepoint
+  instead of only `engine.breaker.evaluate` called directly — the gate
+  itself remains unconnected to any live Postmaster OAuth/domain source
+  (real, separately-scoped setup), documented as such rather than silently
+  left as a hidden gap. A new `tests/test_reachability.py` runs a real
+  `check` in a fresh subprocess and asserts every module outside
+  `experimental/` is either imported by it or explicitly named with a
+  reason (a separately-wired entry point, a directly-callable library
+  utility per README's own "full public surface" description, or the
+  documented-unwired Postmaster gate) — so a fifth round of this same
+  finding fails a test instead of needing another audit to notice.
+
 - **`cli.py`/`providers/{lemlist,apollo,ses}.py`: three implemented drivers
   weren't CLI-selectable, and the README contradicted itself about it**
   (external audit finding CLOSE3-4). `LemlistDriver`/`ApolloDriver`/

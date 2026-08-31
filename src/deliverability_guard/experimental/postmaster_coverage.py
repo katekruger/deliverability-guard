@@ -30,7 +30,8 @@ from collections.abc import Sequence
 from dataclasses import dataclass
 from datetime import date, timedelta
 
-from deliverability_guard.engine.state import DailyReport, DataState, evaluate_stream
+from deliverability_guard.engine.state import DataState
+from deliverability_guard.experimental.state import DailyReport, evaluate_stream
 from deliverability_guard.signals.postmaster import DomainStatRow
 
 

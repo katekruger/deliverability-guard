@@ -27,6 +27,7 @@ Changelog = "https://github.com/katekruger/deliverability-guard/blob/main/CHANGE
 
 [project.scripts]
 deliverability-guard = "deliverability_guard.cli:main"
+deliverability-guard-mcp = "deliverability_guard.mcp_server:main"
 
 [tool.hatch.version]
 path = "src/deliverability_guard/__init__.py"
@@ -100,6 +101,13 @@ reportMissingTypeStubs = false
 testpaths = ["tests"]
 addopts = "--cov=deliverability_guard --cov-report=term-missing"
 filterwarnings = ["error"]
+# Explicit rather than relying on pytest's rootdir-insertion side effect,
+# which only added `tests/` to sys.path for top-level `tests/*.py` files --
+# a test module nested under `tests/experimental/` (CLOSE3-5) got its OWN
+# directory inserted instead, breaking `from fixtures.fake_driver import
+# FakeDriver`. This makes `fixtures` importable the same way from anywhere
+# under `tests/`, regardless of nesting.
+pythonpath = ["tests"]
 
 [tool.coverage.run]
 source = ["src/deliverability_guard"]

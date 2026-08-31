@@ -1,5 +1,7 @@
-"""Tests for loops/fast.py, including the end-to-end webhook -> evaluation
--> throttle path in dry-run required by Prompt 3's definition of done."""
+"""Tests for loops/fast.py: aggregation and the pull-based evaluation
+chokepoint. The per-webhook-event path (`FastLoopSignal`/`evaluate_signal`)
+moved to `experimental.webhook_signal` (CLOSE3-5); see
+`tests/experimental/test_webhook_signal.py`."""
 
 from datetime import UTC, date, datetime
 
@@ -7,127 +9,18 @@ from deliverability_guard.engine.breaker import DEFAULT_LADDER, BreakerStateStor
 from deliverability_guard.engine.changepoint import CusumState
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
 from deliverability_guard.loops.fast import (
-    FastLoopSignal,
     aggregate_mailbox_stats,
     evaluate_all_mailboxes,
-    evaluate_signal,
 )
 from deliverability_guard.providers.base import (
     MailboxDayStats,
     MailboxRef,
     MailboxStatus,
-    WebhookEvent,
-    WebhookLedger,
 )
 from fixtures.fake_driver import FakeDriver
 
 _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
 _MAILBOX = MailboxRef(provider="fake", mailbox_id="a@example.com")
-
-
-def _bounce_event(event_id: str) -> WebhookEvent:
-    return WebhookEvent(
-        event_id=event_id,
-        provider="fake",
-        event_type="bounce",
-        occurred_at=_NOW,
-        mailbox=_MAILBOX,
-    )
-
-
-def test_webhook_to_evaluation_to_throttle_end_to_end_in_dry_run() -> None:
-    driver = FakeDriver()
-    signal = FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-1"))
-
-    result = evaluate_signal(
-        signal,
-        driver=driver,
-        ledger=WebhookLedger(),
-        cumulative_sends=20_000,
-        cumulative_complaints=30,
-        prior=DEFAULT_PRIOR,
-        thresholds=DEFAULT_LADDER,
-        state_store=BreakerStateStore(),
-        dry_run=True,
-        now=_NOW,
-        current_daily_limit=100,
-    )
-
-    assert result is not None
-    assert result.verdict == Verdict.THROTTLE
-    assert result.dry_run is True
-    assert result.action is not None
-    assert "[DRY RUN]" in result.action.detail
-    # Dry-run: the real driver's throttle() was never called.
-    assert driver.throttle_calls == []
-
-
-def test_a_redelivered_webhook_is_not_evaluated_twice() -> None:
-    """Duplicate webhook delivery -> idempotent by event id."""
-    driver = FakeDriver()
-    ledger = WebhookLedger()
-    signal = FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-1"))
-
-    first = evaluate_signal(
-        signal,
-        driver=driver,
-        ledger=ledger,
-        cumulative_sends=5000,
-        cumulative_complaints=40,
-        prior=DEFAULT_PRIOR,
-        thresholds=DEFAULT_LADDER,
-        state_store=BreakerStateStore(),
-        dry_run=True,
-        now=_NOW,
-    )
-    second = evaluate_signal(
-        signal,  # the exact same event, redelivered
-        driver=driver,
-        ledger=ledger,
-        cumulative_sends=5000,
-        cumulative_complaints=40,
-        prior=DEFAULT_PRIOR,
-        thresholds=DEFAULT_LADDER,
-        state_store=BreakerStateStore(),
-        dry_run=True,
-        now=_NOW,
-    )
-
-    assert first is not None
-    assert second is None
-
-
-def test_a_different_event_id_for_the_same_mailbox_is_still_evaluated() -> None:
-    driver = FakeDriver()
-    ledger = WebhookLedger()
-
-    first = evaluate_signal(
-        FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-1")),
-        driver=driver,
-        ledger=ledger,
-        cumulative_sends=50,
-        cumulative_complaints=0,
-        prior=DEFAULT_PRIOR,
-        thresholds=DEFAULT_LADDER,
-        state_store=BreakerStateStore(),
-        dry_run=True,
-        now=_NOW,
-    )
-    second = evaluate_signal(
-        FastLoopSignal(mailbox=_MAILBOX, event=_bounce_event("evt-2")),
-        driver=driver,
-        ledger=ledger,
-        cumulative_sends=51,
-        cumulative_complaints=1,
-        prior=DEFAULT_PRIOR,
-        thresholds=DEFAULT_LADDER,
-        state_store=BreakerStateStore(),
-        dry_run=True,
-        now=_NOW,
-    )
-
-    assert first is not None
-    assert second is not None
 
 
 # --- aggregate_mailbox_stats / evaluate_all_mailboxes ---------------------
@@ -323,6 +216,64 @@ def test_evaluate_all_mailboxes_throttles_a_mailbox_given_a_current_daily_limit(
 
     assert result.action.outcome is ActionOutcome.PERFORMED
     assert driver.throttle_calls == [("a@example.com", 50)]
+
+
+# --- CLOSE3-5: the Postmaster hard gate must be reachable through this ----
+# --- chokepoint, not just engine.breaker.evaluate directly ----------------
+
+
+def test_evaluate_all_mailboxes_passes_compliance_gate_tripped_through() -> None:
+    """CLOSE3-5: `compliance_gate_tripped` was not passed at all by
+    `evaluate_all_mailboxes` -- `signals.postmaster.forces_hard_gate`'s
+    verdict could never actually force a PAUSE through the real chokepoint
+    `cli.cmd_check`/`loops.controller` share, only through
+    `engine.breaker.evaluate` called directly. A healthy mailbox (0
+    complaints in 5000 sends -- would be OK on its own evidence) whose
+    `compliance_gate_tripped_for` reports tripped must still PAUSE."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(
+        stats_to_return=[
+            MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 31), sends=5000, bounces=0)
+        ]
+    )
+
+    (result,) = evaluate_all_mailboxes(
+        driver=driver,
+        since=date(2025, 12, 31),
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped_for=lambda _mailbox: True,
+    )
+
+    assert result.verdict == Verdict.PAUSE
+    assert driver.pause_calls == [mailbox]
+
+
+def test_evaluate_all_mailboxes_defaults_to_no_compliance_gate() -> None:
+    """Without `compliance_gate_tripped_for`, behavior is unchanged from
+    before this wiring existed -- the gate is opt-in, not a surprise."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(
+        stats_to_return=[
+            MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 31), sends=5000, bounces=0)
+        ]
+    )
+
+    (result,) = evaluate_all_mailboxes(
+        driver=driver,
+        since=date(2025, 12, 31),
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+
+    assert result.verdict == Verdict.OK
+    assert driver.pause_calls == []
 
 
 def test_evaluate_all_mailboxes_pools_peers_on_the_same_domain() -> None:

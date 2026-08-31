@@ -19,6 +19,15 @@ behind (slower). Whether either is actually harmful to THIS mailbox's real
 reputation is not something a folklore curve can know; this is a
 heuristic comparison against a baseline with no ground truth behind it,
 not a verdict, and never presented as one.
+
+STATUS (CLOSE3-5): moved here from `identity/`. `check_adherence` was fully
+implemented, with 11 tests, but had no caller anywhere except its own test
+file -- three audit rounds noted the same finding. Quarantined here rather
+than deleted: this is real, correct, honestly-labeled logic, just not
+wired into anything yet. README's "What this cannot see" section
+correctly still lists warmup adherence as not implemented in the shipped
+CLI -- promote this back to `identity/` and wire it (and update that
+README line) once something calls it.
 """
 
 from dataclasses import dataclass

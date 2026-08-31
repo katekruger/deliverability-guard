@@ -20,6 +20,9 @@ logic testable as ordinary Python functions, without needing a live MCP
 client or the protocol layer at all.
 """
 
+import argparse
+import sys
+from collections.abc import Sequence
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
@@ -30,6 +33,7 @@ from deliverability_guard.engine.breaker import BreakerStateStore
 from deliverability_guard.providers.base import MailboxRef
 
 _SERVER_NAME = "deliverability-guard"
+_DEFAULT_CONFIG_PATH = Path("config/thresholds.yml")
 
 
 def get_mailbox_status(config_path: Path, mailbox_id: str) -> str:
@@ -107,3 +111,32 @@ def build_server(config_path: Path) -> MCPServer:
     server.add_tool(recent_decisions)
 
     return server
+
+
+def main(argv: Sequence[str] | None = None) -> int:  # pragma: no cover -- stdio server, no exit
+    """Entry point for the `deliverability-guard-mcp` console script
+    (CLOSE3-5: this module previously had no `main`, no script registration,
+    and no caller at all outside its own test file -- `build_server` was
+    real, tested, and completely unreachable). Runs over stdio, the same
+    transport every other MCP server in this ecosystem defaults to; there is
+    no live-call risk in importing or constructing this (AGENTS.md), only in
+    actually running it against a real config.
+    """
+    parser = argparse.ArgumentParser(
+        prog="deliverability-guard-mcp",
+        description="MCP server wrapping deliverability-guard's read-only surface.",
+    )
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=_DEFAULT_CONFIG_PATH,
+        help=f"path to the thresholds config (default: {_DEFAULT_CONFIG_PATH})",
+    )
+    args = parser.parse_args(argv)
+    server = build_server(args.config)
+    server.run()
+    return 0
+
+
+if __name__ == "__main__":  # pragma: no cover
+    sys.exit(main())
