@@ -1,0 +1,16 @@
+{
+  "daily_stats": [
+    {
+      "sender_email": "sender1@example.com",
+      "date": "2026-08-01",
+      "emails_sent": 40,
+      "emails_bounced": 1
+    },
+    {
+      "sender_email": "sender2@example.com",
+      "date": "2026-07-25",
+      "emails_sent": 60,
+      "emails_bounced": 3
+    }
+  ]
+}

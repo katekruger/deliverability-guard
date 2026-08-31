@@ -1,0 +1,6 @@
+{
+  "email_accounts": [
+    { "email": "sender1@example.com" },
+    { "email": "sender2@example.com" }
+  ]
+}

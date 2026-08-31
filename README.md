@@ -101,7 +101,7 @@ Capability declaration is the whole design of the provider driver interface (`pr
 | **Instantly** | ✅ Implemented (reference driver) | per-mailbox daily | ✅ mailbox or campaign | ❌ no primitive | yes |
 | **Smartlead** | ✅ Implemented (proves the throttle path) | per-campaign | campaign only, not per-mailbox | ✅ per-mailbox daily limit | yes |
 | **Lemlist** | ✅ Implemented | activities export, aggregated per mailbox/day | ✅ campaign only, idempotent server-side | ❌ no primitive | unverified (capability not claimed) |
-| Apollo | Researched, not yet implemented | email stats | list only | ❌ | polling only |
+| **Apollo** | ✅ Implemented | per-campaign daily stats | ✅ campaign (`/abort`, resume semantics unverified) | ❌ no primitive | polling only (capability not claimed) |
 | Outreach | Researched, not yet implemented | yes | likely (unverified) | likely (unverified) | best-in-class |
 | Salesloft | Researched, not yet implemented | yes | **likely UI-only** — no API | ❌ | unverified |
 | Amplemarket | Researched, not yet implemented | ❌ | **no status-change API at all** — app-only | ❌ | ❌ |
