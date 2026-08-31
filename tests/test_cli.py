@@ -439,6 +439,19 @@ def test_help_works_with_no_config_present(tmp_path: Path, monkeypatch: pytest.M
     assert exc_info.value.code == 0
 
 
+def test_help_documents_the_exit_code_map() -> None:
+    """CLOSE3-6: the commit that introduced these exit codes claimed they
+    were documented in 'the module docstring, README, and --help's exit
+    code map' -- but `build_parser` set no `epilog`, so `--help`'s rendered
+    text had no exit-code content at all. This is the one place a cron
+    author actually looks."""
+    help_text = build_parser().format_help()
+    assert "all clear" in help_text
+    assert "breach" in help_text
+    assert "config" in help_text.lower()
+    assert "transport" in help_text.lower()
+
+
 def test_main_reports_a_config_error_cleanly(tmp_path: Path) -> None:
     missing = tmp_path / "does-not-exist.yml"
     exit_code = main(["--config", str(missing), "status", "a@example.com"])

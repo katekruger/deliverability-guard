@@ -302,10 +302,27 @@ def cmd_resume(
     return _EXIT_OK
 
 
+_EXIT_CODE_EPILOG = """\
+exit codes:
+  0  all clear
+  1  check found a breach (or resume was refused)
+  2  a config/setup error (bad YAML, unknown provider, missing credential)
+  3  a provider transport failure (network error, rate limit exhausted,
+     malformed response)
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
+    # CLOSE3-6: this project's own commit history claimed exit codes were
+    # documented in "the module docstring, README, and --help's exit code
+    # map" -- but no `epilog` was ever set, so the rendered `--help` text
+    # had no exit-code content at all. This is the one place a cron author
+    # actually looks; module docstring and README were already correct.
     parser = argparse.ArgumentParser(
         prog="deliverability-guard",
         description="A sending circuit breaker for outbound email.",
+        epilog=_EXIT_CODE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config",

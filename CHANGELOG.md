@@ -157,6 +157,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`/`README.md`: two small documentation corrections** (external
+  audit finding CLOSE3-6). `build_parser()` set no `epilog`, so `--help`'s
+  rendered text had no exit-code content at all, despite a commit message
+  claiming exit codes were documented in "the module docstring, README, and
+  `--help`'s exit code map" — the module docstring and README were correct;
+  `--help` wasn't. Added an `epilog` with the exit code map, the one place a
+  cron author actually looks. README line 151 said warmup adherence was
+  "Not implemented in v0.1" without qualification; `identity/
+  warmup_advisor.py` (now `experimental/warmup_advisor.py` — CLOSE3-5) ships
+  a complete, tested implementation with no caller. The line now says what's
+  actually true: not implemented in the shipped surface, but a real
+  heuristic exists, quarantined because nothing calls it yet.
+
 - **Three functions with zero production callers, ten unimported modules,
   and an unwired Postmaster hard gate** (external audit finding CLOSE3-5 --
   the fourth round of the same finding on `loops.fast.evaluate_signal`,
