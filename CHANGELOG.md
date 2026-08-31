@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mcp_server.py`: an MCP server wrapping the read surface** (BUILD-PLAN.md
+  §4 item #27 -- "Ties into the rest of the portfolio"). Three read-only
+  tools: `mailbox_status` (current breaker state), `thresholds` (the
+  configured warn/throttle/pause ladder), and `recent_decisions` (recent
+  decision-log entries for one mailbox, newest first). **Deliberately no
+  `pause`/`resume`/`throttle` tool** -- see the [ADR 0003
+  addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-08-30-the-mcp-server-is-read-only-on-purpose):
+  handing the resume decision to whatever is on the other end of an MCP
+  connection is the same automatic-resume failure mode that ADR already
+  rejects, just with an LLM's judgment substituted for a threshold. Each
+  tool's underlying logic (`get_mailbox_status`/`get_thresholds`/
+  `list_recent_decisions`) is a plain function taking `config_path`
+  explicitly, testable with no MCP client or protocol layer at all;
+  `build_server`'s registration wiring is confirmed via the `mcp` SDK's
+  own in-process `list_tools`/`call_tool`, still with no network of any
+  kind. Adds `mcp` (the official Model Context Protocol SDK) as a runtime
+  dependency.
+
+
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
