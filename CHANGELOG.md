@@ -63,6 +63,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   AGENTS.md applies everywhere else in this project. `resolve` has no
   default and must always be supplied, so a test can never fall through to
   a real DNS lookup by omission.
+- **`providers/ses.py`: the Amazon SES driver** (BUILD-PLAN.md §3 v0.3 --
+  "the only platform with native breaker primitives" among the ESPs not
+  yet implemented). `READ_STATS` via CloudWatch's `Send`/`Bounce` metric
+  sums, dimensioned by configuration set (SES has no per-mailbox concept
+  at all -- see the module docstring); `PAUSE` via SESv2
+  `PutConfigurationSetSendingOptions` (a configuration set, reachable
+  through the generic `pause()`) and a separate, deliberately-not-generic
+  `pause_account()` account-wide kill switch, which is never reachable
+  through `pause()` itself -- the same "a disproportionate action must be
+  deliberate" rule `providers/smartlead.py` already established for
+  campaign-vs-mailbox pause. `THROTTLE` is not claimed: SES's rate control
+  is sends-per-second, not a daily-volume limit, and mapping one onto the
+  other would misrepresent what actually happens. `WEBHOOKS` is not
+  claimed either -- SES delivers bounce/complaint notifications via SNS, a
+  push mechanism this driver does not implement (a documented known
+  limitation, not silently missing).
+
+  This is the first dependency-adding driver in the project: `boto3` is a
+  new runtime dependency, justified in [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)
+  as avoiding hand-rolled AWS SigV4 request signing (security-sensitive
+  cryptographic code this project shouldn't reimplement) at the cost of a
+  genuinely heavy (~15MB) addition. Tests use hand-defined `Protocol`
+  fakes for the SESv2/CloudWatch clients -- no `moto`, no live AWS
+  account, no network call of any kind.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
