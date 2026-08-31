@@ -33,6 +33,7 @@ tests/fixtures/apollo/README.md.
 import random
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import date
 
 import httpx
@@ -190,6 +191,34 @@ class ApolloDriver:
             )
             for row in rows
         ]
+
+
+@dataclass(frozen=True, slots=True)
+class ApolloCampaignDriver:
+    """Adapts `ApolloDriver` to the generic `ProviderDriver` Protocol by
+    pinning `read_mailbox_stats` to one campaign id (CLOSE3-4) -- same
+    pattern `providers.smartlead.SmartleadCampaignDriver` established.
+    Every other method passes straight through to `inner`."""
+
+    inner: ApolloDriver
+    campaign_id: str
+
+    @property
+    def name(self) -> str:
+        return self.inner.name
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self.inner.capabilities
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        return self.inner.read_mailbox_stats(since, campaign_id=self.campaign_id)
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        return self.inner.throttle(mailbox_id, daily_limit)
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        return self.inner.pause(target)
 
 
 def _parse_json(response: httpx.Response) -> object:

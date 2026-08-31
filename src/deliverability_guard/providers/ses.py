@@ -43,6 +43,7 @@ SigV4 request signing.
 """
 
 from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
 from datetime import UTC, date, datetime
 from typing import Protocol, cast
 
@@ -96,16 +97,22 @@ class CloudWatchClient(Protocol):
     ) -> Mapping[str, object]: ...
 
 
-def _new_sesv2_client() -> SesV2Client:  # pragma: no cover -- exercised only with real AWS creds
+def _new_sesv2_client(region_name: str | None) -> SesV2Client:  # pragma: no cover -- real AWS creds
     import boto3
 
-    return cast(SesV2Client, boto3.client("sesv2"))  # pyright: ignore[reportUnknownMemberType]
+    return cast(
+        SesV2Client,
+        boto3.client("sesv2", region_name=region_name),  # pyright: ignore[reportUnknownMemberType]
+    )
 
 
-def _new_cloudwatch_client() -> CloudWatchClient:  # pragma: no cover
+def _new_cloudwatch_client(region_name: str | None) -> CloudWatchClient:  # pragma: no cover
     import boto3
 
-    return cast(CloudWatchClient, boto3.client("cloudwatch"))  # pyright: ignore[reportUnknownMemberType]
+    return cast(
+        CloudWatchClient,
+        boto3.client("cloudwatch", region_name=region_name),  # pyright: ignore[reportUnknownMemberType]
+    )
 
 
 class SesDriver:
@@ -123,10 +130,20 @@ class SesDriver:
         *,
         sesv2_client: SesV2Client | None = None,
         cloudwatch_client: CloudWatchClient | None = None,
+        region_name: str | None = None,
     ) -> None:
-        self._sesv2 = sesv2_client if sesv2_client is not None else _new_sesv2_client()
+        """`region_name` is passed straight through to `boto3.client(...)`
+        when this driver constructs its own clients (i.e. when
+        `sesv2_client`/`cloudwatch_client` aren't given) -- explicit, rather
+        than relying on ambient `AWS_DEFAULT_REGION` process environment,
+        so `cli.build_driver` can construct a real driver deterministically
+        from the one config source it already reads everything else from
+        (CLOSE3-4). Ignored when either client is given directly."""
+        self._sesv2 = sesv2_client if sesv2_client is not None else _new_sesv2_client(region_name)
         self._cloudwatch = (
-            cloudwatch_client if cloudwatch_client is not None else _new_cloudwatch_client()
+            cloudwatch_client
+            if cloudwatch_client is not None
+            else _new_cloudwatch_client(region_name)
         )
 
     def read_mailbox_stats(
@@ -285,3 +302,34 @@ class SesDriver:
             detail=f"{_PROVIDER}: account-wide sending enabled",
             capability=Capability.PAUSE,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SesConfigurationSetDriver:
+    """Adapts `SesDriver` to the generic `ProviderDriver` Protocol by pinning
+    `read_mailbox_stats` to one configuration set (CLOSE3-4) -- same pattern
+    `providers.smartlead.SmartleadCampaignDriver` established for Smartlead's
+    equally per-campaign statistics endpoint. Every other method passes
+    straight through to `inner`."""
+
+    inner: SesDriver
+    configuration_set_name: str
+
+    @property
+    def name(self) -> str:
+        return self.inner.name
+
+    @property
+    def capabilities(self) -> frozenset[Capability]:
+        return self.inner.capabilities
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        return self.inner.read_mailbox_stats(
+            since, configuration_set_name=self.configuration_set_name
+        )
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        return self.inner.throttle(mailbox_id, daily_limit)
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        return self.inner.pause(target)

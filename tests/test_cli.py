@@ -356,10 +356,66 @@ def test_build_driver_smartlead_with_credentials_builds_a_driver() -> None:
     assert driver.name == "smartlead"
 
 
+def test_build_driver_lemlist_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="LEMLIST_API_KEY"):
+        build_driver("lemlist", env={})
+
+
+def test_build_driver_lemlist_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="LEMLIST_CAMPAIGN_ID"):
+        build_driver("lemlist", env={"LEMLIST_API_KEY": "test-key"})
+
+
+def test_build_driver_lemlist_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "lemlist", env={"LEMLIST_API_KEY": "test-key", "LEMLIST_CAMPAIGN_ID": "camp-1"}
+    )
+    assert driver.name == "lemlist"
+
+
+def test_build_driver_apollo_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="APOLLO_API_KEY"):
+        build_driver("apollo", env={})
+
+
+def test_build_driver_apollo_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="APOLLO_CAMPAIGN_ID"):
+        build_driver("apollo", env={"APOLLO_API_KEY": "test-key"})
+
+
+def test_build_driver_apollo_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "apollo", env={"APOLLO_API_KEY": "test-key", "APOLLO_CAMPAIGN_ID": "camp-1"}
+    )
+    assert driver.name == "apollo"
+
+
+def test_build_driver_ses_without_configuration_set_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SES_CONFIGURATION_SET_NAME"):
+        build_driver("ses", env={})
+
+
+def test_build_driver_ses_with_configuration_set_builds_a_driver() -> None:
+    """No API key for SES -- it authenticates via boto3's normal AWS
+    credential chain. Constructing the driver itself makes no live call
+    (AGENTS.md) -- boto3 client construction alone never touches the
+    network; `AWS_REGION` is supplied so it doesn't depend on this
+    machine's ambient AWS config to even construct."""
+    driver = build_driver(
+        "ses",
+        env={"SES_CONFIGURATION_SET_NAME": "cs-1", "AWS_REGION": "us-east-1"},
+    )
+    assert driver.name == "ses"
+
+
 def test_build_driver_noop_needs_no_credentials() -> None:
     driver = build_driver("noop", env={})
     assert driver.name == "noop"
-    assert driver.read_mailbox_stats(date(2025, 12, 31)) == []
+    # CLOSE3-4: a small synthetic fixture, not an empty list -- see
+    # `test_main_check_with_the_noop_driver_genuinely_exercises_the_pipeline`
+    # for why an empty report was the wrong shape for a driver whose whole
+    # purpose is to exercise `check`/`run` end to end.
+    assert len(driver.read_mailbox_stats(date(2025, 12, 31))) > 0
 
 
 def test_build_driver_noop_reports_throttle_and_pause_as_unsupported() -> None:
@@ -504,6 +560,29 @@ def test_main_check_with_the_noop_driver_needs_no_credentials(tmp_path: Path) ->
     exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 0
+
+
+def test_main_check_with_the_noop_driver_genuinely_exercises_the_pipeline(
+    tmp_path: Path,
+) -> None:
+    """CLOSE3-4: before this, `noop` reported zero mailboxes, so `check`
+    exited via the early `no mailboxes reported any stats` branch --
+    exercising config loading and the exit path, but never the aggregation,
+    evaluation, or decision-log-writing code `check` is supposed to be
+    proving works. README line 62 claimed it exercised "the decision log";
+    it didn't -- no log file was even created. `noop` now reports a small
+    synthetic fixture, so `check` genuinely writes a decision record."""
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("provider: fake", "provider: noop")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) > 0
+    assert records[0].verdict is Verdict.OK
 
 
 def test_main_reports_an_unreadable_decision_log_cleanly(tmp_path: Path) -> None:

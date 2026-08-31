@@ -13,7 +13,7 @@ from deliverability_guard.providers.base import (
     MailboxRef,
     MalformedResponseError,
 )
-from deliverability_guard.providers.ses import SesDriver
+from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
 
 _NOW = datetime(2026, 8, 2, 12, 0, tzinfo=UTC)
 
@@ -259,3 +259,40 @@ def test_capabilities_declare_no_throttle_or_webhooks() -> None:
     assert Capability.WEBHOOKS not in SesDriver.capabilities
     assert Capability.PAUSE in SesDriver.capabilities
     assert Capability.READ_STATS in SesDriver.capabilities
+
+
+# --- SesConfigurationSetDriver: the ProviderDriver adapter (CLOSE3-4) ------
+
+
+def test_configuration_set_driver_pins_read_mailbox_stats() -> None:
+    sesv2 = _FakeSesV2Client()
+    cloudwatch = _FakeCloudWatchClient({"Send": [{"Timestamp": _NOW, "Sum": 100.0}]})
+    driver = SesConfigurationSetDriver(
+        inner=_driver(sesv2, cloudwatch), configuration_set_name="cs-1"
+    )
+    stats = driver.read_mailbox_stats(date(2026, 8, 2))
+    assert len(stats) > 0
+    assert stats[0].mailbox.mailbox_id == "cs-1"
+
+
+def test_configuration_set_driver_passes_through_name_and_capabilities() -> None:
+    inner = _driver(_FakeSesV2Client(), _FakeCloudWatchClient({}))
+    driver = SesConfigurationSetDriver(inner=inner, configuration_set_name="cs-1")
+    assert driver.name == inner.name
+    assert driver.capabilities == inner.capabilities
+
+
+def test_configuration_set_driver_throttle_passes_through() -> None:
+    inner = _driver(_FakeSesV2Client(), _FakeCloudWatchClient({}))
+    driver = SesConfigurationSetDriver(inner=inner, configuration_set_name="cs-1")
+    result = driver.throttle("acct-1", 25)
+    assert result.outcome == ActionOutcome.UNSUPPORTED
+
+
+def test_configuration_set_driver_pause_passes_through() -> None:
+    sesv2 = _FakeSesV2Client()
+    driver = SesConfigurationSetDriver(
+        inner=_driver(sesv2, _FakeCloudWatchClient({})), configuration_set_name="cs-1"
+    )
+    result = driver.pause(CampaignRef(provider="ses", campaign_id="cs-1"))
+    assert result.outcome == ActionOutcome.PERFORMED

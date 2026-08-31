@@ -157,6 +157,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`/`providers/{lemlist,apollo,ses}.py`: three implemented drivers
+  weren't CLI-selectable, and the README contradicted itself about it**
+  (external audit finding CLOSE3-4). `LemlistDriver`/`ApolloDriver`/
+  `SesDriver` each pin `read_mailbox_stats` to a required `campaign_id` (or,
+  for SES, `configuration_set_name`) keyword the generic `ProviderDriver`
+  Protocol has no room for, so `build_driver("lemlist"|"apollo"|"ses")`
+  raised `unknown provider` — while README rows for all three said
+  "Implemented" under a "Status in this repo" heading that reads as
+  availability. New `LemlistCampaignDriver`/`ApolloCampaignDriver`/
+  `SesConfigurationSetDriver` adapters apply the same pinning pattern
+  `SmartleadCampaignDriver` already established, registered in
+  `build_driver` behind `LEMLIST_API_KEY`/`LEMLIST_CAMPAIGN_ID`,
+  `APOLLO_API_KEY`/`APOLLO_CAMPAIGN_ID`, and
+  `SES_CONFIGURATION_SET_NAME`/`AWS_REGION` respectively (`SesDriver` gained
+  an explicit `region_name` parameter so `build_driver` can construct it
+  deterministically instead of depending on ambient AWS config). A new
+  `tests/test_provider_conformance.py` asserts every CLI-selectable driver
+  satisfies `ProviderDriver`, so pyright catches the next divergence.
+  `noop` now reports a small synthetic two-mailbox fixture instead of an
+  empty list, so `check`/`run` genuinely exercise aggregation, evaluation
+  (including hierarchical pooling), and decision-log writing — README line
+  62's claim that it did was previously false; no log file was even created.
+
 - **`providers/smartlead.py`/`engine/breaker.py`: the THROTTLE rung was
   unreachable against every real, CLI-selectable provider** (external audit
   finding CLOSE3-2). `current_daily_limit` plumbing was correct end to end,
