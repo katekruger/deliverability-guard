@@ -157,6 +157,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`/`cli.py`: nothing could clear a persisted THROTTLED
+  mailbox** (external audit finding CLOSE3-3). `from_log` left OK and WARN
+  verdicts alone entirely, so a mailbox that recovered (THROTTLE, then
+  sustained OK evaluations) but happened to restart mid-recovery read
+  THROTTLED forever, and `resume` refused it outright ("is not paused;
+  nothing to resume") with nowhere to go from there. `from_log` now honours
+  an OK verdict recorded after a THROTTLE as a recovery, mirroring
+  `evaluate()`'s own sustained-recovery check, clearing both status and the
+  remembered applied limit together. `resume` now also accepts a THROTTLED
+  mailbox (not just PAUSED), for the case where the mailbox's own evidence
+  never recovers on its own and a human needs an explicit way back to
+  ACTIVE.
+
 - **`engine/breaker.py`/`audit/log.py`: `from_log` forgot the daily limit it
   had just applied, so a process that restarts between every evaluation
   (e.g. `check` run from cron) re-halved on every single invocation instead

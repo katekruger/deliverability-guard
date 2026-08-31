@@ -1252,6 +1252,59 @@ def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
 
 
+def test_state_store_from_log_recovers_a_throttled_mailbox_after_five_healthy_restarts(
+    tmp_path: Path,
+) -> None:
+    """CLOSE3-3: a THROTTLE followed by sustained healthy evaluations must
+    clear the persisted THROTTLED status, not just the in-process one --
+    `from_log` leaving OK verdicts alone (as it did before this fix) meant a
+    fully recovered mailbox that happened to restart mid-recovery read
+    THROTTLED forever, and no command could clear it. Five SEPARATE
+    restarts (a fresh `BreakerStateStore.from_log` each time, per the
+    session rule that every state-related test gets a sibling that
+    restarts), not five in-process ticks."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    throttle_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(throttle_eval))
+    assert (
+        BreakerStateStore.from_log(log_path).status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    )
+
+    for _ in range(5):
+        restarted_store = BreakerStateStore.from_log(log_path)
+        ok_eval = evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=20_000,
+            complaints=0,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=restarted_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=50,
+        )
+        assert ok_eval.verdict == Verdict.OK
+        append_record(log_path, DecisionRecord.from_evaluation(ok_eval))
+
+    final = BreakerStateStore.from_log(log_path)
+    assert final.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert final.throttled_at_limit(_MAILBOX) is None
+
+
 def test_state_store_from_log_with_no_file_yet_is_an_empty_active_store(tmp_path: Path) -> None:
     """No log file at all is a genuinely new deployment -- every mailbox
     correctly defaults to ACTIVE. This is the "no record" case, distinct

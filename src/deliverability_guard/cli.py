@@ -226,9 +226,15 @@ def cmd_resume(
 ) -> int:
     """The only path out of PAUSED (ADR 0003) -- a typed, explicit human
     action, never something `check` or any other command reaches on its
-    own. Refuses (exit 1, not an error) for a mailbox that isn't currently
-    PAUSED, so a mistyped mailbox id or an already-resumed mailbox doesn't
-    look like success.
+    own. Also the way an operator clears a persisted THROTTLED mailbox
+    (CLOSE3-3): `from_log` now clears THROTTLED on its own once a recovered
+    mailbox's OK verdict actually makes it into the log, but a mailbox that
+    is genuinely stuck THROTTLED -- its own evidence never recovers -- had
+    no path back to ACTIVE at all before this; the refusal message just said
+    what the mailbox wasn't, with nowhere to go from there. Refuses (exit 1,
+    not an error) for a mailbox that is neither PAUSED nor THROTTLED, so a
+    mistyped mailbox id or an already-resumed mailbox doesn't look like
+    success.
 
     Appends a `ResumeRecord` to the decision log so this survives a process
     restart -- see `engine.breaker.BreakerStateStore.from_log`. `resumed_by`
@@ -236,9 +242,10 @@ def cmd_resume(
     0003's whole point is that a human is on the hook for this decision.
     """
     status = state_store.status_of(mailbox)
-    if status is not MailboxBreakerStatus.PAUSED:
+    if status not in (MailboxBreakerStatus.PAUSED, MailboxBreakerStatus.THROTTLED):
         print(
-            f"{mailbox.mailbox_id} is not paused (status: {status.name}); nothing to resume",
+            f"{mailbox.mailbox_id} is not paused or throttled (status: {status.name}); "
+            "nothing to resume",
             file=out,
         )
         return _EXIT_BREACH_OR_REFUSED

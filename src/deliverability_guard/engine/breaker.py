@@ -226,6 +226,14 @@ class BreakerStateStore:
         invocations against one mailbox compounded 50 -> 25 -> 12 -> 6 -> 3
         -> an unearned PAUSE, because every invocation's `from_log` forgot
         the limit it had just applied.
+
+        An OK verdict recorded after a THROTTLE is also honoured here as a
+        recovery (CLOSE3-3), mirroring `evaluate()`'s own
+        `state_store.mark_active` call on sustained recovery: a mailbox
+        rebuilt from a log ending in a healthy evaluation comes back ACTIVE,
+        with `throttled_at_limit` cleared, instead of reading THROTTLED
+        forever just because the process restarted before `evaluate()`
+        itself ever saw the recovery.
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
@@ -283,11 +291,26 @@ class BreakerStateStore:
                 else:
                     status[mailbox] = MailboxBreakerStatus.ACTIVE
                     throttled_at_limit.pop(mailbox, None)
-            # OK or WARN: notify-only or nothing happened -- leave whatever
-            # status this mailbox already had alone. In particular, a
-            # PAUSED mailbox reporting healthy-looking evidence later stays
-            # PAUSED; only `resume_after_human_review` (via a `ResumeRecord`
-            # above) can change that.
+            elif (
+                record.verdict is Verdict.OK
+                and status.get(mailbox) is MailboxBreakerStatus.THROTTLED
+            ):
+                # CLOSE3-3: mirrors `evaluate()`'s own sustained-recovery
+                # check (`state_store.mark_active` on a THROTTLED mailbox
+                # seeing an OK verdict) -- an OK verdict recorded after a
+                # THROTTLE means the mailbox recovered. Without this, a
+                # rebuild from the log left a fully recovered mailbox
+                # reading THROTTLED forever, purely because the process
+                # happened to restart before `evaluate()` itself ever saw
+                # the OK verdicts in sequence.
+                status[mailbox] = MailboxBreakerStatus.ACTIVE
+                throttled_at_limit.pop(mailbox, None)
+            # WARN, or an OK that isn't a recovery: notify-only or nothing
+            # happened -- leave whatever status this mailbox already had
+            # alone. In particular, a PAUSED mailbox reporting
+            # healthy-looking evidence later stays PAUSED; only
+            # `resume_after_human_review` (via a `ResumeRecord` above) can
+            # change that.
         return cls(status, throttled_at_limit)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:

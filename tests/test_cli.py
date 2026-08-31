@@ -271,6 +271,35 @@ def test_resume_appends_a_resume_record_to_the_decision_log(tmp_path: Path) -> N
     assert event.resumed_by == "kate"
 
 
+def test_resume_clears_a_throttled_mailbox(tmp_path: Path) -> None:
+    """CLOSE3-3: before this, `resume` refused a THROTTLED mailbox outright
+    ("is not paused; nothing to resume") -- a dead end for an operator, and
+    the only command capable of clearing a persisted THROTTLED that
+    `from_log`'s own recovery logic hadn't (yet) caught up with. `resume`
+    now accepts THROTTLED the same way it accepts PAUSED: a human,
+    explicitly named, moving the mailbox back to ACTIVE."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_throttled(mailbox, current_daily_limit=50)
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+    assert state_store.throttled_at_limit(mailbox) is None
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+
+
 def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
