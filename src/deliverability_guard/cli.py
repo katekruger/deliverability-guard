@@ -23,7 +23,12 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import TextIO
 
-from deliverability_guard.audit.log import DecisionRecord, append_record
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    append_resume_record,
+)
 from deliverability_guard.config import AppConfig, ConfigError, load_config
 from deliverability_guard.engine.breaker import (
     BreakerEvaluation,
@@ -176,12 +181,26 @@ def cmd_status(
     return _EXIT_OK
 
 
-def cmd_resume(*, mailbox: MailboxRef, state_store: BreakerStateStore, out: TextIO) -> int:
+def cmd_resume(
+    *,
+    mailbox: MailboxRef,
+    state_store: BreakerStateStore,
+    decision_log_path: Path,
+    resumed_by: str,
+    now: datetime,
+    out: TextIO,
+) -> int:
     """The only path out of PAUSED (ADR 0003) -- a typed, explicit human
     action, never something `check` or any other command reaches on its
     own. Refuses (exit 1, not an error) for a mailbox that isn't currently
     PAUSED, so a mistyped mailbox id or an already-resumed mailbox doesn't
-    look like success."""
+    look like success.
+
+    Appends a `ResumeRecord` to the decision log so this survives a process
+    restart -- see `engine.breaker.BreakerStateStore.from_log`. `resumed_by`
+    is required, not defaulted, so a human is always named in the log: ADR
+    0003's whole point is that a human is on the hook for this decision.
+    """
     status = state_store.status_of(mailbox)
     if status is not MailboxBreakerStatus.PAUSED:
         print(
@@ -190,7 +209,16 @@ def cmd_resume(*, mailbox: MailboxRef, state_store: BreakerStateStore, out: Text
         )
         return _EXIT_BREACH_OR_REFUSED
     state_store.resume_after_human_review(mailbox)
-    print(f"{mailbox.mailbox_id} resumed after human review", file=out)
+    append_resume_record(
+        decision_log_path,
+        ResumeRecord(
+            resumed_at=now,
+            provider=mailbox.provider,
+            mailbox_id=mailbox.mailbox_id,
+            resumed_by=resumed_by,
+        ),
+    )
+    print(f"{mailbox.mailbox_id} resumed after human review (by {resumed_by})", file=out)
     return _EXIT_OK
 
 
@@ -226,6 +254,11 @@ def build_parser() -> argparse.ArgumentParser:
         "resume", help="resume a paused mailbox after human review (ADR 0003)"
     )
     resume_parser.add_argument("mailbox_id", help="the mailbox address to resume")
+    resume_parser.add_argument(
+        "--by",
+        default=None,
+        help="who is resuming this mailbox, recorded in the decision log (default: $USER)",
+    )
 
     return parser
 
@@ -287,7 +320,15 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "resume":
         mailbox = MailboxRef(provider=config.provider, mailbox_id=args.mailbox_id)
-        return cmd_resume(mailbox=mailbox, state_store=state_store, out=sys.stdout)
+        resumed_by = args.by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
+        return cmd_resume(
+            mailbox=mailbox,
+            state_store=state_store,
+            decision_log_path=config.decision_log_path,
+            resumed_by=resumed_by,
+            now=datetime.now(UTC),
+            out=sys.stdout,
+        )
 
     raise AssertionError(  # pragma: no cover
         f"unreachable: argparse required a valid command, got {args.command!r}"

@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
+from typing import cast
 
 from deliverability_guard.engine.breaker import BreakerEvaluation, ThresholdLadder, Verdict, rung
 from deliverability_guard.engine.posterior import BetaDistribution, update
@@ -66,6 +67,19 @@ class DecisionRecord:
     def from_evaluation(cls, evaluation: BreakerEvaluation) -> "DecisionRecord":
         posterior = evaluation.posterior
         action = evaluation.action
+        action_outcome = action.outcome if action is not None else None
+        if evaluation.dry_run and action_outcome is ActionOutcome.PERFORMED:
+            # The engine's own `action.outcome` stays PERFORMED for a
+            # dry-run action -- AGENTS.md requires dry-run decisions be
+            # identical to the live path, and `engine.breaker._act` relies
+            # on that to keep its idempotency logic dry-run/live agnostic.
+            # The persisted LOG record is a different contract: its job is
+            # to tell a human, or `replay()`, what actually happened in the
+            # world, and a dry-run action never touched the real provider.
+            # Recording it as PERFORMED here (and nowhere else) is exactly
+            # the "log claims something happened that didn't" bug this
+            # distinction exists to close.
+            action_outcome = ActionOutcome.DRY_RUN
         return cls(
             evaluated_at=evaluation.evaluated_at,
             provider=evaluation.mailbox.provider,
@@ -84,13 +98,14 @@ class DecisionRecord:
             threshold_pause=evaluation.thresholds.pause,
             verdict=evaluation.verdict,
             dry_run=evaluation.dry_run,
-            action_outcome=action.outcome if action is not None else None,
+            action_outcome=action_outcome,
             action_detail=action.detail if action is not None else None,
             action_capability=action.capability if action is not None else None,
         )
 
     def to_dict(self) -> dict[str, object]:
         return {
+            "kind": "decision",
             "evaluated_at": self.evaluated_at.astimezone(UTC).isoformat(),
             "provider": self.provider,
             "mailbox_id": self.mailbox_id,
@@ -144,6 +159,47 @@ class DecisionRecord:
             raise CorruptDecisionRecordError(f"could not parse decision record: {exc}") from exc
 
 
+@dataclass(frozen=True, slots=True)
+class ResumeRecord:
+    """A `resume_after_human_review` event, logged so it survives a restart.
+
+    Not a `BreakerEvaluation` -- there's no posterior, verdict, or action to
+    it, just "a human resumed this mailbox, and here's who and when." Written
+    to the same JSONL file as `DecisionRecord`s, distinguished by the "kind"
+    key, and replayed in file order by `engine.breaker.BreakerStateStore.
+    from_log` alongside decision records so a resume that happened between
+    two evaluations is reflected correctly (ADR 0003's "known limitation":
+    before this existed, a resumed-then-never-re-evaluated mailbox rebuilt
+    as PAUSED after a restart, silently losing the human's action).
+    """
+
+    resumed_at: datetime
+    provider: str
+    mailbox_id: str
+    resumed_by: str
+
+    def to_dict(self) -> dict[str, object]:
+        return {
+            "kind": "resume",
+            "resumed_at": self.resumed_at.astimezone(UTC).isoformat(),
+            "provider": self.provider,
+            "mailbox_id": self.mailbox_id,
+            "resumed_by": self.resumed_by,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, object]) -> "ResumeRecord":
+        try:
+            return cls(
+                resumed_at=datetime.fromisoformat(_require(data, "resumed_at", str)),
+                provider=_require(data, "provider", str),
+                mailbox_id=_require(data, "mailbox_id", str),
+                resumed_by=_require(data, "resumed_by", str),
+            )
+        except (KeyError, ValueError, TypeError) as exc:
+            raise CorruptDecisionRecordError(f"could not parse resume record: {exc}") from exc
+
+
 def replay(record: DecisionRecord) -> Verdict:
     """Recompute the verdict from a record's own stored inputs.
 
@@ -171,14 +227,54 @@ def append_record(path: Path, record: DecisionRecord) -> None:
         f.write(json.dumps(record.to_dict()) + "\n")
 
 
+def append_resume_record(path: Path, record: ResumeRecord) -> None:
+    with path.open("a", encoding="utf-8") as f:
+        f.write(json.dumps(record.to_dict()) + "\n")
+
+
+def _is_resume_line(data: object) -> bool:
+    if not isinstance(data, dict):
+        return False
+    typed_data = cast("dict[str, object]", data)
+    return typed_data.get("kind") == "resume"
+
+
 def read_records(path: Path) -> list[DecisionRecord]:
+    """Decision records only, in file order -- resume records (see
+    `read_events` for both kinds together) are silently skipped rather than
+    raising, so this stays a valid read of a log that predates resume
+    records ever being written to it."""
     records: list[DecisionRecord] = []
     with path.open(encoding="utf-8") as f:
         for line in f:
             stripped = line.strip()
-            if stripped:
-                records.append(DecisionRecord.from_dict(json.loads(stripped)))
+            if not stripped:
+                continue
+            data = json.loads(stripped)
+            if _is_resume_line(data):
+                continue
+            records.append(DecisionRecord.from_dict(data))
     return records
+
+
+def read_events(path: Path) -> list[DecisionRecord | ResumeRecord]:
+    """Every record in the log, in file order, decision and resume events
+    interleaved -- what `engine.breaker.BreakerStateStore.from_log` needs to
+    replay state correctly, since a resume that happened between two
+    decisions must be applied at the right point in the sequence, not
+    lumped in before or after it."""
+    events: list[DecisionRecord | ResumeRecord] = []
+    with path.open(encoding="utf-8") as f:
+        for line in f:
+            stripped = line.strip()
+            if not stripped:
+                continue
+            data = json.loads(stripped)
+            if _is_resume_line(data):
+                events.append(ResumeRecord.from_dict(data))
+            else:
+                events.append(DecisionRecord.from_dict(data))
+    return events
 
 
 def _require[T](data: Mapping[str, object], key: str, expected_type: type[T]) -> T:

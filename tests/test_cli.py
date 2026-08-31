@@ -16,7 +16,7 @@ from pathlib import Path
 import pytest
 
 import deliverability_guard.cli as cli_module
-from deliverability_guard.audit.log import read_records
+from deliverability_guard.audit.log import ResumeRecord, read_events, read_records
 from deliverability_guard.cli import (
     CliError,
     build_driver,
@@ -211,29 +211,66 @@ def test_status_reflects_a_paused_mailbox() -> None:
 # --- resume ---------------------------------------------------------------
 
 
-def test_resume_moves_a_paused_mailbox_back_to_active() -> None:
+def test_resume_moves_a_paused_mailbox_back_to_active(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
     state_store = BreakerStateStore()
     state_store.mark_paused(mailbox)
 
-    exit_code = cmd_resume(mailbox=mailbox, state_store=state_store, out=out)
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
 
     assert exit_code == 0
     assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
     assert "resumed" in out.getvalue()
+    assert "kate" in out.getvalue()
 
 
-def test_resume_refuses_a_mailbox_that_is_not_paused() -> None:
+def test_resume_appends_a_resume_record_to_the_decision_log(tmp_path: Path) -> None:
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_paused(mailbox)
+
+    cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+    assert event.resumed_by == "kate"
+
+
+def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
     state_store = BreakerStateStore()
 
-    exit_code = cmd_resume(mailbox=mailbox, state_store=state_store, out=out)
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
 
     assert exit_code == 1
     assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
     assert "not paused" in out.getvalue()
+    assert not (tmp_path / "decisions.jsonl").exists()
 
 
 # --- build_driver: the provider registry -----------------------------
@@ -459,5 +496,68 @@ def test_main_run_handles_keyboard_interrupt_cleanly(
 
     config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
     exit_code = main(["--config", str(config_path), "run"])
-
     assert exit_code == 0
+
+
+# --- CLOSE-4: resume durability, dry-run non-persistence -------------------
+
+
+def test_main_resume_survives_a_restart_end_to_end(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CLOSE-4 reproduction: pause a mailbox, restart (a fresh
+    `BreakerStateStore.from_log`), resume it, restart again -- the mailbox
+    must come back ACTIVE, not PAUSED. Before this fix, `resume` wrote
+    nothing to the log and the second restart silently lost it."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="hot@example.com")
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 40)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    monkeypatch.setenv("USER", "kate")
+
+    exit_code = main(["--config", str(config_path), "check"])
+    assert exit_code == 1  # PAUSE
+
+    # --- restart: rebuild state purely from the log ---
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+
+    resume_exit_code = main(["--config", str(config_path), "resume", "hot@example.com"])
+    assert resume_exit_code == 0
+
+    # --- restart again: the resume must have survived ---
+    restored_again = BreakerStateStore.from_log(log_path)
+    assert restored_again.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+
+
+def test_main_check_dry_run_pause_does_not_survive_a_restart(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE-4b's reproduction: a dry-run deployment (`dry_run: true`, the
+    config default) that would PAUSE a mailbox must never rebuild that
+    mailbox as PAUSED after a restart -- it never actually paused anything,
+    and AGENTS.md's dry-run non-negotiable means it must never accumulate
+    durable state a live deployment didn't ask for."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="hot@example.com")
+    log_path = tmp_path / "decisions.jsonl"
+    config_path = _config(tmp_path, decision_log=str(log_path))  # dry_run: true
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 40)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    exit_code = main(["--config", str(config_path), "check"])
+    assert exit_code == 1  # PAUSE verdict, but dry-run -- never actually paused
+
+    assert driver.pause_calls == []  # the real (fake) driver was never touched
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox) == MailboxBreakerStatus.ACTIVE

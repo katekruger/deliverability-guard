@@ -170,31 +170,63 @@ class BreakerStateStore:
         store, which would be indistinguishable from "no history" and could
         silently un-pause a mailbox that the log actually says is PAUSED.
 
-        Known limitation: `resume_after_human_review` doesn't itself write a
-        decision record (it isn't a `BreakerEvaluation`), so a mailbox that
-        was resumed by a human and never evaluated again before a restart
-        will be rebuilt as PAUSED rather than ACTIVE. This is a real gap,
-        but an intentionally fail-safe one, consistent with ADR 0003: on
-        ambiguity, this class errs toward PAUSED, never toward ACTIVE.
+        `resume_after_human_review` now writes its own `ResumeRecord` to the
+        same log (see `cli.cmd_resume`), replayed here in file order
+        alongside decision records -- a mailbox resumed by a human and never
+        evaluated again before a restart correctly rebuilds as ACTIVE.
+
+        A record whose `dry_run` is `True` is skipped entirely when deriving
+        status: a dry-run action never touched the real provider (AGENTS.md:
+        dry-run must be a no-op), so it must never be read back as having
+        actually paused or throttled a mailbox -- that would let a dry-run
+        deployment accumulate persistent PAUSED state for mailboxes it was
+        explicitly configured never to touch, exactly the failure the
+        default-dry-run non-negotiable exists to prevent.
+
+        An existing-but-empty log file is treated the same as an unreadable
+        one, raising `BreakerStateStoreLoadError` rather than silently
+        producing the empty (every-mailbox-ACTIVE) store: a zero-byte log is
+        indistinguishable from "the log was truncated mid-write" and could
+        just as easily mean history was lost as mean nothing was ever
+        written. Only a log path that doesn't exist AT ALL is genuinely "no
+        history yet" (see the `not path.exists()` branch above).
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
         # from this module.
         import json
 
-        from deliverability_guard.audit.log import CorruptDecisionRecordError, read_records
+        from deliverability_guard.audit.log import (
+            CorruptDecisionRecordError,
+            ResumeRecord,
+            read_events,
+        )
 
         if not path.exists():
             return cls()
         try:
-            records = read_records(path)
+            if path.stat().st_size == 0:
+                raise BreakerStateStoreLoadError(
+                    f"decision log {path} exists but is empty -- ambiguous between "
+                    "'nothing has ever been recorded' and 'the log was truncated', "
+                    "so refusing to rebuild an all-ACTIVE store from it"
+                )
+            events = read_events(path)
         except (OSError, json.JSONDecodeError, CorruptDecisionRecordError) as exc:
             raise BreakerStateStoreLoadError(
                 f"could not rebuild breaker state from {path}: {exc}"
             ) from exc
 
         status: dict[MailboxRef, MailboxBreakerStatus] = {}
-        for record in records:
+        for event in events:
+            if isinstance(event, ResumeRecord):
+                mailbox = MailboxRef(provider=event.provider, mailbox_id=event.mailbox_id)
+                status[mailbox] = MailboxBreakerStatus.ACTIVE
+                continue
+            record = event
+            if record.dry_run:
+                # Never actually touched the provider -- see docstring above.
+                continue
             mailbox = MailboxRef(provider=record.provider, mailbox_id=record.mailbox_id)
             if record.verdict is Verdict.PAUSE:
                 status[mailbox] = (
@@ -211,7 +243,8 @@ class BreakerStateStore:
             # OK or WARN: notify-only or nothing happened -- leave whatever
             # status this mailbox already had alone. In particular, a
             # PAUSED mailbox reporting healthy-looking evidence later stays
-            # PAUSED; only `resume_after_human_review` can change that.
+            # PAUSED; only `resume_after_human_review` (via a `ResumeRecord`
+            # above) can change that.
         return cls(status)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:

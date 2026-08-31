@@ -7,6 +7,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **`cli.py`, `engine/breaker.py`: `resume` was a no-op across a restart, and
+  dry-run evaluations persisted as real `PAUSED` state** (external audit
+  finding CLOSE-4, the highest-severity item in the follow-up audit).
+  `resume_after_human_review` wrote nothing to the decision log, so a
+  restart after a resume silently rebuilt the mailbox as `PAUSED` again --
+  `resume` was the *only* documented way out of `PAUSED` (ADR 0003), so
+  there was in practice no way back short of hand-editing the log.
+  Separately, `BreakerStateStore.from_log` never inspected a record's
+  `dry_run` flag, so a dry-run deployment -- one explicitly configured to
+  never touch a real mailbox -- accumulated durable `PAUSED` state anyway, a
+  direct violation of AGENTS.md's dry-run non-negotiable. `cli.cmd_resume`
+  now appends an `audit.log.ResumeRecord` (who resumed it, and when) that
+  `from_log` replays in file order; `from_log` also now skips any decision
+  record whose `dry_run` is `True`; `DecisionRecord.from_evaluation` records
+  a dry-run action's outcome as the new `ActionOutcome.DRY_RUN`, distinct
+  from `PERFORMED`, in the log only -- `BreakerEvaluation.action.outcome`
+  itself is unchanged, preserving "dry-run must produce decisions identical
+  to the live path" at the engine level. An existing-but-empty decision log
+  now also raises `BreakerStateStoreLoadError` instead of being read as "no
+  history yet." See the ADR 0003 addendum.
+
 ### Added
 
 - **`loops/controller.py`, `deliverability-guard run`: the always-on

@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from deliverability_guard.audit.log import DecisionRecord, append_record
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    append_resume_record,
+)
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
     BreakerStateStore,
@@ -827,5 +832,154 @@ def test_state_store_from_log_fails_closed_on_an_unreadable_log(tmp_path: Path) 
     PAUSED. Fail loudly instead."""
     log_path = tmp_path / "decisions.jsonl"
     log_path.write_text("not valid json\n")
+    with pytest.raises(BreakerStateStoreLoadError):
+        BreakerStateStore.from_log(log_path)
+
+
+# --- CLOSE-4: resume durability, dry-run non-persistence, empty log --------
+
+
+def test_state_store_rebuilds_active_status_from_a_resume_record_after_pause(
+    tmp_path: Path,
+) -> None:
+    """The CLOSE-4 reproduction, at the breaker level: a paused mailbox with
+    a `ResumeRecord` after it in the log must rebuild as ACTIVE."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+    append_resume_record(
+        log_path,
+        ResumeRecord(
+            resumed_at=_NOW, provider="fake", mailbox_id="a@example.com", resumed_by="kate"
+        ),
+    )
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_rebuild_re_pauses_after_a_later_resume_if_evaluated_again(
+    tmp_path: Path,
+) -> None:
+    """A resume is a point-in-time event, not a permanent exemption: a
+    mailbox resumed and then paused AGAIN later must rebuild as PAUSED --
+    `from_log` must apply events strictly in file order, not just check
+    "was there ever a resume record."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    first_pause = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(first_pause))
+    append_resume_record(
+        log_path,
+        ResumeRecord(
+            resumed_at=_NOW, provider="fake", mailbox_id="a@example.com", resumed_by="kate"
+        ),
+    )
+    second_pause = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(second_pause))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_from_log_skips_a_dry_run_pause_record(tmp_path: Path) -> None:
+    """CLOSE-4b's reproduction: a dry-run PAUSE record must never rebuild as
+    PAUSED -- the real (fake) driver was never touched."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert evaluation.verdict == Verdict.PAUSE
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+def test_state_store_from_log_dry_run_pause_then_real_pause_of_another_mailbox(
+    tmp_path: Path,
+) -> None:
+    """A dry-run pause of one mailbox must not affect a real pause of a
+    different mailbox recorded in the same log."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    other_mailbox = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    dry_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(dry_eval))
+    real_eval = evaluate(
+        driver=driver,
+        mailbox=other_mailbox,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(real_eval))
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert restored.status_of(other_mailbox) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_from_log_fails_closed_on_an_empty_log(tmp_path: Path) -> None:
+    """A log that EXISTS but is zero bytes is ambiguous between "nothing has
+    ever happened" and "the log was truncated" -- fail loudly, the same as
+    any other unreadable log, rather than rebuilding an all-ACTIVE store."""
+    log_path = tmp_path / "decisions.jsonl"
+    log_path.write_text("")
     with pytest.raises(BreakerStateStoreLoadError):
         BreakerStateStore.from_log(log_path)

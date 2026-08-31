@@ -189,6 +189,68 @@ rebuild, a failed pause attempt correctly rebuilding as `ACTIVE`, a paused
 mailbox staying paused through later healthy-looking log entries, and the
 no-history-vs-unreadable-history distinction.
 
+## Addendum (2026-08-31): the never-auto-resume guarantee still didn't survive a restart, in the other direction
+
+A second external audit (CLOSE-4) found that the ENG-5b fix above only
+closed half the gap it named as a known limitation: `resume_after_human_review`
+still wrote nothing to the decision log. End to end, through the CLI's own
+functions, a mailbox that was paused, resumed, and then restarted came back
+`PAUSED` -- the resume was silently lost, and `resume` was the *only*
+documented way out of `PAUSED` (ADR 0003's whole point), so in practice there
+was no way back short of hand-editing the JSONL.
+
+Worse, the same audit found `from_log` never inspected `record.dry_run`: a
+dry-run evaluation that reached `PAUSE` still wrote a record with
+`verdict=PAUSE, action_outcome=PERFORMED` (the engine's own action result,
+which AGENTS.md requires stay identical between dry-run and live -- see
+`providers.base.ActionOutcome.DRY_RUN`'s docstring), and `from_log` read that
+back as a real, persisted `PAUSED` state. A dry-run deployment -- one
+explicitly configured to never touch a real mailbox -- would therefore
+accumulate durable `PAUSED` state anyway, with no supported way back, which
+is a direct violation of AGENTS.md's dry-run non-negotiable.
+
+**Fix, three parts:**
+
+1. `audit.log.ResumeRecord` is a new record type, written by `cli.cmd_resume`
+   to the same JSONL log via `append_resume_record`, carrying who resumed and
+   when. `audit.log.read_events` reads decision and resume records back
+   together, in file order; `BreakerStateStore.from_log` replays both,
+   applying a `ResumeRecord` as an unconditional move to `ACTIVE` at the
+   point in the sequence it occurred. `resumed_by` is a required field on
+   both `cmd_resume` and `ResumeRecord` -- never defaulted to something
+   meaningless -- because this ADR's whole argument is that a specific human
+   is accountable for this decision.
+2. `DecisionRecord.from_evaluation` now records a dry-run action's outcome as
+   `ActionOutcome.DRY_RUN`, distinct from `PERFORMED`, in the LOG only --
+   `BreakerEvaluation.action.outcome` itself, and `engine.breaker._act`'s
+   idempotency logic, are untouched, preserving AGENTS.md's "dry-run must
+   produce decisions identical to the live path" at the engine level. Only
+   the persisted record, whose job is to tell a human or `replay()` what
+   actually happened in the world, needs to say "would have paused," not
+   "paused."
+3. `BreakerStateStore.from_log` now also skips any decision record whose
+   `dry_run` is `True` when deriving status, independent of (1) -- belt and
+   suspenders, since a future bug in (2) should not be able to reintroduce
+   dry-run-derived persisted state on its own.
+
+Separately, a zero-byte decision log (distinguishable from a genuinely
+missing one, but easy to produce by a crash mid-write, a `touch`, or a
+truncated filesystem) previously fell through to `read_records` returning an
+empty list, which `from_log` read as "no history yet" -- exactly as fail-open
+as the ENG-5b bug this ADR already exists to prevent, just via a different
+code path. `from_log` now raises `BreakerStateStoreLoadError` for an
+existing-but-empty log, the same as any other unreadable log.
+
+### Confirmation
+
+`tests/test_breaker.py::test_state_store_rebuilds_active_status_from_a_resume_record_after_pause`
+and `tests/test_cli.py::test_main_resume_survives_a_restart_end_to_end` are
+the restart reproductions for (1). `tests/test_breaker.py::
+test_state_store_from_log_skips_a_dry_run_pause_record` and
+`tests/test_cli.py::test_main_check_dry_run_pause_does_not_survive_a_restart`
+cover (2)/(3). `tests/test_breaker.py::test_state_store_from_log_fails_closed_on_an_empty_log`
+covers the zero-byte case.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and

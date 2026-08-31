@@ -113,6 +113,16 @@ class ActionOutcome(Enum):
     PERFORMED = auto()
     FAILED = auto()
     UNSUPPORTED = auto()
+    # Audit-log-only: what a dry-run action would have done, distinct from
+    # PERFORMED so a persisted record never claims a real provider call
+    # happened when it didn't (see `audit.log.DecisionRecord.from_evaluation`).
+    # No `ProviderDriver`/`DryRunDriver` implementation ever returns this --
+    # `BreakerEvaluation.action.outcome` stays PERFORMED for a dry-run
+    # action, which is what AGENTS.md's "dry-run must produce decisions
+    # identical to the live path" requires at the engine level. Only the
+    # decision log, whose job is to tell a human/replay what actually
+    # happened in the world, distinguishes the two.
+    DRY_RUN = auto()
 
 
 @dataclass(frozen=True, slots=True)
