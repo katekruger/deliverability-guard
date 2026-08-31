@@ -157,6 +157,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`providers/smartlead.py`/`engine/breaker.py`: the THROTTLE rung was
+  unreachable against every real, CLI-selectable provider** (external audit
+  finding CLOSE3-2). `current_daily_limit` plumbing was correct end to end,
+  but zero of five shipped drivers ever populated
+  `MailboxDayStats.current_daily_limit` — including `smartlead`, the one
+  driver declaring `Capability.THROTTLE`, so every real THROTTLE verdict
+  read `action_outcome: UNSUPPORTED` regardless of configuration.
+  `SmartleadCampaignDriver`'s statistics parsing now reads a row's own
+  current limit back from `message_per_day`, the same field its `throttle()`
+  request body writes to. Separately, a THROTTLE verdict a provider
+  genuinely cannot execute (unknown limit, or no throttle primitive at all)
+  no longer writes an identical UNSUPPORTED record forever: after
+  `_MAX_UNSUPPORTED_THROTTLE_STREAK` (3) consecutive unexecutable throttles
+  for one mailbox, the verdict escalates to PAUSE through the human-review
+  gate (ADR 0003). The streak persists across restarts the same way
+  CLOSE3-1's applied-limit memory does.
+
 - **`engine/breaker.py`/`cli.py`: nothing could clear a persisted THROTTLED
   mailbox** (external audit finding CLOSE3-3). `from_log` left OK and WARN
   verdicts alone entirely, so a mailbox that recovered (THROTTLE, then

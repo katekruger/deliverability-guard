@@ -58,6 +58,23 @@ def require_int(row: Mapping[str, object], key: str, provider: str) -> int:
     return value
 
 
+def optional_int(row: Mapping[str, object], key: str, provider: str) -> int | None:
+    """Like `require_int`, but `None` when the key is absent or explicitly
+    `null` -- for a field a provider's response may or may not include
+    (CLOSE3-2: e.g. `current_daily_limit`, which is genuinely unknown for
+    plenty of real rows, not a malformed response). Present-but-wrong-typed
+    is still an error, same as `require_int` -- only absence is tolerated.
+    """
+    if key not in row or row[key] is None:
+        return None
+    value = row[key]
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise MalformedResponseError(
+            f"{provider}: expected '{key}' to be an integer or null, got {type(value).__name__}"
+        )
+    return value
+
+
 def normalize_to_utc_date(raw: str, provider: str) -> date:
     """Parse an ISO 8601 date or datetime string and return its UTC calendar date.
 

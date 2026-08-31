@@ -4,7 +4,8 @@
       "from_email": "sender1@example.com",
       "sent_date": "2026-08-01",
       "sent_count": 500,
-      "bounce_count": 4
+      "bounce_count": 4,
+      "message_per_day": 100
     },
     {
       "from_email": "sender2@example.com",

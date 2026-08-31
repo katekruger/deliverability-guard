@@ -166,6 +166,7 @@ class BreakerStateStore:
         self,
         initial: Mapping[MailboxRef, MailboxBreakerStatus] | None = None,
         initial_throttled_at_limit: Mapping[MailboxRef, int] | None = None,
+        initial_unsupported_throttle_streak: Mapping[MailboxRef, int] | None = None,
     ) -> None:
         self._status: dict[MailboxRef, MailboxBreakerStatus] = dict(initial) if initial else {}
         # The `current_daily_limit` INPUT that was in force the last time
@@ -178,6 +179,16 @@ class BreakerStateStore:
         # the next THROTTLE re-halve an already-throttled limit.
         self._throttled_at_limit: dict[MailboxRef, int] = (
             dict(initial_throttled_at_limit) if initial_throttled_at_limit else {}
+        )
+        # Consecutive THROTTLE evaluations in a row whose action came back
+        # UNSUPPORTED -- the provider can't execute it, either because
+        # `current_daily_limit` is unknown or because the driver structurally
+        # can't throttle at all (CLOSE3-2). Reset by any other outcome; once
+        # it reaches `_MAX_UNSUPPORTED_THROTTLE_STREAK`, `evaluate()`
+        # escalates the verdict to PAUSE instead of writing another
+        # identical UNSUPPORTED record forever.
+        self._unsupported_throttle_streak: dict[MailboxRef, int] = (
+            dict(initial_unsupported_throttle_streak) if initial_unsupported_throttle_streak else {}
         )
 
     @classmethod
@@ -263,11 +274,13 @@ class BreakerStateStore:
 
         status: dict[MailboxRef, MailboxBreakerStatus] = {}
         throttled_at_limit: dict[MailboxRef, int] = {}
+        unsupported_streak: dict[MailboxRef, int] = {}
         for event in events:
             if isinstance(event, ResumeRecord):
                 mailbox = MailboxRef(provider=event.provider, mailbox_id=event.mailbox_id)
                 status[mailbox] = MailboxBreakerStatus.ACTIVE
                 throttled_at_limit.pop(mailbox, None)
+                unsupported_streak.pop(mailbox, None)
                 continue
             record = event
             if record.dry_run:
@@ -283,14 +296,30 @@ class BreakerStateStore:
                     status[mailbox] = MailboxBreakerStatus.PAUSE_FAILED
                 else:
                     status[mailbox] = MailboxBreakerStatus.ACTIVE
+                unsupported_streak.pop(mailbox, None)
             elif record.verdict is Verdict.THROTTLE:
                 if record.action_outcome is ActionOutcome.PERFORMED:
                     status[mailbox] = MailboxBreakerStatus.THROTTLED
                     if record.applied_daily_limit is not None:
                         throttled_at_limit[mailbox] = record.applied_daily_limit
-                else:
+                    unsupported_streak.pop(mailbox, None)
+                elif record.action_outcome is ActionOutcome.UNSUPPORTED:
+                    # CLOSE3-2: a provider that structurally can't execute
+                    # this throttle (or whose `current_daily_limit` is
+                    # unknown) never marks the mailbox THROTTLED -- same as
+                    # the live path (`_act` never calls `mark_throttled` for
+                    # an UNSUPPORTED outcome) -- but the streak of how many
+                    # times in a row this has happened DOES persist, so a
+                    # process that restarts between every evaluation still
+                    # escalates to PAUSE after a bounded number, instead of
+                    # resetting the count on every single restart.
                     status[mailbox] = MailboxBreakerStatus.ACTIVE
                     throttled_at_limit.pop(mailbox, None)
+                    unsupported_streak[mailbox] = unsupported_streak.get(mailbox, 0) + 1
+                else:  # FAILED
+                    status[mailbox] = MailboxBreakerStatus.ACTIVE
+                    throttled_at_limit.pop(mailbox, None)
+                    unsupported_streak.pop(mailbox, None)
             elif (
                 record.verdict is Verdict.OK
                 and status.get(mailbox) is MailboxBreakerStatus.THROTTLED
@@ -305,13 +334,18 @@ class BreakerStateStore:
                 # the OK verdicts in sequence.
                 status[mailbox] = MailboxBreakerStatus.ACTIVE
                 throttled_at_limit.pop(mailbox, None)
-            # WARN, or an OK that isn't a recovery: notify-only or nothing
-            # happened -- leave whatever status this mailbox already had
-            # alone. In particular, a PAUSED mailbox reporting
-            # healthy-looking evidence later stays PAUSED; only
-            # `resume_after_human_review` (via a `ResumeRecord` above) can
-            # change that.
-        return cls(status, throttled_at_limit)
+                unsupported_streak.pop(mailbox, None)
+            else:
+                # WARN, or an OK that isn't a recovery: notify-only or
+                # nothing happened for status/limit -- leave whatever status
+                # this mailbox already had alone (a PAUSED mailbox reporting
+                # healthy-looking evidence later stays PAUSED; only
+                # `resume_after_human_review`, via a `ResumeRecord` above,
+                # can change that). The unsupported-throttle streak DOES
+                # still reset here, mirroring `evaluate()`'s own
+                # `verdict is not THROTTLE -> clear` rule.
+                unsupported_streak.pop(mailbox, None)
+        return cls(status, throttled_at_limit, unsupported_streak)
 
     def status_of(self, mailbox: MailboxRef) -> MailboxBreakerStatus:
         return self._status.get(mailbox, MailboxBreakerStatus.ACTIVE)
@@ -322,6 +356,18 @@ class BreakerStateStore:
         that memory has since been cleared by genuine recovery -- see
         `mark_active`)."""
         return self._throttled_at_limit.get(mailbox)
+
+    def unsupported_throttle_streak(self, mailbox: MailboxRef) -> int:
+        """How many consecutive THROTTLE evaluations in a row have come back
+        UNSUPPORTED for this mailbox (CLOSE3-2). `0` if it's never happened,
+        or has since been reset by any other outcome."""
+        return self._unsupported_throttle_streak.get(mailbox, 0)
+
+    def mark_unsupported_throttle(self, mailbox: MailboxRef) -> None:
+        self._unsupported_throttle_streak[mailbox] = self.unsupported_throttle_streak(mailbox) + 1
+
+    def clear_unsupported_throttle_streak(self, mailbox: MailboxRef) -> None:
+        self._unsupported_throttle_streak.pop(mailbox, None)
 
     def mark_throttled(self, mailbox: MailboxRef, *, current_daily_limit: int) -> None:
         self._status[mailbox] = MailboxBreakerStatus.THROTTLED
@@ -357,17 +403,29 @@ class BreakerStateStore:
         """
         self._status[mailbox] = MailboxBreakerStatus.ACTIVE
         self._throttled_at_limit.pop(mailbox, None)
+        self._unsupported_throttle_streak.pop(mailbox, None)
 
     def resume_after_human_review(self, mailbox: MailboxRef) -> None:
         """The only way back from PAUSED to ACTIVE. Not called anywhere in
         this module's automatic evaluation path. See ADR 0003."""
         self._status[mailbox] = MailboxBreakerStatus.ACTIVE
         self._throttled_at_limit.pop(mailbox, None)
+        self._unsupported_throttle_streak.pop(mailbox, None)
 
 
 # A mailbox throttled all the way to 0/day is a pause wearing a different
 # hat -- it blurs the ladder's rungs into each other. 1 is the floor.
 _MIN_THROTTLED_DAILY_LIMIT = 1
+
+# CLOSE3-2: how many consecutive THROTTLE evaluations may come back
+# UNSUPPORTED before escalating to PAUSE. A provider that can't execute the
+# throttle -- unknown `current_daily_limit`, or a driver that structurally
+# has no throttle primitive at all -- must not write an identical
+# UNSUPPORTED record forever; a bounded streak still gives a few evaluations'
+# worth of benefit of the doubt (e.g. a transient gap in reported data)
+# before routing through the human-review gate (ADR 0003), same as the
+# floor-escalation case just below.
+_MAX_UNSUPPORTED_THROTTLE_STREAK = 3
 
 
 @dataclass(frozen=True, slots=True)
@@ -553,6 +611,17 @@ def evaluate(
         # PAUSE -- and therefore through the human-review gate (ADR 0003)
         # -- instead.
         verdict = Verdict.PAUSE
+    elif (
+        verdict is Verdict.THROTTLE
+        and state_store.unsupported_throttle_streak(mailbox) >= _MAX_UNSUPPORTED_THROTTLE_STREAK
+    ):
+        # CLOSE3-2: a throttle this provider has been unable to execute
+        # `_MAX_UNSUPPORTED_THROTTLE_STREAK` times in a row -- unknown
+        # `current_daily_limit`, or a driver with no throttle primitive at
+        # all -- is not a rung this mailbox can ever actually descend.
+        # Escalate through PAUSE (and therefore the human-review gate, ADR
+        # 0003) instead of writing another identical UNSUPPORTED record.
+        verdict = Verdict.PAUSE
     elif verdict is Verdict.OK and state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
         # CLOSE-3b: a sustained OK verdict is the ladder's own recovery path
         # for THROTTLE (unlike PAUSE, which never auto-recovers -- ADR
@@ -561,6 +630,13 @@ def evaluate(
         # later re-degradation reads as an idempotent no-op instead of a
         # fresh throttle.
         state_store.mark_active(mailbox)
+
+    if verdict is not Verdict.THROTTLE:
+        # Reset CLOSE3-2's streak on any outcome other than a THROTTLE
+        # verdict -- OK, WARN, or an escalation to PAUSE just above all mean
+        # this mailbox is no longer in the "repeatedly unexecutable
+        # throttle" situation the streak tracks.
+        state_store.clear_unsupported_throttle_streak(mailbox)
 
     action: ActionResult | None = None
     applied_daily_limit: int | None = None
@@ -573,8 +649,14 @@ def evaluate(
             dry_run=dry_run,
             current_daily_limit=current_daily_limit,
         )
-        if verdict is Verdict.THROTTLE and action.outcome is ActionOutcome.PERFORMED:
-            applied_daily_limit = state_store.throttled_at_limit(mailbox)
+        if verdict is Verdict.THROTTLE:
+            if action.outcome is ActionOutcome.PERFORMED:
+                applied_daily_limit = state_store.throttled_at_limit(mailbox)
+                state_store.clear_unsupported_throttle_streak(mailbox)
+            elif action.outcome is ActionOutcome.UNSUPPORTED:
+                state_store.mark_unsupported_throttle(mailbox)
+            else:  # FAILED
+                state_store.clear_unsupported_throttle_streak(mailbox)
 
     return BreakerEvaluation(
         evaluated_at=now,

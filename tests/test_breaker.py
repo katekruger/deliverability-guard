@@ -11,6 +11,7 @@ from deliverability_guard.audit.log import (
     ResumeRecord,
     append_record,
     append_resume_record,
+    read_records,
 )
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
@@ -232,6 +233,123 @@ def test_throttle_that_would_drop_below_the_floor_escalates_to_pause() -> None:
     assert driver.throttle_calls == []
     assert driver.pause_calls == [_MAILBOX]
     assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+# --- CLOSE3-2: an unexecutable throttle must not loop forever -------------
+
+
+def test_unsupported_throttle_escalates_to_pause_after_a_bounded_streak() -> None:
+    """CLOSE3-2: before this, a mailbox whose current daily limit is unknown
+    (or whose provider structurally can't throttle) stayed ACTIVE forever,
+    re-deriving THROTTLE and re-emitting an identical UNSUPPORTED record on
+    every single evaluation. After a bounded number of consecutive
+    unexecutable throttles, this must escalate to PAUSE -- through the
+    human-review gate (ADR 0003), same as the floor-escalation case just
+    above."""
+    driver = FakeDriver(throttle_outcome=ActionOutcome.UNSUPPORTED)
+    state_store = BreakerStateStore()
+    results = [
+        evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=20_000,
+            complaints=30,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=100,
+        )
+        for _ in range(4)
+    ]
+    assert [r.verdict for r in results] == [
+        Verdict.THROTTLE,
+        Verdict.THROTTLE,
+        Verdict.THROTTLE,
+        Verdict.PAUSE,
+    ]
+    assert driver.pause_calls == [_MAILBOX]
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_a_successful_throttle_resets_the_unsupported_streak() -> None:
+    """The streak is specific to consecutive unexecutable throttles -- a
+    successful throttle in between must reset it, not let it silently
+    accumulate toward an escalation the mailbox no longer deserves."""
+    driver = FakeDriver(throttle_outcome=ActionOutcome.UNSUPPORTED)
+    state_store = BreakerStateStore()
+    for _ in range(2):  # below the escalation bound of 3
+        evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=20_000,
+            complaints=30,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=100,
+        )
+    driver.throttle_outcome = ActionOutcome.PERFORMED
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    assert result.verdict == Verdict.THROTTLE
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+
+def test_state_store_from_log_bounds_repeated_unsupported_throttle_records(
+    tmp_path: Path,
+) -> None:
+    """CLOSE3-2's own required test shape: ten separate restarts (a fresh
+    `BreakerStateStore.from_log` each time), a driver that always reports
+    UNSUPPORTED for throttle. The log must not accumulate ten identical
+    UNSUPPORTED throttle records -- the streak persists across restarts via
+    `from_log`, same as `_throttled_at_limit` (CLOSE3-1)."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver(throttle_outcome=ActionOutcome.UNSUPPORTED)
+    for _ in range(10):
+        state_store = (
+            BreakerStateStore.from_log(log_path) if log_path.exists() else BreakerStateStore()
+        )
+        if state_store.status_of(_MAILBOX) is MailboxBreakerStatus.PAUSED:
+            # An operator would investigate a PAUSED mailbox, not keep
+            # re-running `check` against it unattended -- the point already
+            # made is that escalation happened well before ten runs.
+            break
+        result = evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=20_000,
+            complaints=30,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=100,
+        )
+        append_record(log_path, DecisionRecord.from_evaluation(result))
+
+    records = read_records(log_path)
+    unsupported_throttle_records = [
+        r
+        for r in records
+        if r.verdict is Verdict.THROTTLE and r.action_outcome is ActionOutcome.UNSUPPORTED
+    ]
+    assert len(unsupported_throttle_records) < 10
+    assert BreakerStateStore.from_log(log_path).status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
 # --- Idempotency: THROTTLE, keyed on the verdict, not the limit ------------
