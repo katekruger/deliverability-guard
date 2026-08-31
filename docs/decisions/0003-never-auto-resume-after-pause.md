@@ -251,6 +251,73 @@ test_state_store_from_log_skips_a_dry_run_pause_record` and
 cover (2)/(3). `tests/test_breaker.py::test_state_store_from_log_fails_closed_on_an_empty_log`
 covers the zero-byte case.
 
+## Addendum (2026-08-31): the throttle rung latched, reopened, and never fired in production (CLOSE-3)
+
+A third finding from the same follow-up audit (CLOSE-3), specifically about
+the THROTTLE rung rather than PAUSE:
+
+1. **THROTTLE never reached the provider at all** on the real `check`/`run`
+   path, because `loops.fast.evaluate_all_mailboxes` never passed
+   `current_daily_limit`. Fixed as part of the CLOSE-1 wiring commit (see
+   ADR 0002's addendum for that).
+2. **Once THROTTLED, THROTTLE was a permanent no-op.** Nothing ever cleared
+   `THROTTLED` back to `ACTIVE` on recovery, and the ENG-5a idempotency fix
+   above was keyed purely on status, not on whether the mailbox's daily
+   limit had actually changed since. Concretely: `THROTTLE -> OK -> THROTTLE`
+   never reached the provider a second time, and a human manually restoring
+   a throttled mailbox's daily limit -- without an intervening `OK` verdict
+   -- was invisible to the idempotency check entirely.
+3. **A failed PAUSE reopened the THROTTLE cascade.** `_act` marked a FAILED
+   pause attempt `ACTIVE`, the same status as a mailbox that had never been
+   touched. A subsequent THROTTLE verdict against that "pristine-looking"
+   mailbox re-halved an already-throttled limit (25 -> 12), continuing the
+   exact cascade ENG-5a's idempotency fix was supposed to prevent.
+4. **Floor escalation had an off-by-one.** The guard was
+   `current_daily_limit // 2 < _MIN_THROTTLED_DAILY_LIMIT` (`< 1`). At a
+   limit of 2 or 3, `// 2` is exactly `1` -- the floor -- so the guard never
+   fired, and the mailbox was silently clamped to 1/day (a de-facto pause)
+   without ever passing through the human-review gate this ADR exists to
+   enforce.
+
+**Fix, matching the four numbered points above:**
+
+1. See ADR 0002's addendum on wiring.
+2. `engine.breaker.evaluate` now clears `THROTTLED` back to `ACTIVE` whenever
+   it computes a plain `OK` verdict (never on `WARN`). Idempotency is now
+   also keyed on the daily limit, not just the status:
+   `BreakerStateStore` tracks `throttled_at_limit(mailbox)`, the
+   `current_daily_limit` input in force the last time this mailbox was
+   actually throttled. A THROTTLE verdict is a no-op only when the mailbox's
+   *current* limit hasn't grown past that recorded value; if it has (a
+   human restored it, with no intervening `OK`), that's treated as a fresh
+   throttle event and acted on again.
+3. `MailboxBreakerStatus` gained `PAUSE_FAILED`, distinct from `ACTIVE`. A
+   FAILED pause attempt now marks `PAUSE_FAILED`, which -- unlike
+   `mark_active` -- does NOT clear `throttled_at_limit`, so a later THROTTLE
+   still compares against what was actually applied and stays idempotent.
+4. The floor-escalation guard is now `current_daily_limit // 2 <=
+   _MIN_THROTTLED_DAILY_LIMIT` -- escalates when the RESULT would be at or
+   below the floor, not only strictly below it.
+
+**Known limitation, carried forward deliberately:** a `BreakerStateStore`
+rebuilt via `from_log` does not restore `throttled_at_limit` -- the decision
+log doesn't currently persist the `current_daily_limit` input a throttle was
+computed against. The first THROTTLE evaluation after a restart will
+therefore act once more even if nothing has actually changed, recomputing a
+fresh (still correct) limit rather than a stale one. This is a real gap, but
+not the ENG-5a-style unbounded cascade this ADR guards against -- it's at
+most one extra, correctly-computed call per restart.
+
+### Confirmation
+
+`tests/test_breaker.py::test_throttle_then_ok_then_throttle_re_throttles`,
+`test_throttle_re_throttles_when_the_current_limit_has_grown_past_what_was_applied`,
+`test_failed_pause_does_not_let_a_later_throttle_re_halve`,
+`test_daily_limit_of_two_escalates_to_pause`, and
+`test_daily_limit_of_three_escalates_to_pause` cover points 2-4 above, and
+`test_repeated_throttle_verdict_does_not_re_halve_the_daily_limit` (unchanged)
+confirms the six-identical-ticks case still holds.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and

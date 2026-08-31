@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: the THROTTLE rung latched, reopened, and never
+  auto-recovered** (external audit finding CLOSE-3, points 3b-3d; 3a is the
+  same wiring fix as the `evaluate_all_mailboxes` commit below). Three
+  separate bugs, all in `_act`/`evaluate`: (1) once THROTTLED, nothing ever
+  cleared the status back to `ACTIVE` on recovery, and idempotency was keyed
+  purely on status rather than on the mailbox's actual daily limit, so
+  `THROTTLE -> OK -> THROTTLE` never reached the provider a second time, and
+  a human manually restoring a throttled limit was invisible to the
+  idempotency check; (2) a FAILED pause attempt was marked `ACTIVE`, the
+  same as a never-touched mailbox, so a subsequent THROTTLE re-halved an
+  already-throttled limit (25 -> 12) -- reopening the exact cascade the
+  ENG-5a fix above exists to prevent; (3) the floor-escalation guard used
+  `<` instead of `<=`, so a daily limit of 2 or 3 halved to exactly 1 (the
+  floor) without ever escalating to `PAUSE`, silently clamping to a
+  de-facto pause with no human gate. `evaluate()` now clears `THROTTLED` to
+  `ACTIVE` on a sustained `OK` verdict; `BreakerStateStore` now tracks the
+  daily limit a throttle was last applied against and keys idempotency on
+  it; `MailboxBreakerStatus` gained `PAUSE_FAILED`, distinct from `ACTIVE`,
+  which preserves that limit memory through a failed pause attempt; the
+  floor guard is now `<=`. See the ADR 0003 addendum.
+
 - **`cli.py`, `engine/breaker.py`: `resume` was a no-op across a restart, and
   dry-run evaluations persisted as real `PAUSED` state** (external audit
   finding CLOSE-4, the highest-severity item in the follow-up audit).
