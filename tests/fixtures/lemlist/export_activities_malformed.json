@@ -1,0 +1,10 @@
+{
+  "activities": [
+    {
+      "campaignId": "camp_123",
+      "leadEmail": "lead1@prospect.com",
+      "type": "emailsSent",
+      "date": "2026-08-01T10:00:00.000Z"
+    }
+  ]
+}
