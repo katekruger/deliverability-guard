@@ -104,12 +104,12 @@ Capability declaration is the whole design of the provider driver interface (`pr
 |---|---|:--:|:--:|:--:|:--:|
 | **Instantly** | ✅ Implemented (reference driver) | per-mailbox daily | ✅ mailbox or campaign | ❌ no primitive | yes |
 | **Smartlead** | ✅ Implemented and CLI-selectable (proves the throttle path) | per-campaign | campaign only, not per-mailbox | ✅ per-mailbox daily limit | yes |
-| Lemlist | Researched, not yet implemented | activities | idempotent, campaign-level | ❌ | unverified |
-| Apollo | Researched, not yet implemented | email stats | list only | ❌ | polling only |
+| **Lemlist** | ✅ Implemented | activities export, aggregated per mailbox/day | ✅ campaign only, idempotent server-side | ❌ no primitive | unverified (capability not claimed) |
+| **Apollo** | ✅ Implemented | per-campaign daily stats | ✅ campaign (`/abort`, resume semantics unverified) | ❌ no primitive | polling only (capability not claimed) |
 | Outreach | Researched, not yet implemented | yes | likely (unverified) | likely (unverified) | best-in-class |
 | Salesloft | Researched, not yet implemented | yes | **likely UI-only** — no API | ❌ | unverified |
 | Amplemarket | Researched, not yet implemented | ❌ | **no status-change API at all** — app-only | ❌ | ❌ |
-| Amazon SES | Researched, not yet implemented | via CloudWatch | account-level (config set) | via config set | via SNS |
+| **Amazon SES** | ✅ Implemented (read + pause; see [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)) | CloudWatch `Send`/`Bounce` metrics | ✅ configuration set or whole account | ❌ no daily-volume primitive | not implemented (SNS ingestion is separate infra) |
 | Postmark | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 | SendGrid | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 

@@ -9,6 +9,122 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`mcp_server.py`: an MCP server wrapping the read surface** (BUILD-PLAN.md
+  §4 item #27 -- "Ties into the rest of the portfolio"). Three read-only
+  tools: `mailbox_status` (current breaker state), `thresholds` (the
+  configured warn/throttle/pause ladder), and `recent_decisions` (recent
+  decision-log entries for one mailbox, newest first). **Deliberately no
+  `pause`/`resume`/`throttle` tool** -- see the [ADR 0003
+  addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-08-30-the-mcp-server-is-read-only-on-purpose):
+  handing the resume decision to whatever is on the other end of an MCP
+  connection is the same automatic-resume failure mode that ADR already
+  rejects, just with an LLM's judgment substituted for a threshold. Each
+  tool's underlying logic (`get_mailbox_status`/`get_thresholds`/
+  `list_recent_decisions`) is a plain function taking `config_path`
+  explicitly, testable with no MCP client or protocol layer at all;
+  `build_server`'s registration wiring is confirmed via the `mcp` SDK's
+  own in-process `list_tools`/`call_tool`, still with no network of any
+  kind. Adds `mcp` (the official Model Context Protocol SDK) as a runtime
+  dependency.
+- **`providers/lemlist.py`: the lemlist driver** (BUILD-PLAN.md §3 v0.3).
+  `READ_STATS` via the `activities` export, aggregated client-side into
+  per-mailbox daily send/bounce counts; `PAUSE` at campaign granularity
+  only (no per-mailbox pause endpoint exists), relying on lemlist's own
+  documented server-side idempotency rather than adding a client-side
+  guard. `THROTTLE` and `WEBHOOKS` are not claimed -- lemlist has no
+  daily-limit primitive, and BUILD-PLAN.md flags its webhook support as
+  unverified. Endpoint shapes are hand-authored from public documentation
+  (no live lemlist account in this environment), same caveat as
+  `providers/instantly.py` -- see `tests/fixtures/lemlist/README.md`.
+- **`providers/apollo.py`: the Apollo driver** (BUILD-PLAN.md §3 v0.3).
+  `READ_STATS` per campaign (Apollo has no global per-mailbox feed, like
+  Smartlead and lemlist); `PAUSE` at campaign granularity only via
+  Apollo's own named `/abort` endpoint, since Apollo's per-mailbox
+  pause/throttle capability is "list only" (`list_email_accounts()`
+  enumerates connected mailboxes but cannot act on one individually).
+  `activate_campaign`'s resume semantics are explicitly flagged as
+  unverified in both the docstring and its `ActionResult.detail`, per
+  BUILD-PLAN.md's own caveat -- confirm it restores prior sequence state
+  before relying on it. `THROTTLE`/`WEBHOOKS` are not claimed: no
+  daily-limit endpoint exists, and Apollo's webhook support is polling
+  only. Endpoint shapes are hand-authored from public documentation, same
+  caveat as `providers/instantly.py` -- see
+  `tests/fixtures/apollo/README.md`.
+- **`signals/spamhaus.py`: Spamhaus DQS blocklist checks** (BUILD-PLAN.md
+  §4 item #25 -- "the only free programmatic blocklist worth having,"
+  since Talos/SenderScore/Validity have no public API). `check_ip` looks
+  up an IPv4 address against the ZEN zone via a reversed-octet DNS query
+  and classifies the return code (SBL/CSS/XBL/PBL, or `UNKNOWN_LISTED` for
+  an unrecognized code -- never silently coerced to not-listed). A
+  confirmed NXDOMAIN (`DnsNameNotFoundError`) is the only result treated
+  as "not listed"; every other failure (timeout, SERVFAIL, an empty
+  answer with no exception) raises `SpamhausLookupError` instead of
+  reading as a clean IP -- the same missing-data-is-not-zero principle
+  AGENTS.md applies everywhere else in this project. `resolve` has no
+  default and must always be supplied, so a test can never fall through to
+  a real DNS lookup by omission.
+- **`providers/ses.py`: the Amazon SES driver** (BUILD-PLAN.md §3 v0.3 --
+  "the only platform with native breaker primitives" among the ESPs not
+  yet implemented). `READ_STATS` via CloudWatch's `Send`/`Bounce` metric
+  sums, dimensioned by configuration set (SES has no per-mailbox concept
+  at all -- see the module docstring); `PAUSE` via SESv2
+  `PutConfigurationSetSendingOptions` (a configuration set, reachable
+  through the generic `pause()`) and a separate, deliberately-not-generic
+  `pause_account()` account-wide kill switch, which is never reachable
+  through `pause()` itself -- the same "a disproportionate action must be
+  deliberate" rule `providers/smartlead.py` already established for
+  campaign-vs-mailbox pause. `THROTTLE` is not claimed: SES's rate control
+  is sends-per-second, not a daily-volume limit, and mapping one onto the
+  other would misrepresent what actually happens. `WEBHOOKS` is not
+  claimed either -- SES delivers bounce/complaint notifications via SNS, a
+  push mechanism this driver does not implement (a documented known
+  limitation, not silently missing).
+
+  This is the first dependency-adding driver in the project: `boto3` is a
+  new runtime dependency, justified in [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)
+  as avoiding hand-rolled AWS SigV4 request signing (security-sensitive
+  cryptographic code this project shouldn't reimplement) at the cost of a
+  genuinely heavy (~15MB) addition. Tests use hand-defined `Protocol`
+  fakes for the SESv2/CloudWatch clients -- no `moto`, no live AWS
+  account, no network call of any kind.
+- **`signals/dmarc.py`: DMARC aggregate-report auth-health signal, built
+  on `parsedmarc`** (BUILD-PLAN.md §4 item #17 -- "Reuse as a library. Do
+  not reimplement."). `summarize_auth_health` aggregates parsedmarc's own
+  parsed-report dicts (this module never parses raw DMARC XML itself)
+  into total/aligned message counts and a ranked list of unauthenticated
+  `UnknownSource`s -- sources failing BOTH SPF and DKIM alignment (RFC
+  9989 §3: DMARC passes on either, not both). Zero reports is
+  `INSUFFICIENT_DATA`, never a 0%- or 100%-aligned rate. A malformed
+  report (missing `records`/`alignment`/`source`, a non-integer `count`)
+  raises `MalformedDmarcReportError` rather than silently skipping or
+  defaulting -- same missing-data discipline as everywhere else in this
+  project. Explicitly a slow-loop, cross-provider signal, never a
+  real-time one, and carries no complaint or inbox-placement data at all.
+
+  Adds `parsedmarc` as a runtime dependency, justified in [ADR
+  0006](docs/decisions/0006-parsedmarc-dependency-for-dmarc-auth-health.md)
+  -- BUILD-PLAN.md's own research already concluded this shouldn't be
+  reimplemented; the ADR discloses the ~20-transitive-package weight this
+  adds. `tests/test_dmarc.py` includes a real integration test against
+  `parsedmarc.parse_aggregate_report_xml(..., offline=True)` (no network
+  call) that caught a real gap in the initial implementation: offline
+  parsing leaves `source.base_domain` unset, which is why
+  `_source_identifier` falls back to the raw IP address.
+- **`identity/warmup_advisor.py`: warmup curve adherence, explicitly
+  labeled as folklore** (BUILD-PLAN.md §4 item #19). `check_adherence`
+  compares a mailbox's actual observed daily sends against a piecewise-
+  linear-interpolated ramp curve and classifies the result as
+  `ON_SCHEDULE`/`AHEAD_OF_SCHEDULE`/`BEHIND_SCHEDULE` (within a
+  configurable `tolerance` fraction) or `PAST_CURVE` once the mailbox is
+  older than the curve's last defined checkpoint -- deliberately not a
+  "bad" outcome, since the curve has nothing more to recommend past that
+  point. `DEFAULT_WARMUP_CURVE` is documented, per BUILD-PLAN.md §8's own
+  instruction, as vendor consensus with no RFC, M3AAWG document, or
+  independent research behind it -- "presenting folklore as authoritative
+  is the project's most likely credibility failure" -- and every function
+  accepts a `curve` override so a caller is never stuck with it. No
+  enforcement of any kind: this is a comparison against a baseline with no
+  ground truth, never a verdict.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
@@ -63,7 +179,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not how far it can pull the posterior itself. `evaluate()` now takes the
   worse (higher) of the pooled and flat lower bounds whenever `peer_group`
   is given: pooling can only ever add sensitivity, never remove it. See
-  [ADR 0005](docs/decisions/0005-pooling-never-reduces-breaker-sensitivity.md).
+  [ADR 0007](docs/decisions/0007-pooling-never-reduces-breaker-sensitivity.md).
 
 - **`loops/fast.py`: `pooled_posterior` and `cusum_step` had callers that
   nothing itself called in production** (external audit finding CLOSE-1).

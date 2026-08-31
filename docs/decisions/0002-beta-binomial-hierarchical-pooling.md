@@ -216,7 +216,7 @@ Wiring pooling into production (the next addendum, below) surfaced a
 follow-up correctness bug: even with the ESS cap, pooling could make the
 breaker's decision LESS sensitive than evaluating a mailbox's own evidence
 alone, at own-volume levels between roughly 91 and 389 sends. See
-[ADR 0005](0005-pooling-never-reduces-breaker-sensitivity.md) for the full
+[ADR 0007](0007-pooling-never-reduces-breaker-sensitivity.md) for the full
 reproduction and fix -- `evaluate()` now takes the worse of the pooled and
 flat lower bounds whenever pooling is used, guaranteeing pooling only ever
 adds sensitivity, never removes it.

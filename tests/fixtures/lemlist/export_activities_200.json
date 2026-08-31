@@ -1,0 +1,39 @@
+{
+  "activities": [
+    {
+      "campaignId": "camp_123",
+      "sendUserEmail": "sender1@example.com",
+      "leadEmail": "lead1@prospect.com",
+      "type": "emailsSent",
+      "date": "2026-08-01T10:00:00.000Z"
+    },
+    {
+      "campaignId": "camp_123",
+      "sendUserEmail": "sender1@example.com",
+      "leadEmail": "lead2@prospect.com",
+      "type": "emailsSent",
+      "date": "2026-08-01T11:00:00.000Z"
+    },
+    {
+      "campaignId": "camp_123",
+      "sendUserEmail": "sender1@example.com",
+      "leadEmail": "lead2@prospect.com",
+      "type": "emailsBounced",
+      "date": "2026-08-01T11:05:00.000Z"
+    },
+    {
+      "campaignId": "camp_123",
+      "sendUserEmail": "sender1@example.com",
+      "leadEmail": "lead3@prospect.com",
+      "type": "emailsOpened",
+      "date": "2026-08-01T12:00:00.000Z"
+    },
+    {
+      "campaignId": "camp_123",
+      "sendUserEmail": "sender2@example.com",
+      "leadEmail": "lead4@prospect.com",
+      "type": "emailsSent",
+      "date": "2026-07-30T09:00:00.000Z"
+    }
+  ]
+}

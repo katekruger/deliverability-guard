@@ -395,7 +395,7 @@ def evaluate(
 
     When `peer_group` is given, the VERDICT (and the `lower_bound` returned
     on `BreakerEvaluation`) is the WORSE of the pooled and flat lower bounds
-    -- never just the pooled one (ADR 0005). The ESS cap alone still let a
+    -- never just the pooled one (ADR 0007). The ESS cap alone still let a
     large healthy peer group make the breaker read a mailbox with enough of
     its OWN bad evidence to breach on its own as healthy once pooled, at
     own-volume levels the cap didn't bound. `BreakerEvaluation.posterior`

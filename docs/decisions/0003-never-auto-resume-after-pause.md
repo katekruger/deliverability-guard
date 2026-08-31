@@ -189,6 +189,23 @@ rebuild, a failed pause attempt correctly rebuilding as `ACTIVE`, a paused
 mailbox staying paused through later healthy-looking log entries, and the
 no-history-vs-unreadable-history distinction.
 
+## Addendum (2026-08-30): the MCP server is read-only, on purpose
+
+`mcp_server.py` (BUILD-PLAN.md §4 item #27) wraps this project's read
+surface -- breaker status, configured thresholds, recent decision-log
+entries -- as MCP tools. It deliberately does NOT expose `resume`,
+`pause`, or `throttle`. Wiring `resume_after_human_review` up as an
+LLM-callable MCP tool would hand the resume decision to whatever is on
+the other end of the MCP connection, which is exactly the automatic-
+resume path this ADR exists to rule out -- an MCP client asking an LLM
+"should I resume this mailbox?" and getting a "yes" is not meaningfully
+different from the auto-resume-on-a-quiet-posterior option this ADR
+already rejected, just with an LLM's judgment substituted for a
+threshold. If a write surface is ever wanted here, that is a new decision
+requiring its own ADR, not a quiet extension of `mcp_server.py`.
+`tests/test_mcp_server.py::test_build_server_never_registers_a_pause_or_resume_tool`
+enforces this by inspecting the server's registered tool names directly.
+
 ## Addendum (2026-08-31): the never-auto-resume guarantee still didn't survive a restart, in the other direction
 
 A second external audit (CLOSE-4) found that the ENG-5b fix above only
