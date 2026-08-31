@@ -6,6 +6,7 @@ import pytest
 
 from deliverability_guard.providers._parsing import (
     normalize_to_utc_date,
+    optional_int,
     require_dict,
     require_int,
     require_list,
@@ -60,6 +61,28 @@ def test_require_int_rejects_a_bool() -> None:
 def test_require_int_rejects_a_float() -> None:
     with pytest.raises(MalformedResponseError, match="'k'"):
         require_int({"k": 5.5}, "k", "x")
+
+
+def test_optional_int_accepts_an_int() -> None:
+    assert optional_int({"k": 25}, "k", "x") == 25
+
+
+def test_optional_int_returns_none_for_a_missing_key() -> None:
+    assert optional_int({}, "k", "x") is None
+
+
+def test_optional_int_returns_none_for_an_explicit_null() -> None:
+    assert optional_int({"k": None}, "k", "x") is None
+
+
+def test_optional_int_rejects_a_bool() -> None:
+    with pytest.raises(MalformedResponseError, match="'k'"):
+        optional_int({"k": True}, "k", "x")
+
+
+def test_optional_int_rejects_a_float() -> None:
+    with pytest.raises(MalformedResponseError, match="'k'"):
+        optional_int({"k": 5.5}, "k", "x")
 
 
 def test_normalize_bare_date_returned_as_is() -> None:

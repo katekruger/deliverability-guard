@@ -13,7 +13,7 @@ from deliverability_guard.providers.base import (
     MalformedResponseError,
     RateLimitExceededError,
 )
-from deliverability_guard.providers.lemlist import LemlistDriver
+from deliverability_guard.providers.lemlist import LemlistCampaignDriver, LemlistDriver
 from fixtures.http import recording_client, response
 
 _BASE_URL = "https://api.lemlist.com/api"
@@ -184,3 +184,37 @@ def test_malformed_response_error_never_contains_the_api_key() -> None:
     with pytest.raises(MalformedResponseError) as exc_info:
         _driver(client).read_mailbox_stats(since=date(2026, 7, 1), campaign_id="camp_123")
     assert "super-secret-key" not in str(exc_info.value)
+
+
+# --- LemlistCampaignDriver: the ProviderDriver adapter (CLOSE3-4) ----------
+
+
+def test_campaign_driver_pins_read_mailbox_stats_to_its_campaign_id() -> None:
+    client, _ = recording_client(
+        [response(200, "lemlist/export_activities_200.json")], base_url=_BASE_URL
+    )
+    driver = LemlistCampaignDriver(inner=_driver(client), campaign_id="camp_123")
+    stats = driver.read_mailbox_stats(date(2026, 8, 1))
+    assert len(stats) > 0
+
+
+def test_campaign_driver_passes_through_name_and_capabilities() -> None:
+    inner = _driver(recording_client([], base_url=_BASE_URL)[0])
+    driver = LemlistCampaignDriver(inner=inner, campaign_id="camp_123")
+    assert driver.name == inner.name
+    assert driver.capabilities == inner.capabilities
+
+
+def test_campaign_driver_throttle_passes_through() -> None:
+    driver = LemlistCampaignDriver(
+        inner=_driver(recording_client([], base_url=_BASE_URL)[0]), campaign_id="camp_123"
+    )
+    result = driver.throttle("acct-1", 25)
+    assert result.outcome == ActionOutcome.UNSUPPORTED
+
+
+def test_campaign_driver_pause_passes_through() -> None:
+    client, _ = recording_client([httpx.Response(200, json={})], base_url=_BASE_URL)
+    driver = LemlistCampaignDriver(inner=_driver(client), campaign_id="camp_123")
+    result = driver.pause(CampaignRef(provider="lemlist", campaign_id="camp_123"))
+    assert result.outcome == ActionOutcome.PERFORMED

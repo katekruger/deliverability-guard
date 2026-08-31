@@ -16,7 +16,13 @@ from pathlib import Path
 import pytest
 
 import deliverability_guard.cli as cli_module
-from deliverability_guard.audit.log import ResumeRecord, read_events, read_records
+from deliverability_guard.audit.log import (
+    DecisionRecord,
+    ResumeRecord,
+    append_record,
+    read_events,
+    read_records,
+)
 from deliverability_guard.cli import (
     CliError,
     build_driver,
@@ -29,12 +35,24 @@ from deliverability_guard.cli import (
 )
 from deliverability_guard.config import load_config
 from deliverability_guard.engine.breaker import (
+    DEFAULT_LADDER,
     BreakerStateStore,
     MailboxBreakerStatus,
     ThresholdStore,
     Verdict,
+    evaluate,
 )
-from deliverability_guard.providers.base import MailboxDayStats, MailboxRef, MailboxStatus
+from deliverability_guard.engine.posterior import DEFAULT_PRIOR
+from deliverability_guard.providers.base import (
+    ActionOutcome,
+    ActionResult,
+    CampaignRef,
+    Capability,
+    MailboxDayStats,
+    MailboxRef,
+    MailboxStatus,
+    unsupported,
+)
 from fixtures.fake_driver import FakeDriver
 
 _NOW = datetime(2026, 1, 1, 12, 0, tzinfo=UTC)
@@ -253,6 +271,35 @@ def test_resume_appends_a_resume_record_to_the_decision_log(tmp_path: Path) -> N
     assert event.resumed_by == "kate"
 
 
+def test_resume_clears_a_throttled_mailbox(tmp_path: Path) -> None:
+    """CLOSE3-3: before this, `resume` refused a THROTTLED mailbox outright
+    ("is not paused; nothing to resume") -- a dead end for an operator, and
+    the only command capable of clearing a persisted THROTTLED that
+    `from_log`'s own recovery logic hadn't (yet) caught up with. `resume`
+    now accepts THROTTLED the same way it accepts PAUSED: a human,
+    explicitly named, moving the mailbox back to ACTIVE."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_throttled(mailbox, current_daily_limit=50)
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+    assert state_store.throttled_at_limit(mailbox) is None
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+
+
 def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
@@ -309,10 +356,66 @@ def test_build_driver_smartlead_with_credentials_builds_a_driver() -> None:
     assert driver.name == "smartlead"
 
 
+def test_build_driver_lemlist_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="LEMLIST_API_KEY"):
+        build_driver("lemlist", env={})
+
+
+def test_build_driver_lemlist_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="LEMLIST_CAMPAIGN_ID"):
+        build_driver("lemlist", env={"LEMLIST_API_KEY": "test-key"})
+
+
+def test_build_driver_lemlist_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "lemlist", env={"LEMLIST_API_KEY": "test-key", "LEMLIST_CAMPAIGN_ID": "camp-1"}
+    )
+    assert driver.name == "lemlist"
+
+
+def test_build_driver_apollo_without_api_key_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="APOLLO_API_KEY"):
+        build_driver("apollo", env={})
+
+
+def test_build_driver_apollo_without_campaign_id_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="APOLLO_CAMPAIGN_ID"):
+        build_driver("apollo", env={"APOLLO_API_KEY": "test-key"})
+
+
+def test_build_driver_apollo_with_credentials_builds_a_driver() -> None:
+    driver = build_driver(
+        "apollo", env={"APOLLO_API_KEY": "test-key", "APOLLO_CAMPAIGN_ID": "camp-1"}
+    )
+    assert driver.name == "apollo"
+
+
+def test_build_driver_ses_without_configuration_set_raises_cli_error() -> None:
+    with pytest.raises(CliError, match="SES_CONFIGURATION_SET_NAME"):
+        build_driver("ses", env={})
+
+
+def test_build_driver_ses_with_configuration_set_builds_a_driver() -> None:
+    """No API key for SES -- it authenticates via boto3's normal AWS
+    credential chain. Constructing the driver itself makes no live call
+    (AGENTS.md) -- boto3 client construction alone never touches the
+    network; `AWS_REGION` is supplied so it doesn't depend on this
+    machine's ambient AWS config to even construct."""
+    driver = build_driver(
+        "ses",
+        env={"SES_CONFIGURATION_SET_NAME": "cs-1", "AWS_REGION": "us-east-1"},
+    )
+    assert driver.name == "ses"
+
+
 def test_build_driver_noop_needs_no_credentials() -> None:
     driver = build_driver("noop", env={})
     assert driver.name == "noop"
-    assert driver.read_mailbox_stats(date(2025, 12, 31)) == []
+    # CLOSE3-4: a small synthetic fixture, not an empty list -- see
+    # `test_main_check_with_the_noop_driver_genuinely_exercises_the_pipeline`
+    # for why an empty report was the wrong shape for a driver whose whole
+    # purpose is to exercise `check`/`run` end to end.
+    assert len(driver.read_mailbox_stats(date(2025, 12, 31))) > 0
 
 
 def test_build_driver_noop_reports_throttle_and_pause_as_unsupported() -> None:
@@ -334,6 +437,19 @@ def test_help_works_with_no_config_present(tmp_path: Path, monkeypatch: pytest.M
     with pytest.raises(SystemExit) as exc_info:
         build_parser().parse_args(["--help"])
     assert exc_info.value.code == 0
+
+
+def test_help_documents_the_exit_code_map() -> None:
+    """CLOSE3-6: the commit that introduced these exit codes claimed they
+    were documented in 'the module docstring, README, and --help's exit
+    code map' -- but `build_parser` set no `epilog`, so `--help`'s rendered
+    text had no exit-code content at all. This is the one place a cron
+    author actually looks."""
+    help_text = build_parser().format_help()
+    assert "all clear" in help_text
+    assert "breach" in help_text
+    assert "config" in help_text.lower()
+    assert "transport" in help_text.lower()
 
 
 def test_main_reports_a_config_error_cleanly(tmp_path: Path) -> None:
@@ -459,6 +575,29 @@ def test_main_check_with_the_noop_driver_needs_no_credentials(tmp_path: Path) ->
     assert exit_code == 0
 
 
+def test_main_check_with_the_noop_driver_genuinely_exercises_the_pipeline(
+    tmp_path: Path,
+) -> None:
+    """CLOSE3-4: before this, `noop` reported zero mailboxes, so `check`
+    exited via the early `no mailboxes reported any stats` branch --
+    exercising config loading and the exit path, but never the aggregation,
+    evaluation, or decision-log-writing code `check` is supposed to be
+    proving works. README line 62 claimed it exercised "the decision log";
+    it didn't -- no log file was even created. `noop` now reports a small
+    synthetic fixture, so `check` genuinely writes a decision record."""
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("provider: fake", "provider: noop")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) > 0
+    assert records[0].verdict is Verdict.OK
+
+
 def test_main_reports_an_unreadable_decision_log_cleanly(tmp_path: Path) -> None:
     log_path = tmp_path / "decisions.jsonl"
     log_path.write_text("not valid json\n")
@@ -486,6 +625,133 @@ def test_main_check_end_to_end_with_a_fake_driver(
     exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 0
+
+
+class _ReducingDriver:
+    """Reports a `current_daily_limit` that reflects its own most recent
+    `throttle()` call, and identical sends/complaints on every read --
+    simulating a real provider account queried by six separate `check`
+    invocations against the SAME mailbox (CLOSE3-1's cron-cascade
+    reproduction). Unlike `FakeDriver`, whose `throttle_calls` list is a
+    pure recorder, this one's `read_mailbox_stats` actually reflects the
+    reduction the way a real provider would."""
+
+    name = "fake"
+
+    def __init__(self, *, initial_limit: int) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.current_limit = initial_limit
+        self.throttle_calls: list[tuple[str, int]] = []
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=20_000,
+                bounces=30,
+                current_daily_limit=self.current_limit,
+            )
+        ]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        self.current_limit = daily_limit
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        return unsupported(Capability.PAUSE, self.name, "fake: not exercised in this test")
+
+
+_LIVE_YAML = """
+provider: fake
+complaint_rate_ladder:
+  warn: 0.0005
+  throttle: 0.0010
+  pause: 0.0020
+prior:
+  alpha: 0.5
+  beta: 500
+dry_run: false
+"""
+
+
+def test_six_separate_check_invocations_throttle_the_mailbox_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE3-1: `from_log` must restore `_throttled_at_limit`, not just
+    status, or every `check` invocation looks like a fresh restart with no
+    memory of the limit it already applied -- six identical evaluations
+    compound 50 -> 25 -> 12 -> 6 -> 3 -> PAUSE instead of throttling once and
+    staying idempotent. Six SEPARATE `cli.main` invocations, each of which
+    rebuilds `BreakerStateStore` via `from_log` internally (see
+    `cli.main`), against a driver whose reported `current_daily_limit`
+    reflects its own prior throttle call -- the shape of the documented cron
+    deployment, not an in-process loop."""
+    driver = _ReducingDriver(initial_limit=50)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _ReducingDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(6):
+        main(["--config", str(config_path), "check"])
+
+    assert driver.throttle_calls == [("a@example.com", 25)]
+    assert driver.current_limit == 25
+
+    state_store = BreakerStateStore.from_log(tmp_path / "decisions.jsonl")
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.THROTTLED
+
+
+def test_from_log_restart_between_tick_one_and_two_is_a_no_op(tmp_path: Path) -> None:
+    """A restart between the very first throttle and the second identical
+    evaluation specifically: tick 2 must be idempotent, not a fresh
+    halving."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver()
+    store1 = BreakerStateStore()
+    result1 = evaluate(
+        driver=driver,
+        mailbox=mailbox,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=store1,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(result1))
+    assert driver.throttle_calls == [("a@example.com", 25)]
+
+    # Restart: rebuild state purely from the log.
+    store2 = BreakerStateStore.from_log(log_path)
+    evaluate(
+        driver=driver,
+        mailbox=mailbox,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=store2,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=50,
+    )
+    assert driver.throttle_calls == [("a@example.com", 25)]
 
 
 # --- run: the always-on two-loop daemon -----------------------------------

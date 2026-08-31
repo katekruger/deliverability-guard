@@ -23,7 +23,8 @@ from deliverability_guard.engine.posterior import (
     pooled_prior,
     update,
 )
-from deliverability_guard.engine.state import DailyReport, DataState, evaluate_stream
+from deliverability_guard.engine.state import DataState
+from deliverability_guard.experimental.state import DailyReport, evaluate_stream
 from fixtures.streams import synthetic_stream
 
 # Gmail's hard ceiling (BUILD-PLAN.md §7). The worked example in §6 is

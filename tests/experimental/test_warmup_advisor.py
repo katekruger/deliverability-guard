@@ -1,14 +1,18 @@
-"""Tests for identity/warmup_advisor.py (BUILD-PLAN.md §4 item #19).
+"""Tests for experimental/warmup_advisor.py (BUILD-PLAN.md §4 item #19).
 
 Warmup curves are folklore (BUILD-PLAN.md §8: no RFC, no M3AAWG document,
 no independent research -- every source with numbers is a warmup vendor
 selling warmup). These tests check the interpolation/tolerance MATH is
 correct, not that the default curve's numbers are "right" -- there is no
-ground truth to check them against, which is the whole point."""
+ground truth to check them against, which is the whole point.
+
+CLOSE3-5: moved from `identity/` to `experimental/` -- implemented and
+tested, but `check_adherence` has no caller anywhere but this file. See the
+module's own docstring."""
 
 import pytest
 
-from deliverability_guard.identity.warmup_advisor import (
+from deliverability_guard.experimental.warmup_advisor import (
     DEFAULT_WARMUP_CURVE,
     AdherenceState,
     check_adherence,

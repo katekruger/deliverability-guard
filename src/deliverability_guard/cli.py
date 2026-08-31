@@ -49,9 +49,12 @@ from deliverability_guard.engine.breaker import (
 from deliverability_guard.loops import controller
 from deliverability_guard.loops.fast import evaluate_all_mailboxes
 from deliverability_guard.loops.slow import ThresholdAdjustment
+from deliverability_guard.providers.apollo import ApolloCampaignDriver, ApolloDriver
 from deliverability_guard.providers.base import MailboxRef, ProviderDriver, ProviderError
 from deliverability_guard.providers.instantly import InstantlyDriver
+from deliverability_guard.providers.lemlist import LemlistCampaignDriver, LemlistDriver
 from deliverability_guard.providers.noop import NoopDriver
+from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
 from deliverability_guard.providers.smartlead import SmartleadCampaignDriver, SmartleadDriver
 
 _DEFAULT_CONFIG_PATH = Path("config/thresholds.yml")
@@ -75,10 +78,15 @@ def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
 
     `smartlead` proves the THROTTLE path (BUILD-PLAN.md §5's capability
     matrix) -- it was fully implemented in `providers/smartlead.py` but
-    unreachable from the CLI until CLOSE-5a registered it here. `noop`
-    requires no credential and reports no mailboxes; it exists so `check`/
-    `run` can be exercised end to end -- config loading, the decision log,
-    exit codes -- without a live provider account (CLOSE-5a).
+    unreachable from the CLI until CLOSE-5a registered it here. `lemlist`,
+    `apollo`, and `ses` follow the same *CampaignDriver/*ConfigurationSetDriver
+    adapter pattern Smartlead established -- each pins the campaign id (or,
+    for SES, the configuration set) their own `read_mailbox_stats` needs but
+    the generic `ProviderDriver` Protocol has no room for -- registered here
+    for the same reason Smartlead was (CLOSE3-4). `noop` requires no
+    credential and reports no mailboxes; it exists so `check`/`run` can be
+    exercised end to end -- config loading, the decision log, exit codes --
+    without a live provider account (CLOSE-5a).
     """
     if provider == "instantly":
         api_key = env.get("INSTANTLY_API_KEY")
@@ -94,6 +102,37 @@ def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
             raise CliError("SMARTLEAD_CAMPAIGN_ID is not set (see .env.example)")
         return SmartleadCampaignDriver(
             inner=SmartleadDriver(api_key=api_key), campaign_id=campaign_id
+        )
+    if provider == "lemlist":
+        api_key = env.get("LEMLIST_API_KEY")
+        if not api_key:
+            raise CliError("LEMLIST_API_KEY is not set (see .env.example)")
+        campaign_id = env.get("LEMLIST_CAMPAIGN_ID")
+        if not campaign_id:
+            raise CliError("LEMLIST_CAMPAIGN_ID is not set (see .env.example)")
+        return LemlistCampaignDriver(inner=LemlistDriver(api_key=api_key), campaign_id=campaign_id)
+    if provider == "apollo":
+        api_key = env.get("APOLLO_API_KEY")
+        if not api_key:
+            raise CliError("APOLLO_API_KEY is not set (see .env.example)")
+        campaign_id = env.get("APOLLO_CAMPAIGN_ID")
+        if not campaign_id:
+            raise CliError("APOLLO_CAMPAIGN_ID is not set (see .env.example)")
+        return ApolloCampaignDriver(inner=ApolloDriver(api_key=api_key), campaign_id=campaign_id)
+    if provider == "ses":
+        configuration_set_name = env.get("SES_CONFIGURATION_SET_NAME")
+        if not configuration_set_name:
+            raise CliError("SES_CONFIGURATION_SET_NAME is not set (see .env.example)")
+        # No API key: SES authenticates via boto3's normal AWS credential
+        # chain (env vars, shared config, instance role, ...), not a
+        # provider-issued key. `AWS_REGION` is read explicitly rather than
+        # relying on boto3's own ambient region resolution, so this
+        # constructs deterministically from the same config source
+        # everything else here reads from.
+        region_name = env.get("AWS_REGION")
+        return SesConfigurationSetDriver(
+            inner=SesDriver(region_name=region_name),
+            configuration_set_name=configuration_set_name,
         )
     if provider == "noop":
         return NoopDriver()
@@ -226,9 +265,15 @@ def cmd_resume(
 ) -> int:
     """The only path out of PAUSED (ADR 0003) -- a typed, explicit human
     action, never something `check` or any other command reaches on its
-    own. Refuses (exit 1, not an error) for a mailbox that isn't currently
-    PAUSED, so a mistyped mailbox id or an already-resumed mailbox doesn't
-    look like success.
+    own. Also the way an operator clears a persisted THROTTLED mailbox
+    (CLOSE3-3): `from_log` now clears THROTTLED on its own once a recovered
+    mailbox's OK verdict actually makes it into the log, but a mailbox that
+    is genuinely stuck THROTTLED -- its own evidence never recovers -- had
+    no path back to ACTIVE at all before this; the refusal message just said
+    what the mailbox wasn't, with nowhere to go from there. Refuses (exit 1,
+    not an error) for a mailbox that is neither PAUSED nor THROTTLED, so a
+    mistyped mailbox id or an already-resumed mailbox doesn't look like
+    success.
 
     Appends a `ResumeRecord` to the decision log so this survives a process
     restart -- see `engine.breaker.BreakerStateStore.from_log`. `resumed_by`
@@ -236,9 +281,10 @@ def cmd_resume(
     0003's whole point is that a human is on the hook for this decision.
     """
     status = state_store.status_of(mailbox)
-    if status is not MailboxBreakerStatus.PAUSED:
+    if status not in (MailboxBreakerStatus.PAUSED, MailboxBreakerStatus.THROTTLED):
         print(
-            f"{mailbox.mailbox_id} is not paused (status: {status.name}); nothing to resume",
+            f"{mailbox.mailbox_id} is not paused or throttled (status: {status.name}); "
+            "nothing to resume",
             file=out,
         )
         return _EXIT_BREACH_OR_REFUSED
@@ -256,10 +302,27 @@ def cmd_resume(
     return _EXIT_OK
 
 
+_EXIT_CODE_EPILOG = """\
+exit codes:
+  0  all clear
+  1  check found a breach (or resume was refused)
+  2  a config/setup error (bad YAML, unknown provider, missing credential)
+  3  a provider transport failure (network error, rate limit exhausted,
+     malformed response)
+"""
+
+
 def build_parser() -> argparse.ArgumentParser:
+    # CLOSE3-6: this project's own commit history claimed exit codes were
+    # documented in "the module docstring, README, and --help's exit code
+    # map" -- but no `epilog` was ever set, so the rendered `--help` text
+    # had no exit-code content at all. This is the one place a cron author
+    # actually looks; module docstring and README were already correct.
     parser = argparse.ArgumentParser(
         prog="deliverability-guard",
         description="A sending circuit breaker for outbound email.",
+        epilog=_EXIT_CODE_EPILOG,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     parser.add_argument(
         "--config",

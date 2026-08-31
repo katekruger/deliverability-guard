@@ -5,7 +5,7 @@ from datetime import date
 import httpx
 import pytest
 
-from deliverability_guard.providers.apollo import ApolloDriver
+from deliverability_guard.providers.apollo import ApolloCampaignDriver, ApolloDriver
 from deliverability_guard.providers.base import (
     ActionOutcome,
     CampaignRef,
@@ -166,3 +166,35 @@ def test_malformed_response_error_never_contains_the_api_key() -> None:
     with pytest.raises(MalformedResponseError) as exc_info:
         _driver(client).read_mailbox_stats(since=date(2026, 7, 1), campaign_id="camp-1")
     assert "super-secret-key" not in str(exc_info.value)
+
+
+# --- ApolloCampaignDriver: the ProviderDriver adapter (CLOSE3-4) -----------
+
+
+def test_campaign_driver_pins_read_mailbox_stats_to_its_campaign_id() -> None:
+    client, _ = recording_client([response(200, "apollo/daily_stats_200.json")], base_url=_BASE_URL)
+    driver = ApolloCampaignDriver(inner=_driver(client), campaign_id="camp-1")
+    stats = driver.read_mailbox_stats(date(2026, 8, 1))
+    assert len(stats) > 0
+
+
+def test_campaign_driver_passes_through_name_and_capabilities() -> None:
+    inner = _driver(recording_client([], base_url=_BASE_URL)[0])
+    driver = ApolloCampaignDriver(inner=inner, campaign_id="camp-1")
+    assert driver.name == inner.name
+    assert driver.capabilities == inner.capabilities
+
+
+def test_campaign_driver_throttle_passes_through() -> None:
+    driver = ApolloCampaignDriver(
+        inner=_driver(recording_client([], base_url=_BASE_URL)[0]), campaign_id="camp-1"
+    )
+    result = driver.throttle("acct-1", 25)
+    assert result.outcome == ActionOutcome.UNSUPPORTED
+
+
+def test_campaign_driver_pause_passes_through() -> None:
+    client, _ = recording_client([httpx.Response(200, json={})], base_url=_BASE_URL)
+    driver = ApolloCampaignDriver(inner=_driver(client), campaign_id="camp-1")
+    result = driver.pause(CampaignRef(provider="apollo", campaign_id="camp-1"))
+    assert result.outcome == ActionOutcome.PERFORMED

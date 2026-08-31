@@ -59,7 +59,7 @@ Every `fast_interval_seconds` (default 300 = 5 minutes) it re-pulls stats and re
 
 Exit codes: `0` all clear, `1` `check` found a breach (or `resume` was refused), `2` a config/setup error (bad YAML, unknown provider, missing credential), `3` a provider transport failure (network error, rate limit exhausted, malformed response) — distinct from `1` so a cron wrapper can tell "the fleet is healthy" apart from "we couldn't even ask the provider."
 
-Selectable providers: `instantly` (needs `INSTANTLY_API_KEY`), `smartlead` (needs `SMARTLEAD_API_KEY` and `SMARTLEAD_CAMPAIGN_ID` — its stats endpoint is per-campaign, not global), and `noop`, which needs no credentials at all and reports no mailboxes — set `provider: noop` in `config/thresholds.yml` to exercise `check`/`run` end to end (config loading, the decision log, exit codes) without a live account.
+Selectable providers: `instantly` (needs `INSTANTLY_API_KEY`), `smartlead` (needs `SMARTLEAD_API_KEY` and `SMARTLEAD_CAMPAIGN_ID` — its stats endpoint is per-campaign, not global), `lemlist` (needs `LEMLIST_API_KEY` and `LEMLIST_CAMPAIGN_ID`, also per-campaign), `apollo` (needs `APOLLO_API_KEY` and `APOLLO_CAMPAIGN_ID`, also per-campaign), `ses` (needs `SES_CONFIGURATION_SET_NAME`; authenticates via boto3's normal AWS credential chain rather than a provider API key — `AWS_REGION` is read explicitly rather than relying on ambient AWS config), and `noop`, which needs no credentials at all and reports a small synthetic fixture — set `provider: noop` in `config/thresholds.yml` to exercise `check`/`run` end to end (config loading, aggregation, evaluation, the decision log, exit codes) without a live account.
 
 ```bash
 uv run deliverability-guard status sender@yourdomain.com
@@ -104,12 +104,12 @@ Capability declaration is the whole design of the provider driver interface (`pr
 |---|---|:--:|:--:|:--:|:--:|
 | **Instantly** | ✅ Implemented (reference driver) | per-mailbox daily | ✅ mailbox or campaign | ❌ no primitive | yes |
 | **Smartlead** | ✅ Implemented and CLI-selectable (proves the throttle path) | per-campaign | campaign only, not per-mailbox | ✅ per-mailbox daily limit | yes |
-| **Lemlist** | ✅ Implemented | activities export, aggregated per mailbox/day | ✅ campaign only, idempotent server-side | ❌ no primitive | unverified (capability not claimed) |
-| **Apollo** | ✅ Implemented | per-campaign daily stats | ✅ campaign (`/abort`, resume semantics unverified) | ❌ no primitive | polling only (capability not claimed) |
+| **Lemlist** | ✅ Implemented and CLI-selectable | activities export, aggregated per mailbox/day | ✅ campaign only, idempotent server-side | ❌ no primitive | unverified (capability not claimed) |
+| **Apollo** | ✅ Implemented and CLI-selectable | per-campaign daily stats | ✅ campaign (`/abort`, resume semantics unverified) | ❌ no primitive | polling only (capability not claimed) |
 | Outreach | Researched, not yet implemented | yes | likely (unverified) | likely (unverified) | best-in-class |
 | Salesloft | Researched, not yet implemented | yes | **likely UI-only** — no API | ❌ | unverified |
 | Amplemarket | Researched, not yet implemented | ❌ | **no status-change API at all** — app-only | ❌ | ❌ |
-| **Amazon SES** | ✅ Implemented (read + pause; see [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)) | CloudWatch `Send`/`Bounce` metrics | ✅ configuration set or whole account | ❌ no daily-volume primitive | not implemented (SNS ingestion is separate infra) |
+| **Amazon SES** | ✅ Implemented and CLI-selectable (read + pause; see [ADR 0005](docs/decisions/0005-boto3-dependency-for-ses.md)) | CloudWatch `Send`/`Bounce` metrics | ✅ configuration set or whole account | ❌ no daily-volume primitive | not implemented (SNS ingestion is separate infra) |
 | Postmark | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 | SendGrid | Researched, not yet implemented | yes | ❌ no pause primitive | ❌ | yes |
 
@@ -148,7 +148,7 @@ Sourced against:
 - **Inbox placement.** This tool has no visibility into whether a delivered message actually landed in the primary inbox versus a spam or promotions folder — it can see bounces, complaints, and compliance verdicts, not placement.
 - **Postmaster's own confidence bounds — removed in v2.** Google's v1 Postmaster API exposed `userReportedSpamRatioLowerBound`/`UpperBound` alongside the point estimate. v2 dropped them entirely (confirmed against the live discovery document, [docs/postmaster-verdicts.md](docs/postmaster-verdicts.md)) — a real regression this project doesn't have a way to work around, only to be honest about: every Postmaster-sourced rate is treated as a bare point estimate, run through the same posterior machinery as any other rate.
 - **Which campaign caused a spike, without the identity scheme adopted first.** Postmaster reports a domain-day scalar; the sequencer reports per-message events; there is no join key between them by default. `identity/feedback_id.py` and `identity/subdomain_advisor.py` fix this — but only for mail sent *after* they're adopted, and only if the underlying sending architecture actually follows the scheme. See [`docs/limits.md`](docs/limits.md).
-- **Warmup adherence.** Not implemented in v0.1. When it lands, it will ship as explicitly-labeled vendor-consensus heuristics, not a standard — there is no RFC or independent research behind published warmup curves, and presenting folklore as authoritative would be this project's fastest way to lose credibility.
+- **Warmup adherence.** Not implemented in v0.1's shipped surface — a heuristic comparison against a folklore ramp curve exists at [`experimental/warmup_advisor.py`](src/deliverability_guard/experimental/warmup_advisor.py), quarantined there because nothing calls it yet, not because the logic is unfinished. When it ships for real, it will ship as explicitly-labeled vendor-consensus heuristics, not a standard — there is no RFC or independent research behind published warmup curves, and presenting folklore as authoritative would be this project's fastest way to lose credibility.
 
 ## License
 

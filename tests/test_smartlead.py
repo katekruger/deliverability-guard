@@ -36,6 +36,34 @@ def test_read_mailbox_stats_parses_a_normal_response_and_filters_by_since() -> N
     assert "sender3@example.com" not in by_email
 
 
+def test_read_mailbox_stats_populates_current_daily_limit_when_reported() -> None:
+    """CLOSE3-2: `smartlead` is the one CLI-selectable driver declaring
+    `Capability.THROTTLE`, but before this it never populated
+    `current_daily_limit` -- so the THROTTLE rung was reachable in theory
+    and unreachable against every real driver a user could actually select.
+    Smartlead's own `POST /email-accounts/{id}` throttle body uses
+    `message_per_day`; the statistics row this reads it back from."""
+    client, _ = recording_client(
+        [response(200, "smartlead/campaign_statistics_200.json")],
+        base_url="https://server.smartlead.ai/api/v1",
+    )
+    stats = _driver(client).read_mailbox_stats(since=date(2026, 8, 1), campaign_id="camp-1")
+    by_email = {s.mailbox.mailbox_id: s for s in stats}
+    assert by_email["sender1@example.com"].current_daily_limit == 100
+
+
+def test_read_mailbox_stats_current_daily_limit_is_none_when_not_reported() -> None:
+    """A row that doesn't report a daily limit stays `None`, never coerced
+    to a guess (AGENTS.md)."""
+    client, _ = recording_client(
+        [response(200, "smartlead/campaign_statistics_200.json")],
+        base_url="https://server.smartlead.ai/api/v1",
+    )
+    stats = _driver(client).read_mailbox_stats(since=date(2026, 8, 1), campaign_id="camp-1")
+    by_email = {s.mailbox.mailbox_id: s for s in stats}
+    assert by_email["sender2@example.com"].current_daily_limit is None
+
+
 def test_read_mailbox_stats_flags_a_disconnected_mailbox() -> None:
     client, _ = recording_client(
         [response(200, "smartlead/campaign_statistics_200.json")],

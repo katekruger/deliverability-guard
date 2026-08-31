@@ -9,6 +9,18 @@ The daily-limit endpoint is the most underrated one in this whole space: it
 is the difference between a circuit breaker and a kill switch (BUILD-PLAN.md
 §5). `capabilities` therefore includes THROTTLE.
 
+CLOSE3-2: `read_mailbox_stats` reads a row's own current limit back from
+`message_per_day`, the same field name `throttle()`'s request body writes
+to -- the statistics endpoint's exact field name for this is unverified
+against a live account (same provenance caveat as everywhere else in this
+module), but reusing the write-side field name is the least-guessed choice
+available. Without this, `current_daily_limit` was never populated by any
+shipped driver, so the THROTTLE rung -- reachable in `engine.breaker.evaluate`
+-- was unreachable against every real, CLI-selectable provider: every
+THROTTLE verdict read `action_outcome: UNSUPPORTED` regardless of what a
+user configured. A row with no `message_per_day` still leaves
+`current_daily_limit` as `None`, never coerced to a guess.
+
 `capabilities` deliberately EXCLUDES PAUSE, even though Smartlead's
 campaign-status endpoint can technically pause a whole campaign. This
 project's `pause()` contract is per-mailbox (BUILD-PLAN.md §2: "the
@@ -51,6 +63,7 @@ import httpx
 
 from deliverability_guard.providers._parsing import (
     normalize_to_utc_date,
+    optional_int,
     require_dict,
     require_int,
     require_list,
@@ -243,4 +256,5 @@ def _parse_statistics_row(raw_row: object) -> MailboxDayStats:
         bounces=bounces,
         status=status,
         source_day=raw_date,
+        current_daily_limit=optional_int(row, "message_per_day", _PROVIDER),
     )

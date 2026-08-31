@@ -62,6 +62,13 @@ class DecisionRecord:
     action_outcome: ActionOutcome | None
     action_detail: str | None
     action_capability: Capability | None
+    applied_daily_limit: int | None = None
+    """Persists `BreakerEvaluation.applied_daily_limit` (CLOSE3-1): the
+    `current_daily_limit` input a PERFORMED throttle is currently locked to.
+    `BreakerStateStore.from_log` restores `_throttled_at_limit` from this,
+    which is what keeps a process that restarts between every evaluation
+    (e.g. `check` run from cron) idempotent from its very next re-evaluation
+    instead of re-halving on every single restart."""
 
     @classmethod
     def from_evaluation(cls, evaluation: BreakerEvaluation) -> "DecisionRecord":
@@ -101,6 +108,7 @@ class DecisionRecord:
             action_outcome=action_outcome,
             action_detail=action.detail if action is not None else None,
             action_capability=action.capability if action is not None else None,
+            applied_daily_limit=evaluation.applied_daily_limit,
         )
 
     def to_dict(self) -> dict[str, object]:
@@ -128,6 +136,7 @@ class DecisionRecord:
             "action_capability": (
                 self.action_capability.name if self.action_capability is not None else None
             ),
+            "applied_daily_limit": self.applied_daily_limit,
         }
 
     @classmethod
@@ -154,6 +163,7 @@ class DecisionRecord:
                 action_outcome=_optional_enum(data, "action_outcome", ActionOutcome),
                 action_detail=_optional(data, "action_detail", str),
                 action_capability=_optional_enum(data, "action_capability", Capability),
+                applied_daily_limit=_optional(data, "applied_daily_limit", int),
             )
         except (KeyError, ValueError, TypeError) as exc:
             raise CorruptDecisionRecordError(f"could not parse decision record: {exc}") from exc

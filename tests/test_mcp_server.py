@@ -13,6 +13,7 @@ import pytest
 from mcp.server.mcpserver import MCPServer
 from mcp.types import CallToolResult
 
+import deliverability_guard.mcp_server as mcp_server_module
 from deliverability_guard.audit.log import DecisionRecord, append_record
 from deliverability_guard.engine.breaker import DEFAULT_LADDER, BreakerStateStore, evaluate
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
@@ -21,6 +22,7 @@ from deliverability_guard.mcp_server import (
     get_mailbox_status,
     get_thresholds,
     list_recent_decisions,
+    main,
 )
 from deliverability_guard.providers.base import MailboxRef
 from fixtures.fake_driver import FakeDriver
@@ -220,3 +222,53 @@ def test_build_server_thresholds_tool_calls_through_correctly(tmp_path: Path) ->
         "throttle": 0.0010,
         "pause": 0.0020,
     }
+
+
+# --- main(): the deliverability-guard-mcp console script (CLOSE3-5) -------
+
+
+def test_main_builds_a_server_from_the_given_config_and_runs_it(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE3-5: before this, `build_server` was real and tested but had no
+    caller outside its own test file -- no `main`, no console script.
+    `main` must build from the CLI-supplied `--config` path and run the
+    resulting server over stdio (never actually invoked here -- this
+    monkeypatches `run` to a no-op so the test can't block)."""
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    built_with: list[Path] = []
+    ran: list[bool] = []
+
+    class _FakeServer:
+        def run(self) -> None:
+            ran.append(True)
+
+    def _fake_build_server(config_path_arg: Path) -> _FakeServer:
+        built_with.append(config_path_arg)
+        return _FakeServer()
+
+    monkeypatch.setattr(mcp_server_module, "build_server", _fake_build_server)
+
+    exit_code = main(["--config", str(config_path)])
+
+    assert exit_code == 0
+    assert built_with == [config_path]
+    assert ran == [True]
+
+
+def test_main_defaults_to_the_standard_config_path(monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[Path] = []
+
+    class _FakeServer:
+        def run(self) -> None:
+            pass
+
+    def _fake_build_server(config_path_arg: Path) -> _FakeServer:
+        seen.append(config_path_arg)
+        return _FakeServer()
+
+    monkeypatch.setattr(mcp_server_module, "build_server", _fake_build_server)
+
+    main([])
+
+    assert seen == [Path("config/thresholds.yml")]

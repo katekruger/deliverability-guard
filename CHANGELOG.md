@@ -157,6 +157,115 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`/`README.md`: two small documentation corrections** (external
+  audit finding CLOSE3-6). `build_parser()` set no `epilog`, so `--help`'s
+  rendered text had no exit-code content at all, despite a commit message
+  claiming exit codes were documented in "the module docstring, README, and
+  `--help`'s exit code map" — the module docstring and README were correct;
+  `--help` wasn't. Added an `epilog` with the exit code map, the one place a
+  cron author actually looks. README line 151 said warmup adherence was
+  "Not implemented in v0.1" without qualification; `identity/
+  warmup_advisor.py` (now `experimental/warmup_advisor.py` — CLOSE3-5) ships
+  a complete, tested implementation with no caller. The line now says what's
+  actually true: not implemented in the shipped surface, but a real
+  heuristic exists, quarantined because nothing calls it yet.
+
+- **Three functions with zero production callers, ten unimported modules,
+  and an unwired Postmaster hard gate** (external audit finding CLOSE3-5 --
+  the fourth round of the same finding on `loops.fast.evaluate_signal`,
+  `engine.state.evaluate_stream`, and `identity.warmup_advisor.
+  check_adherence`). `evaluate_signal`/`FastLoopSignal` moved to the new
+  `experimental.webhook_signal` (nothing in this codebase accepts an
+  inbound webhook yet). `evaluate_stream`/`DailyReport`/`classify`/
+  `StateEvaluation` moved to the new `experimental.state` (their only
+  production caller, `experimental.postmaster_coverage`, is itself
+  experimental — a production function whose sole consumer is
+  non-production belonged on one side or the other; `DataState` alone
+  stays in `engine/state.py` on the strength of `engine.breaker`/
+  `audit.log`'s real usage). `identity.warmup_advisor` moved to
+  `experimental.warmup_advisor` wholesale. `mcp_server.py` gained a real
+  `main()` and a `deliverability-guard-mcp` console script entry — it
+  previously had no caller anywhere outside its own test file. Most
+  importantly: `loops.fast.evaluate_all_mailboxes` gained
+  `compliance_gate_tripped_for`, so `signals.postmaster.forces_hard_gate`'s
+  verdict can now actually reach the shared `check`/`run` chokepoint
+  instead of only `engine.breaker.evaluate` called directly — the gate
+  itself remains unconnected to any live Postmaster OAuth/domain source
+  (real, separately-scoped setup), documented as such rather than silently
+  left as a hidden gap. A new `tests/test_reachability.py` runs a real
+  `check` in a fresh subprocess and asserts every module outside
+  `experimental/` is either imported by it or explicitly named with a
+  reason (a separately-wired entry point, a directly-callable library
+  utility per README's own "full public surface" description, or the
+  documented-unwired Postmaster gate) — so a fifth round of this same
+  finding fails a test instead of needing another audit to notice.
+
+- **`cli.py`/`providers/{lemlist,apollo,ses}.py`: three implemented drivers
+  weren't CLI-selectable, and the README contradicted itself about it**
+  (external audit finding CLOSE3-4). `LemlistDriver`/`ApolloDriver`/
+  `SesDriver` each pin `read_mailbox_stats` to a required `campaign_id` (or,
+  for SES, `configuration_set_name`) keyword the generic `ProviderDriver`
+  Protocol has no room for, so `build_driver("lemlist"|"apollo"|"ses")`
+  raised `unknown provider` — while README rows for all three said
+  "Implemented" under a "Status in this repo" heading that reads as
+  availability. New `LemlistCampaignDriver`/`ApolloCampaignDriver`/
+  `SesConfigurationSetDriver` adapters apply the same pinning pattern
+  `SmartleadCampaignDriver` already established, registered in
+  `build_driver` behind `LEMLIST_API_KEY`/`LEMLIST_CAMPAIGN_ID`,
+  `APOLLO_API_KEY`/`APOLLO_CAMPAIGN_ID`, and
+  `SES_CONFIGURATION_SET_NAME`/`AWS_REGION` respectively (`SesDriver` gained
+  an explicit `region_name` parameter so `build_driver` can construct it
+  deterministically instead of depending on ambient AWS config). A new
+  `tests/test_provider_conformance.py` asserts every CLI-selectable driver
+  satisfies `ProviderDriver`, so pyright catches the next divergence.
+  `noop` now reports a small synthetic two-mailbox fixture instead of an
+  empty list, so `check`/`run` genuinely exercise aggregation, evaluation
+  (including hierarchical pooling), and decision-log writing — README line
+  62's claim that it did was previously false; no log file was even created.
+
+- **`providers/smartlead.py`/`engine/breaker.py`: the THROTTLE rung was
+  unreachable against every real, CLI-selectable provider** (external audit
+  finding CLOSE3-2). `current_daily_limit` plumbing was correct end to end,
+  but zero of five shipped drivers ever populated
+  `MailboxDayStats.current_daily_limit` — including `smartlead`, the one
+  driver declaring `Capability.THROTTLE`, so every real THROTTLE verdict
+  read `action_outcome: UNSUPPORTED` regardless of configuration.
+  `SmartleadCampaignDriver`'s statistics parsing now reads a row's own
+  current limit back from `message_per_day`, the same field its `throttle()`
+  request body writes to. Separately, a THROTTLE verdict a provider
+  genuinely cannot execute (unknown limit, or no throttle primitive at all)
+  no longer writes an identical UNSUPPORTED record forever: after
+  `_MAX_UNSUPPORTED_THROTTLE_STREAK` (3) consecutive unexecutable throttles
+  for one mailbox, the verdict escalates to PAUSE through the human-review
+  gate (ADR 0003). The streak persists across restarts the same way
+  CLOSE3-1's applied-limit memory does.
+
+- **`engine/breaker.py`/`cli.py`: nothing could clear a persisted THROTTLED
+  mailbox** (external audit finding CLOSE3-3). `from_log` left OK and WARN
+  verdicts alone entirely, so a mailbox that recovered (THROTTLE, then
+  sustained OK evaluations) but happened to restart mid-recovery read
+  THROTTLED forever, and `resume` refused it outright ("is not paused;
+  nothing to resume") with nowhere to go from there. `from_log` now honours
+  an OK verdict recorded after a THROTTLE as a recovery, mirroring
+  `evaluate()`'s own sustained-recovery check, clearing both status and the
+  remembered applied limit together. `resume` now also accepts a THROTTLED
+  mailbox (not just PAUSED), for the case where the mailbox's own evidence
+  never recovers on its own and a human needs an explicit way back to
+  ACTIVE.
+
+- **`engine/breaker.py`/`audit/log.py`: `from_log` forgot the daily limit it
+  had just applied, so a process that restarts between every evaluation
+  (e.g. `check` run from cron) re-halved on every single invocation instead
+  of staying idempotent** (external audit finding CLOSE3-1 — "the cron
+  cascade"). Six identical `check` invocations against one mailbox used to
+  compound `50 -> 25 -> 12 -> 6 -> 3 -> PAUSE`; in-process they correctly
+  stayed at one throttle call, because `BreakerStateStore._throttled_at_limit`
+  survived within a single process but was never persisted. `DecisionRecord`
+  now carries `applied_daily_limit` for a PERFORMED throttle, and
+  `BreakerStateStore.from_log` restores `_throttled_at_limit` from it
+  alongside status — six separate `check` invocations now produce exactly
+  one provider throttle call and a final limit of 25.
+
 - **`cli.py`: only Instantly was selectable, and a transport failure
   tracebacked with the same exit code as "ran fine, found a breach"**
   (external audit finding CLOSE-5). `build_driver` now also registers

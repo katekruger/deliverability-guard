@@ -7,16 +7,8 @@ than waiting on a lagging signal (BUILD-PLAN.md §5). For a 50/day mailbox
 that lag is 150 messages already gone by the time a lagging signal would
 have fired; for a 40-mailbox farm, 6,000.
 
-This module's job is narrow and deliberately so: decide whether a signal is
-a fresh event worth evaluating at all (via the same `WebhookLedger` used by
-provider drivers, so a redelivered webhook doesn't trigger a second
-evaluation), then hand off to `engine.breaker.evaluate` for the actual
-decision. It does not own send/complaint accounting -- the caller supplies
-the mailbox's current cumulative counts, e.g. from a running tally kept
-elsewhere as webhooks arrive.
-
-`evaluate_all_mailboxes` is the OTHER, pull-based entry point, and the one
-that matters most: it is the shared chokepoint `cli.cmd_check` and
+`evaluate_all_mailboxes` below is the pull-based entry point this module
+actually ships: it is the shared chokepoint `cli.cmd_check` and
 `loops.controller.run`'s fast tick both call, so it is the single place
 where a mailbox's peer group (for hierarchical pooling), current daily
 limit (for THROTTLE), and CUSUM trend state must all be assembled and
@@ -26,6 +18,24 @@ actually exercise `engine.posterior.pooled_posterior` or
 `evaluate_all_mailboxes` called `evaluate()` with neither `peer_group` nor
 `current_daily_limit`, so a real `check`/`run` never pooled and never
 throttled).
+
+CLOSE3-5: this module used to also define `FastLoopSignal`/`evaluate_signal`
+-- per-webhook-event evaluation for a fast loop that reacts to pushed
+webhooks. They moved to `experimental.webhook_signal`: nothing in this
+codebase accepts an inbound webhook at all yet (see `loops.controller`'s
+module docstring), so `evaluate_signal` had zero production callers. See
+that module's docstring for the full reasoning and what would bring it back.
+
+`evaluate_all_mailboxes` also gained `compliance_gate_tripped_for`
+(CLOSE3-5): `signals.postmaster.forces_hard_gate` could only ever force a
+PAUSE through `engine.breaker.evaluate` called directly, never through this
+shared chokepoint. THE GATE ITSELF REMAINS UNWIRED TO ANY LIVE DATA SOURCE:
+neither `cli.cmd_check` nor `loops.controller.run` constructs a
+`PostmasterClient` or passes anything here yet -- that needs a live OAuth
+token and a configured domain, real setup this PR does not add (AGENTS.md:
+no new features beyond what closes the finding). What changed is that the
+chokepoint can now honor a compliance signal if a caller has one, instead
+of silently having nowhere to put it.
 """
 
 from collections.abc import Callable, Iterable, MutableMapping, Sequence
@@ -49,63 +59,7 @@ from deliverability_guard.providers.base import (
     MailboxRef,
     MailboxStatus,
     ProviderDriver,
-    WebhookEvent,
-    WebhookLedger,
 )
-
-
-@dataclass(frozen=True, slots=True)
-class FastLoopSignal:
-    """A leading indicator that something may be wrong right now."""
-
-    mailbox: MailboxRef
-    event: WebhookEvent
-
-
-def evaluate_signal(
-    signal: FastLoopSignal,
-    *,
-    driver: ProviderDriver,
-    ledger: WebhookLedger,
-    cumulative_sends: int,
-    cumulative_complaints: int,
-    prior: BetaDistribution,
-    thresholds: ThresholdLadder,
-    state_store: BreakerStateStore,
-    dry_run: bool,
-    now: datetime,
-    current_daily_limit: int | None = None,
-) -> BreakerEvaluation | None:
-    """Returns `None` if `signal.event` is a redelivery already processed
-    via `ledger` -- there is nothing new to evaluate. Otherwise runs a full
-    breaker evaluation using the caller-supplied cumulative counts.
-
-    `dry_run` has no default here either, for the same reason as
-    `engine.breaker.evaluate`: every call site decides explicitly.
-
-    There used to be a companion `evaluate_signal_with_trend` that ran
-    `engine.changepoint.cusum_step` alongside this. It had zero production
-    callers (CLOSE-1) -- nothing in this codebase yet accepts an inbound
-    webhook at all (see `loops.controller`'s module docstring), so nothing
-    called this function either, let alone the trend variant. It was
-    deleted rather than wired up: CUSUM's per-period evidence model fits
-    `evaluate_all_mailboxes`'s pull-based tick, below, far more naturally
-    than a per-webhook-event signal, and that's where it's wired now.
-    """
-    if not ledger.accept(signal.event):
-        return None
-    return evaluate(
-        driver=driver,
-        mailbox=signal.mailbox,
-        sends=cumulative_sends,
-        complaints=cumulative_complaints,
-        prior=prior,
-        thresholds=thresholds,
-        state_store=state_store,
-        dry_run=dry_run,
-        now=now,
-        current_daily_limit=current_daily_limit,
-    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -217,6 +171,7 @@ def evaluate_all_mailboxes(
     cusum_slack: float = DEFAULT_CUSUM_SLACK,
     cusum_threshold: float = DEFAULT_CUSUM_THRESHOLD,
     on_cusum_alarm: Callable[[MailboxRef, CusumResult], None] | None = None,
+    compliance_gate_tripped_for: Callable[[MailboxRef], bool] | None = None,
 ) -> list[BreakerEvaluation]:
     """Pull every mailbox's stats since `since`, aggregate, and evaluate
     each one through the breaker -- building each mailbox's same-domain peer
@@ -241,6 +196,21 @@ def evaluate_all_mailboxes(
     CUSUM statistic alarms this tick; it does not itself take an action --
     that's a policy decision left to the caller, matching how a WARN verdict
     from the breaker's own ladder is notify-only too.
+
+    `compliance_gate_tripped_for`, when given, is called once per mailbox to
+    produce `engine.breaker.evaluate`'s `compliance_gate_tripped` argument
+    (CLOSE3-5): before this parameter existed, `signals.postmaster.
+    forces_hard_gate`'s verdict could force a PAUSE only through
+    `engine.breaker.evaluate` called directly -- never through this shared
+    chokepoint, so a real `check`/`run` could never actually honor Google's
+    own compliance verdict regardless of what a caller had available. `None`
+    (the default) reproduces the no-gate behavior every caller had before
+    this parameter existed. Neither `cli.cmd_check` nor `loops.controller.
+    run` passes anything here yet -- doing so needs a live Postmaster OAuth
+    token and domain configured somewhere, which is real, separately-scoped
+    setup (see `experimental.postmaster_coverage`'s own docstring for the
+    same caveat about Postmaster ingestion generally). This closes the
+    WIRING gap the chokepoint had; it is not, on its own, a live integration.
     """
     totals = aggregate_mailbox_stats(driver.read_mailbox_stats(since))
     peer_groups = _peer_groups(totals)
@@ -260,6 +230,11 @@ def evaluate_all_mailboxes(
                 current_daily_limit=total.current_daily_limit,
                 peer_group=peer_groups[total.mailbox],
                 max_pooled_ess=max_pooled_ess,
+                compliance_gate_tripped=(
+                    compliance_gate_tripped_for(total.mailbox)
+                    if compliance_gate_tripped_for is not None
+                    else False
+                ),
             )
         )
         if cusum_states is not None:
