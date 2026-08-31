@@ -7,6 +7,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`loops/controller.py`, `deliverability-guard run`: the always-on
+  two-loop daemon.** `run` executes `check`'s evaluation on a loop until
+  stopped (`fast_interval_seconds`, default 300) and, on a much longer
+  cadence (`slow_interval_seconds`, default 86400), tunes the shared
+  threshold ladder from its own rolling window of recent posterior lower
+  bounds via the existing (unmodified) `loops.slow.tune_thresholds`. The
+  fast tick and `check` share one evaluation path
+  (`loops.fast.evaluate_all_mailboxes`), so the one-shot and continuous
+  forms can't drift apart. This is a polling fast loop, not a webhook
+  receiver, and the slow loop's evidence is self-sourced rather than a
+  live Postmaster feed -- see ADR 0004 for exactly what that does and
+  doesn't implement of BUILD-PLAN.md §5's original architecture, and why.
+  New config keys `fast_interval_seconds`/`slow_interval_seconds` (both
+  optional, with the defaults above).
+- **`cli.py`, `config.py`: a real running system** (audit finding ENG-6).
+  `deliverability-guard check` is the single-shot form of the fast loop —
+  the minimum viable thing a user can put in cron: it loads
+  `config/thresholds.yml` (which no code previously read, despite `pyyaml`
+  being a declared runtime dependency and the README's quickstart telling
+  users to `cp` it into place), pulls each mailbox's stats from the
+  configured provider, evaluates every mailbox through
+  `engine.breaker.evaluate`, appends a decision record per mailbox, and
+  exits non-zero if any mailbox's verdict isn't OK. `status <mailbox>`
+  prints current breaker state; `resume <mailbox>` is the only way a
+  paused mailbox becomes active again (ADR 0003). Provider credentials are
+  read from the environment, never the YAML config. `[project.scripts]`
+  now registers a real `deliverability-guard` entry point. The full
+  always-running two-loop daemon controller (BUILD-PLAN.md §5) is still
+  future work; `check` is its cron-friendly single-shot equivalent.
+
 ### Fixed
 
 - **`cli.py`: only Instantly was selectable, and a transport failure
@@ -106,40 +138,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now also raises `BreakerStateStoreLoadError` instead of being read as "no
   history yet." See the ADR 0003 addendum.
 
-### Added
-
-- **`loops/controller.py`, `deliverability-guard run`: the always-on
-  two-loop daemon.** `run` executes `check`'s evaluation on a loop until
-  stopped (`fast_interval_seconds`, default 300) and, on a much longer
-  cadence (`slow_interval_seconds`, default 86400), tunes the shared
-  threshold ladder from its own rolling window of recent posterior lower
-  bounds via the existing (unmodified) `loops.slow.tune_thresholds`. The
-  fast tick and `check` share one evaluation path
-  (`loops.fast.evaluate_all_mailboxes`), so the one-shot and continuous
-  forms can't drift apart. This is a polling fast loop, not a webhook
-  receiver, and the slow loop's evidence is self-sourced rather than a
-  live Postmaster feed -- see ADR 0004 for exactly what that does and
-  doesn't implement of BUILD-PLAN.md §5's original architecture, and why.
-  New config keys `fast_interval_seconds`/`slow_interval_seconds` (both
-  optional, with the defaults above).
-- **`cli.py`, `config.py`: a real running system** (audit finding ENG-6).
-  `deliverability-guard check` is the single-shot form of the fast loop —
-  the minimum viable thing a user can put in cron: it loads
-  `config/thresholds.yml` (which no code previously read, despite `pyyaml`
-  being a declared runtime dependency and the README's quickstart telling
-  users to `cp` it into place), pulls each mailbox's stats from the
-  configured provider, evaluates every mailbox through
-  `engine.breaker.evaluate`, appends a decision record per mailbox, and
-  exits non-zero if any mailbox's verdict isn't OK. `status <mailbox>`
-  prints current breaker state; `resume <mailbox>` is the only way a
-  paused mailbox becomes active again (ADR 0003). Provider credentials are
-  read from the environment, never the YAML config. `[project.scripts]`
-  now registers a real `deliverability-guard` entry point. The full
-  always-running two-loop daemon controller (BUILD-PLAN.md §5) is still
-  future work; `check` is its cron-friendly single-shot equivalent.
-
-### Fixed
-
 - **`engine/breaker.py`: THROTTLE was not idempotent and could reach a
   de-facto pause without ever passing through the human-review gate**
   (audit finding ENG-5a). Six identical THROTTLE evaluations halved a
@@ -169,10 +167,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `pooled_prior`/`pooled_posterior` and `engine.state.evaluate_stream` had
   zero production callers; `engine.changepoint.cusum_step` likewise.
   `engine.breaker.evaluate` now accepts an optional `peer_group` to use the
-  (capped) pooled posterior; `loops.fast.evaluate_signal_with_trend` wires
-  CUSUM sequential change detection alongside the breaker's own evaluation;
-  `signals.postmaster.coverage_over_range` now imports `evaluate_stream`
-  instead of reimplementing its transition logic.
+  (capped) pooled posterior, and `signals.postmaster.coverage_over_range`
+  now imports `evaluate_stream` instead of reimplementing its transition
+  logic. (A follow-up audit, CLOSE-1, found neither `peer_group` nor
+  `cusum_step` actually had a caller in `check`/`run` yet at this point --
+  see the CLOSE-1 entry above for the wiring that closed that gap, which
+  superseded and removed the `evaluate_signal_with_trend` function this
+  entry originally described.)
 
 ### Changed
 
