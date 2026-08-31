@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`loops/fast.py`: `pooled_posterior` and `cusum_step` had callers that
+  nothing itself called in production** (external audit finding CLOSE-1).
+  `evaluate_all_mailboxes` -- the shared chokepoint `cli.cmd_check` and
+  `loops.controller.run`'s fast tick both use -- called `engine.breaker.evaluate`
+  with neither `peer_group` nor a CUSUM state, so a real `check`/`run` never
+  pooled and never ran the trend check, even though both mechanisms were
+  themselves correct. `evaluate_all_mailboxes` now builds each mailbox's
+  same-domain peer group (leave-one-out) and threads it through, and
+  accepts an optional `cusum_states` mapping so `cusum_step` runs alongside
+  the breaker's own posterior ladder every tick when a caller opts in
+  (`loops.controller.run` now does, persisting state for the daemon's
+  lifetime). `max_pooled_ess` is now a configurable value
+  (`config/thresholds.yml`'s `max_pooled_ess`). The zero-caller
+  `evaluate_signal_with_trend` was deleted rather than adopted for this --
+  CUSUM's per-period model fits this pull-based tick, not a per-webhook
+  signal nothing in this codebase receives yet. `signals.postmaster.
+  coverage_over_range`, the third function named in the same finding, moved
+  to `experimental.postmaster_coverage`: there is no Postmaster ingestion
+  pipeline anywhere in this codebase to wire it into yet, unlike
+  `get_compliance_status`/`forces_hard_gate`, which already feed a real
+  integration point. See the ADR 0002 addendum.
+- **`loops/fast.py`, `engine/breaker.py`: THROTTLE never reached the
+  provider on the real `check`/`run` path at all** (CLOSE-3a, the same
+  wiring gap as above). `evaluate_all_mailboxes` never passed
+  `current_daily_limit`, so every THROTTLE-worthy evaluation reported
+  itself `UNSUPPORTED` instead of actually reducing a mailbox's daily
+  limit. `providers.base.MailboxDayStats` gained an optional
+  `current_daily_limit` field; `loops.fast.aggregate_mailbox_stats` takes
+  each mailbox's most recently reported value and `evaluate_all_mailboxes`
+  passes it through.
+
 - **`engine/breaker.py`: the THROTTLE rung latched, reopened, and never
   auto-recovered** (external audit finding CLOSE-3, points 3b-3d; 3a is the
   same wiring fix as the `evaluate_all_mailboxes` commit below). Three

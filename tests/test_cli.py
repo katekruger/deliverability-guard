@@ -561,3 +561,97 @@ def test_main_check_dry_run_pause_does_not_survive_a_restart(
 
     restored = BreakerStateStore.from_log(log_path)
     assert restored.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+
+
+# --- CLOSE-1: pooled_posterior and cusum_step actually execute during a real
+# `check`/`run`, proven by instrumentation, not by a unit test that calls
+# them directly. (An external audit drove a real cmd_check and a five-tick
+# cmd_run and found NEITHER function executed at all -- each had a caller,
+# but nothing called that caller in production.)
+
+
+def test_close1_check_actually_executes_pooled_posterior_and_cusum_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """This test fails against the pre-CLOSE-1 `evaluate_all_mailboxes`,
+    which called `engine.breaker.evaluate` with neither `peer_group` nor a
+    CUSUM state to hand to `cusum_step`."""
+    import deliverability_guard.engine.breaker as breaker_module
+    import deliverability_guard.loops.fast as fast_module
+
+    pooled_posterior_calls: list[object] = []
+    real_pooled_posterior = breaker_module.pooled_posterior
+
+    def _spy_pooled_posterior(*args: object, **kwargs: object) -> object:
+        pooled_posterior_calls.append((args, kwargs))
+        return real_pooled_posterior(*args, **kwargs)  # type: ignore[arg-type]
+
+    cusum_step_calls: list[object] = []
+    real_cusum_step = fast_module.cusum_step
+
+    def _spy_cusum_step(*args: object, **kwargs: object) -> object:
+        cusum_step_calls.append((args, kwargs))
+        return real_cusum_step(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(breaker_module, "pooled_posterior", _spy_pooled_posterior)
+    monkeypatch.setattr(fast_module, "cusum_step", _spy_cusum_step)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    fake_driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return fake_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0
+    assert len(pooled_posterior_calls) >= 1
+    assert len(cusum_step_calls) >= 1
+
+
+def test_close1_run_actually_executes_pooled_posterior_and_cusum_step(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The five-tick `cmd_run` half of the same reproduction."""
+    import deliverability_guard.engine.breaker as breaker_module
+    import deliverability_guard.loops.fast as fast_module
+
+    pooled_posterior_calls: list[object] = []
+    real_pooled_posterior = breaker_module.pooled_posterior
+
+    def _spy_pooled_posterior(*args: object, **kwargs: object) -> object:
+        pooled_posterior_calls.append((args, kwargs))
+        return real_pooled_posterior(*args, **kwargs)  # type: ignore[arg-type]
+
+    cusum_step_calls: list[object] = []
+    real_cusum_step = fast_module.cusum_step
+
+    def _spy_cusum_step(*args: object, **kwargs: object) -> object:
+        cusum_step_calls.append((args, kwargs))
+        return real_cusum_step(*args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(breaker_module, "pooled_posterior", _spy_pooled_posterior)
+    monkeypatch.setattr(fast_module, "cusum_step", _spy_cusum_step)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    fake_driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return fake_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+
+    def _no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module.time, "sleep", _no_sleep)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "5"])
+
+    assert exit_code == 0
+    assert len(pooled_posterior_calls) == 5
+    assert len(cusum_step_calls) == 5

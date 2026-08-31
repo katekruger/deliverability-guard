@@ -89,7 +89,11 @@ def cmd_check(
     Aggregates each mailbox's stats over the last day via
     `loops.fast.evaluate_all_mailboxes` -- the same aggregation-and-
     evaluation path `loops.controller`'s fast tick uses, so this command
-    and the continuous daemon cannot drift apart from each other.
+    and the continuous daemon cannot drift apart from each other. That
+    includes hierarchical pooling and a CUSUM trend check (`max_pooled_ess`
+    from config; CUSUM state starts fresh each invocation, since `check` is
+    a one-shot process with nowhere to persist a running trend statistic
+    between invocations -- `run` is where CUSUM accumulates real history).
     """
     since = now.date() - timedelta(days=1)
     results = evaluate_all_mailboxes(
@@ -100,6 +104,8 @@ def cmd_check(
         state_store=state_store,
         dry_run=config.dry_run,
         now=now,
+        max_pooled_ess=config.max_pooled_ess,
+        cusum_states={},
     )
 
     if not results:
@@ -164,6 +170,7 @@ def cmd_run(
         now=now,
         sleep=sleep,
         max_ticks=max_ticks,
+        max_pooled_ess=config.max_pooled_ess,
         on_fast_tick=on_fast_tick,
         on_slow_tick=on_slow_tick,
     )

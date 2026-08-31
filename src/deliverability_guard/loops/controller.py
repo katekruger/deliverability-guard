@@ -39,10 +39,16 @@ from deliverability_guard.engine.breaker import (
     BreakerStateStore,
     ThresholdStore,
 )
-from deliverability_guard.engine.posterior import BetaDistribution
-from deliverability_guard.loops.fast import evaluate_all_mailboxes
+from deliverability_guard.engine.changepoint import CusumResult, CusumState
+from deliverability_guard.engine.posterior import DEFAULT_MAX_POOLED_ESS, BetaDistribution
+from deliverability_guard.loops.fast import (
+    DEFAULT_CUSUM_SLACK,
+    DEFAULT_CUSUM_TARGET_RATE,
+    DEFAULT_CUSUM_THRESHOLD,
+    evaluate_all_mailboxes,
+)
 from deliverability_guard.loops.slow import ThresholdAdjustment, tune_thresholds
-from deliverability_guard.providers.base import ProviderDriver
+from deliverability_guard.providers.base import MailboxRef, ProviderDriver
 
 # How many recent posterior lower bounds the slow loop considers. Large
 # enough to smooth over a single noisy tick, small enough that a real
@@ -65,8 +71,13 @@ def run(
     should_stop: Callable[[], bool] = lambda: False,
     compliance_degraded: Callable[[], bool] = lambda: False,
     lower_bound_window: int = DEFAULT_LOWER_BOUND_WINDOW,
+    max_pooled_ess: float = DEFAULT_MAX_POOLED_ESS,
+    cusum_target_rate: float = DEFAULT_CUSUM_TARGET_RATE,
+    cusum_slack: float = DEFAULT_CUSUM_SLACK,
+    cusum_threshold: float = DEFAULT_CUSUM_THRESHOLD,
     on_fast_tick: Callable[[list[BreakerEvaluation]], None] | None = None,
     on_slow_tick: Callable[[ThresholdAdjustment], None] | None = None,
+    on_cusum_alarm: Callable[[MailboxRef, CusumResult], None] | None = None,
 ) -> None:
     """Run the two-loop controller.
 
@@ -88,11 +99,19 @@ def run(
     `compliance_degraded()`) is handed to `loops.slow.tune_thresholds`; a
     proposed tighter ladder is applied to `threshold_store` immediately, so
     it's in effect for the very next fast tick.
+
+    `cusum_states`, the CUSUM trend state per mailbox, is created once
+    outside the loop and carried across every tick (mirroring
+    `state_store`/`threshold_store`), so the running statistic actually
+    accumulates evidence over the daemon's lifetime rather than resetting
+    every tick -- see `loops.fast.evaluate_all_mailboxes`'s own docstring
+    for why that matters.
     """
     if max_ticks is not None and max_ticks <= 0:
         return
 
     recent_lower_bounds: deque[float] = deque(maxlen=lower_bound_window)
+    cusum_states: dict[MailboxRef, CusumState] = {}
     last_slow_tick_at = now()
     tick = 0
 
@@ -110,6 +129,12 @@ def run(
             state_store=state_store,
             dry_run=dry_run,
             now=tick_time,
+            max_pooled_ess=max_pooled_ess,
+            cusum_states=cusum_states,
+            cusum_target_rate=cusum_target_rate,
+            cusum_slack=cusum_slack,
+            cusum_threshold=cusum_threshold,
+            on_cusum_alarm=on_cusum_alarm,
         )
         if on_fast_tick is not None:
             on_fast_tick(results)

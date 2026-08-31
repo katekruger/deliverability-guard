@@ -32,18 +32,26 @@ project's own posterior, regardless of volume.
 The programmatic `create_domain` / `get_verification_token` / `verify_domain`
 flow matters because it means multi-tenant onboarding without walking each
 user through the Postmaster web UI by hand.
+
+`coverage_over_range`, the per-day data-availability tracker for a
+Postmaster metric, used to live here. It moved to
+`experimental.postmaster_coverage` (CLOSE-1): it has no production caller
+-- nothing in this codebase ingests Postmaster domain-stats data at all yet
+-- unlike `get_compliance_status`/`forces_hard_gate` just above, which DO
+feed a real (if not yet CLI-invoked) integration point on
+`engine.breaker.evaluate`. See that module's docstring for the full
+reasoning.
 """
 
 import random
 import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
-from datetime import date, timedelta
+from datetime import date
 from enum import Enum, auto
 
 import httpx
 
-from deliverability_guard.engine.state import DailyReport, DataState, evaluate_stream
 from deliverability_guard.providers._parsing import (
     require_dict,
     require_int,
@@ -138,63 +146,6 @@ class DomainStatRow:
     day: date | None
     value: float
     source_day: str | None
-
-
-@dataclass(frozen=True, slots=True)
-class DayAvailability:
-    day: date
-    state: DataState
-    transition_alert: bool
-    """True exactly on the day this metric transitions from having data to
-    not having it. See `coverage_over_range` below."""
-
-
-def coverage_over_range(
-    rows: Sequence[DomainStatRow],
-    *,
-    metric_name: str,
-    since: date,
-    until: date,
-) -> list[DayAvailability]:
-    """Per-day OK/INSUFFICIENT_DATA/STALE for one metric over a date range,
-    treating a present-to-absent transition as its own alert.
-
-    This exists for the landmine BUILD-PLAN.md §8 and §9 both call out: a
-    domain that gets throttled sends less, can drop below Postmaster's
-    (unpublished) privacy threshold as a direct consequence, and disappear
-    from `domainStats:query` results entirely -- monitoring goes dark
-    exactly when things are worst. A missing day is never coerced to "0%,
-    therefore healthy"; a transition into missing days is its own alert.
-
-    Delegates the actual OK/INSUFFICIENT_DATA/STALE transition logic to
-    `engine.state.evaluate_stream` rather than reimplementing it: a
-    Postmaster row carries a bare rate value with no sends/complaints count,
-    so it's translated into a placeholder `DailyReport` (`sends=1` when
-    present, `sends=None` when absent) purely to signal presence/absence --
-    `evaluate_stream` only ever looks at `DailyReport.has_data`, never the
-    counts themselves, so the placeholder values are never a lossy stand-in
-    for real data.
-    """
-    if since > until:
-        raise ValueError(f"since ({since}) must not be after until ({until})")
-    present_days = {
-        row.day for row in rows if row.metric_name == metric_name and row.day is not None
-    }
-    reports: list[DailyReport] = []
-    current = since
-    one_day = timedelta(days=1)
-    while current <= until:
-        has_data = current in present_days
-        reports.append(
-            DailyReport(
-                day=current, sends=1 if has_data else None, complaints=0 if has_data else None
-            )
-        )
-        current += one_day
-    return [
-        DayAvailability(day=e.day, state=e.state, transition_alert=e.transition_alert)
-        for e in evaluate_stream(reports)
-    ]
 
 
 class PostmasterClient:

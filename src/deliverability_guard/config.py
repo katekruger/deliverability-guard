@@ -20,7 +20,7 @@ from typing import cast
 import yaml
 
 from deliverability_guard.engine.breaker import ThresholdLadder
-from deliverability_guard.engine.posterior import BetaDistribution
+from deliverability_guard.engine.posterior import DEFAULT_MAX_POOLED_ESS, BetaDistribution
 
 _DEFAULT_PROVIDER = "instantly"
 _DEFAULT_DECISION_LOG_PATH = "var/decisions.jsonl"
@@ -50,6 +50,7 @@ class AppConfig:
     decision_log_path: Path
     fast_interval_seconds: int
     slow_interval_seconds: int
+    max_pooled_ess: float
 
 
 def load_config(path: Path) -> AppConfig:
@@ -119,6 +120,15 @@ def load_config(path: Path) -> AppConfig:
         config_data, "slow_interval_seconds", _DEFAULT_SLOW_INTERVAL_SECONDS, path
     )
 
+    max_pooled_ess_raw = config_data.get("max_pooled_ess", DEFAULT_MAX_POOLED_ESS)
+    if isinstance(max_pooled_ess_raw, bool) or not isinstance(max_pooled_ess_raw, int | float):
+        raise ConfigError(
+            f"{path}: 'max_pooled_ess' must be a number, got {type(max_pooled_ess_raw).__name__}"
+        )
+    if max_pooled_ess_raw <= 0:
+        raise ConfigError(f"{path}: 'max_pooled_ess' must be > 0, got {max_pooled_ess_raw}")
+    max_pooled_ess = float(max_pooled_ess_raw)
+
     return AppConfig(
         thresholds=thresholds,
         prior=prior,
@@ -127,6 +137,7 @@ def load_config(path: Path) -> AppConfig:
         decision_log_path=decision_log_path,
         fast_interval_seconds=fast_interval_seconds,
         slow_interval_seconds=slow_interval_seconds,
+        max_pooled_ess=max_pooled_ess,
     )
 
 

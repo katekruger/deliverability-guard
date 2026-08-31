@@ -6,11 +6,11 @@ deciders: "Kate Kruger"
 
 # Beta-binomial posterior with hierarchical pooling, not fixed-window rates
 
-> **Status note (August 2026):** the pooling implemented in
-> `engine/posterior.py` is complete pooling weighted by raw volume, not the
-> partial pooling this ADR describes. It is not currently called from
-> `breaker.evaluate()`. See ENG-4. Until that lands, every production verdict
-> comes from the flat per-mailbox posterior described in ADR 0001.
+> **Status note (superseded):** an earlier version of this note said the
+> pooling implemented in `engine/posterior.py` was complete pooling with no
+> production caller. Both are now fixed -- see the two addenda below (ESS
+> capping, then wiring into `loops.fast.evaluate_all_mailboxes`) for the
+> full history.
 
 ## Context and Problem Statement
 
@@ -209,6 +209,66 @@ flat posterior every existing caller relied on before this parameter
 existed. Populating a mailbox's actual peer group at each call site (from
 its domain's other mailboxes) is left to the caller building the fast/slow
 loop wiring -- this ADR only commits to the engine-level contract.
+
+## Addendum (2026-08-31): wiring pooling and CUSUM into the production chokepoint (CLOSE-1)
+
+A follow-up audit found that the ESS-cap fix above, and `cusum_step`
+(`engine/changepoint.py`), still had no real production caller: `evaluate`'s
+`peer_group` parameter existed and was correct, but nothing that runs
+`deliverability-guard check` or `deliverability-guard run` ever supplied
+one, and nothing called `cusum_step` at all. `loops.fast.evaluate_all_mailboxes`
+-- the shared aggregation-and-evaluation chokepoint `cli.cmd_check` and
+`loops.controller.run`'s fast tick both already used -- called
+`engine.breaker.evaluate` with neither `peer_group` nor `current_daily_limit`
+(see the CLOSE-3 addendum on that second half). Every production verdict
+was therefore still the flat, unpooled posterior, even though the pooling
+math itself had been fixed.
+
+**Fix:** `evaluate_all_mailboxes` now builds each mailbox's peer group
+itself, grouped by sending domain (the part of the mailbox address after
+`@`, via a new `_domain_of` helper) with leave-one-out semantics matching
+`pooled_posterior`'s own contract, and passes it through on every call.
+`max_pooled_ess` is now a configurable value (`config/thresholds.yml`'s
+`max_pooled_ess`, default `DEFAULT_MAX_POOLED_ESS`), threaded from
+`AppConfig` through `cli.cmd_check`/`cmd_run` and `loops.controller.run`, so
+a deployment can tune the cap without editing code.
+
+Separately, `evaluate_all_mailboxes` gained an optional `cusum_states`
+parameter: when a caller supplies a mapping to persist trend state in (as
+`loops.controller.run` now does, once per daemon lifetime, mirroring
+`state_store`), `engine.changepoint.cusum_step` runs alongside the
+breaker's own posterior ladder for every mailbox, every tick.
+`loops.fast.evaluate_signal_with_trend`, the old (zero-caller) wiring
+point for this, was deleted rather than adopted -- CUSUM's per-period
+evidence model fits this pull-based tick far more naturally than a
+per-webhook-event signal, and nothing in this codebase accepts an inbound
+webhook yet regardless (see `loops.controller`'s own module docstring).
+`cli.cmd_check` passes a fresh, per-invocation `cusum_states={}` (a one-shot
+process has nowhere to persist a running trend statistic between
+invocations); `cli.cmd_run` relies on `loops.controller.run`'s
+daemon-lifetime dict instead.
+
+**`coverage_over_range` (`signals/postmaster.py`, now `engine.state.evaluate_stream`'s
+other unreached caller) was moved to `experimental.postmaster_coverage`
+rather than wired up**, because there is genuinely nowhere to wire it TO
+yet: no code anywhere calls `PostmasterClient.query_domain_stats` and hands
+the result to it, unlike `get_compliance_status`/`forces_hard_gate`, which
+already feed `evaluate`'s `compliance_gate_tripped` parameter. Building a
+real Postmaster ingestion pipeline (OAuth, config, a CLI subcommand or
+`loops/` integration point) is un-shipped v0.2 infrastructure, not a
+same-chokepoint wiring gap. See that module's own docstring.
+
+### Confirmation
+
+`tests/test_cli.py::test_close1_check_actually_executes_pooled_posterior_and_cusum_step`
+and `test_close1_run_actually_executes_pooled_posterior_and_cusum_step`
+instrument the real functions (not a unit test that calls them directly)
+and drive `cli.main(["check", ...])` / `cli.main(["run", "--ticks", "5"])`
+end to end -- both fail against the pre-CLOSE-1 wiring.
+`tests/test_fast_loop.py` covers peer-group construction (same-domain
+pooling, cross-domain isolation, the configurable ESS cap) and CUSUM
+wiring (state persisted and passed through, the alarm callback, the
+intentional `cusum_states=None` opt-out) directly.
 
 ## More Information
 
