@@ -50,6 +50,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   only. Endpoint shapes are hand-authored from public documentation, same
   caveat as `providers/instantly.py` -- see
   `tests/fixtures/apollo/README.md`.
+- **`signals/spamhaus.py`: Spamhaus DQS blocklist checks** (BUILD-PLAN.md
+  §4 item #25 -- "the only free programmatic blocklist worth having,"
+  since Talos/SenderScore/Validity have no public API). `check_ip` looks
+  up an IPv4 address against the ZEN zone via a reversed-octet DNS query
+  and classifies the return code (SBL/CSS/XBL/PBL, or `UNKNOWN_LISTED` for
+  an unrecognized code -- never silently coerced to not-listed). A
+  confirmed NXDOMAIN (`DnsNameNotFoundError`) is the only result treated
+  as "not listed"; every other failure (timeout, SERVFAIL, an empty
+  answer with no exception) raises `SpamhausLookupError` instead of
+  reading as a clean IP -- the same missing-data-is-not-zero principle
+  AGENTS.md applies everywhere else in this project. `resolve` has no
+  default and must always be supplied, so a test can never fall through to
+  a real DNS lookup by omission.
 - **`loops/controller.py`, `deliverability-guard run`: the always-on
   two-loop daemon.** `run` executes `check`'s evaluation on a loop until
   stopped (`fast_interval_seconds`, default 300) and, on a much longer
