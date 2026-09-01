@@ -313,6 +313,23 @@ def test_act_checks_paused_status_before_ever_calling_throttle() -> None:
     )
 
 
+def test_engine_breaker_module_never_constructs_a_campaign_ref() -> None:
+    """CLOSE5-3: the README's/CHANGELOG's CLOSE4-3 claim -- 'the ladder only
+    ever constructs a `MailboxRef`, never a `CampaignRef`' -- was true when
+    written but had no executable guard, so nothing would fail if it
+    stopped being true. Same source-level idiom as
+    `test_evaluate_never_calls_resume_after_human_review` and
+    `test_act_checks_paused_status_before_ever_calling_throttle` just
+    above: this repo already has the pattern for exactly this kind of
+    claim, and it should be used every time one is made, not only for the
+    ones that happened to get caught by an audit."""
+    import inspect
+
+    from deliverability_guard.engine import breaker as breaker_module
+
+    assert "CampaignRef" not in inspect.getsource(breaker_module)
+
+
 # --- CLOSE3-2: an unexecutable throttle must not loop forever -------------
 
 

@@ -216,6 +216,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   status (and, where relevant, `throttled_at_limit`) untouched during
   replay, exactly mirroring `_act`." It didn't, for exactly this branch.
 
+- **`README.md`/`CHANGELOG.md`: two absolute claims with no executable
+  guard** (external audit finding CLOSE5-3). Both landed in the CLOSE4-3
+  commit; neither was false when written, and neither would have failed
+  when it became false. (1) The README's/CHANGELOG's claim that the
+  ladder "only ever constructs a `MailboxRef`, never a `CampaignRef`" —
+  added `test_engine_breaker_module_never_constructs_a_campaign_ref`, the
+  same source-level idiom `tests/test_breaker.py` already uses for the
+  `resume_after_human_review` claim. (2) The CLOSE4-1 CHANGELOG entry's
+  "exactly mirroring `_act`" — refuted by CLOSE5-2 above; corrected in
+  that same commit. Swept the README for the same shape of claim while
+  here: "every driver's `pause()`/`throttle()` is always callable and
+  returns an explicit 'unsupported' result rather than silently doing
+  nothing" (line 101) also had no guard — added
+  `test_every_driver_declines_an_unsupported_capability_without_raising`
+  to `tests/test_provider_conformance.py`, exercising only the (driver,
+  verb) pairs each driver structurally declines, so it never makes a live
+  call against the capabilities the HTTP-backed drivers actually implement.
+
 - **`README.md`: the capability matrix's "campaign only" pause marks
   described driver-API surface the breaker itself never reaches** (external
   audit finding CLOSE4-3, a documentation decision rather than a bug).
