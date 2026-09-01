@@ -34,7 +34,7 @@ uv run python examples/demo.py
 
 ## Quick start (dry-run)
 
-Dry-run is the default everywhere in this project. It is not a separate code path — it's the exact same evaluation logic, with a no-op decorator standing in for the real provider call, so what you see in dry-run is what would actually happen.
+Dry-run is the default everywhere in this project. It is not a separate code path — it's the exact same evaluation logic, with a no-op decorator standing in for the real provider call, so what you see in dry-run is what would actually happen. That identity is per-evaluation, not per-process: a dry-run `run` daemon's in-memory state DOES keep remembering a mailbox it already decided to pause, the same way a live daemon's would — so its second and later ticks correctly report "already paused," not "would pause" again. A dry-run `check` invoked from cron, by contrast, never accumulates that memory across separate invocations, because the decision log deliberately never persists a dry-run action as real pause history (a dry-run action never touched the real provider, so a restart must not read it back as one) — so cron reports "would pause" every single time. Neither ever makes a real provider call; only how many times each shape *reports* the same hypothetical decision differs.
 
 ```bash
 git clone https://github.com/katekruger/deliverability-guard

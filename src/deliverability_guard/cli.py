@@ -73,6 +73,26 @@ class CliError(Exception):
     environment. Never a traceback a cron job's error email has to explain."""
 
 
+def _format_verdict_line(prefix: str, result: BreakerEvaluation) -> str:
+    """The one line printed per mailbox by both `cmd_check` and `cmd_run`'s
+    fast tick (CLOSE6-4). A non-OK verdict with an `action` appends that
+    action's own `detail` -- e.g. ADR 0003's "mailbox is paused; throttle
+    refused pending human review." Before this, a PAUSED mailbox whose
+    evidence kept landing in the THROTTLE band printed a bare `THROTTLE`
+    forever on stdout, with the honest refusal detail visible only in the
+    decision log -- exactly the confusing-to-an-operator output CLOSE5-4's
+    reproduction was about, just not yet reflected in what `check`/`run`
+    actually print. `action` is `None` for OK and WARN (neither ever calls
+    `_act`), so this only ever adds text for THROTTLE/PAUSE."""
+    line = (
+        f"{prefix}{result.mailbox.mailbox_id}: {result.verdict.name} "
+        f"(sends={result.sends}, complaints={result.complaints})"
+    )
+    if result.action is not None:
+        line += f" -- {result.action.detail}"
+    return line
+
+
 def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
     """The provider registry. Extend this, not `main()`, to add a provider.
 
@@ -179,11 +199,7 @@ def cmd_check(
         nonlocal exit_code, evaluated_any
         evaluated_any = True
         append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
-        print(
-            f"{result.mailbox.mailbox_id}: {result.verdict.name} "
-            f"(sends={result.sends}, complaints={result.complaints})",
-            file=out,
-        )
+        print(_format_verdict_line("", result), file=out)
         if result.verdict is not Verdict.OK:
             exit_code = _EXIT_BREACH_OR_REFUSED
 
@@ -244,11 +260,7 @@ def cmd_run(
 
     def on_fast_tick(results: list[BreakerEvaluation]) -> None:
         for result in results:
-            print(
-                f"[fast] {result.mailbox.mailbox_id}: {result.verdict.name} "
-                f"(sends={result.sends}, complaints={result.complaints})",
-                file=out,
-            )
+            print(_format_verdict_line("[fast] ", result), file=out)
 
     def on_slow_tick(adjustment: ThresholdAdjustment) -> None:
         print(f"[slow] tightened thresholds: {adjustment.reason}", file=out)

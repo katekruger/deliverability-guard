@@ -157,6 +157,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: a paused mailbox's stdout line said `THROTTLE` with no
+  indication anything was refused** (external audit finding CLOSE6-4,
+  first half). The honest "mailbox is paused; throttle refused pending
+  human review" detail (ADR 0003, CLOSE5-1) existed only in the decision
+  log; `cmd_check` and `cmd_run`'s fast tick printed only
+  `f"{mailbox_id}: {verdict.name} (sends=..., complaints=...)"`, so an
+  operator running `check` from cron and tailing its output — not the
+  JSONL log — saw a bare, unexplained `THROTTLE` forever once a mailbox
+  was paused. Both now append the action's own `detail` (via a new shared
+  `_format_verdict_line` helper) whenever `BreakerEvaluation.action` is
+  set, i.e. for THROTTLE and PAUSE; OK and WARN never set `action`, so
+  their lines are unchanged.
+
+- **`README.md` §"Quick start": dry-run daemon vs. cron parity, decided
+  and documented** (CLOSE6-4, second half). Three ticks of identical
+  PAUSE-worthy evidence under `dry_run: true`: a `run` daemon (one
+  process, memory persists between ticks) reports "would pause" once,
+  then "already paused" from tick two onward; three separate `check`
+  invocations (cron; `from_log` rebuilt fresh each time) report "would
+  pause" every single time. Decision: keep this — the in-process store
+  must keep accumulating dry-run mutations (AGENTS.md: dry-run decisions
+  must be identical to what the live path would decide, and a live
+  daemon's second tick genuinely IS idempotent), while `from_log` must
+  keep skipping dry-run records across a restart (CLOSE-4: a dry-run
+  action never touched the real provider, so it must never be read back
+  as durable pause history). Both properties are individually correct and
+  already tested; the tension between them is what's new here.
+  README.md's dry-run paragraph gained a sentence making the distinction
+  explicit — decisions are identical *per evaluation*, not accumulated
+  identically *per process* — and a new test,
+  `test_dry_run_daemon_and_cron_never_make_a_real_call_but_diverge_in_
+  reporting`, pins exactly this: zero real provider calls either way, and
+  the documented difference in what each shape reports.
+
 - **`README.md`: four more unguarded absolute claims, and one stale
   CHANGELOG sentence** (external audit finding CLOSE6-3, the same shape as
   CLOSE5-3, applied to the claims that finding didn't reach). Each claim

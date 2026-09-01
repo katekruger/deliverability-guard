@@ -415,6 +415,40 @@ def test_main_check_exit_code_3_is_unchanged_when_an_earlier_mailbox_was_persist
     assert exit_code == 3
 
 
+# --- CLOSE6-4: a paused mailbox's stdout line must say why, not just THROTTLE
+
+
+def test_check_prints_the_action_detail_for_a_paused_mailbox_refused_throttle(
+    tmp_path: Path,
+) -> None:
+    """CLOSE6-4's reproduction: a mailbox already PAUSED whose evidence
+    keeps landing in the THROTTLE band used to print a bare
+    `THROTTLE (sends=..., complaints=...)` on every subsequent `check` --
+    the honest 'mailbox is paused; throttle refused pending human review'
+    detail (ADR 0003, CLOSE5-1) existed only in the decision log, never on
+    the stdout an operator running `check` from cron actually reads."""
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="ops@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_paused(mailbox)
+
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 1000, 5)])
+    out = io.StringIO()
+
+    exit_code = cmd_check(driver=driver, config=config, state_store=state_store, now=_NOW, out=out)
+
+    assert exit_code == 1
+    printed = out.getvalue()
+    assert "ops@example.com: THROTTLE" in printed
+    assert "mailbox is paused; throttle refused pending human review" in printed
+    assert driver.throttle_calls == []
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+
+
 # --- status -------------------------------------------------------------
 
 
@@ -1168,6 +1202,70 @@ def test_daemon_and_cron_agree_on_a_smartlead_shaped_three_move_sequence(
     assert cron_driver.pause_calls == daemon_driver.pause_calls
     assert cron_store.status_of(mailbox) == daemon_store.status_of(mailbox)
     assert cron_store.throttled_at_limit(mailbox) == daemon_store.throttled_at_limit(mailbox)
+
+
+def test_dry_run_daemon_and_cron_never_make_a_real_call_but_diverge_in_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE6-4's dry-run question: three ticks of identical PAUSE-worthy
+    evidence under `dry_run: true`.
+
+    Decision made here: the in-process `BreakerStateStore` keeps
+    accumulating dry-run mutations across ticks (`_act`'s PAUSE branch
+    always calls `state_store.mark_paused`, dry-run or not) -- that is
+    what makes a dry-run daemon's SECOND tick report the exact same
+    idempotent "already paused" decision a LIVE daemon's second tick would
+    reach, per AGENTS.md's "dry-run must produce decisions identical to
+    the live path." `BreakerStateStore.from_log` continues to skip
+    dry-run records when rebuilding across a restart (CLOSE-4, unchanged
+    by this decision) -- a dry-run action never touched the real provider,
+    so it must never be read back as durable pause history.
+
+    Put together: a long-lived dry-run `run` daemon (one process, memory
+    persists between ticks) reports "already paused" from its second tick
+    onward, while a dry-run `check` invoked from cron (a fresh process
+    every time, so `from_log` correctly forgets the fake pause on every
+    restart) reports "would pause" on every single invocation. The
+    property that must hold regardless of shape -- and is what this test
+    pins -- is that BOTH make zero real provider calls, always."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    stats = [_stats(mailbox, date(2025, 12, 31), 5000, 40)]
+
+    daemon_driver = FakeDriver(stats_to_return=stats)
+
+    def _fake_build_driver_daemon(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return daemon_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver_daemon)
+
+    def _no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module.time, "sleep", _no_sleep)
+    daemon_log = tmp_path / "daemon-decisions.jsonl"
+    daemon_config = _config(tmp_path, text=_VALID_YAML, decision_log=str(daemon_log))
+    main(["--config", str(daemon_config), "run", "--ticks", "3"])
+
+    assert daemon_driver.pause_calls == []
+
+    cron_driver = FakeDriver(stats_to_return=stats)
+
+    def _fake_build_driver_cron(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return cron_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver_cron)
+    cron_log = tmp_path / "cron-decisions.jsonl"
+    cron_config = _config(tmp_path, text=_VALID_YAML, decision_log=str(cron_log))
+    for _ in range(3):
+        main(["--config", str(cron_config), "check"])
+
+    assert cron_driver.pause_calls == []
+
+    daemon_details = [r.action_detail for r in read_records(daemon_log)]
+    cron_details = [r.action_detail for r in read_records(cron_log)]
+    assert daemon_details[0] == cron_details[0] == f"[DRY RUN] would pause {mailbox!r}"
+    assert daemon_details[1:] == ["mailbox already paused; no action taken (idempotent)"] * 2
+    assert cron_details[1:] == [f"[DRY RUN] would pause {mailbox!r}"] * 2
 
 
 def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
