@@ -185,6 +185,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `driver.throttle()`, in the same idiom the repo already used for the
   symmetric `resume_after_human_review` claim.
 
+- **`engine/breaker.py`: `from_log`'s PAUSE/`UNSUPPORTED` branch didn't
+  mirror `mark_active`, leaving a stale `throttled_at_limit` behind**
+  (external audit finding CLOSE5-2, found by extending the CLOSE4-1
+  permutation sweep with a `PAUSE_UNSUPPORTED` move and switching from
+  `itertools.permutations` to `itertools.product` so repeated moves are
+  covered — 14 of 343 three-move sequences mismatched). `_act`'s
+  PAUSE/UNSUPPORTED path calls `state_store.mark_active`, which clears both
+  `_throttled_at_limit` and the unsupported-throttle streak; `from_log`'s
+  corresponding `else` branch set status to ACTIVE but left
+  `throttled_at_limit` in place. The stale limit then made the very next
+  `THROTTLE`/`PERFORMED` record look like CLOSE4-1's `is_idempotent_replay`
+  case, so replay never restored THROTTLED — reachable in production on
+  `smartlead` (CLI-selectable, `pause(MailboxRef)` UNSUPPORTED,
+  `throttle(mailbox_id, limit)` PERFORMED): on identical evidence, `run`
+  (no restart) and `check` (restart between every evaluation) made a
+  DIFFERENT number of real provider calls, and after any restart the
+  breaker read a genuinely throttled mailbox as pristine. Fixed with the
+  one-line mirror of `mark_active` the finding named
+  (`throttled_at_limit.pop(mailbox, None)`). The permutation sweep now
+  compares `status_of`, `throttled_at_limit`, AND the unsupported-throttle
+  streak (previously status only), and 0/343 sequences mismatch. A new
+  `test_daemon_and_cron_agree_on_a_smartlead_shaped_three_move_sequence`
+  reproduces the finding through the real `evaluate()`/`cli.main` paths
+  directly. Also corrected: the comment above the fixed branch, which
+  argued it was "structurally unreachable from an already-PAUSED mailbox"
+  — true for the status question, irrelevant to the limit question, since
+  this defect's reproduction never starts from PAUSED — and this
+  CHANGELOG's own CLOSE4-1 entry, which claimed a non-acting record "leaves
+  status (and, where relevant, `throttled_at_limit`) untouched during
+  replay, exactly mirroring `_act`." It didn't, for exactly this branch.
+
 - **`README.md`: the capability matrix's "campaign only" pause marks
   described driver-API surface the breaker itself never reaches** (external
   audit finding CLOSE4-3, a documentation decision rather than a bug).
@@ -217,8 +248,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escalate-then-un-pause cycle repeated with period 4 forever — a real
   provider `pause()` call every time it escalated, not once. Fixed: a
   record whose action did not touch the provider now leaves status (and,
-  where relevant, `throttled_at_limit`) untouched during replay, exactly
-  mirroring `_act`. The idempotent-PERFORMED case is distinguished from a
+  where relevant, `throttled_at_limit`) untouched during replay for
+  THROTTLE's three branches, mirroring `_act` for those three cases
+  specifically — **not** "exactly mirroring `_act`" in general, a claim
+  CLOSE5-2 (below) found false for the PAUSE/`UNSUPPORTED` branch this
+  entry didn't touch. The idempotent-PERFORMED case is distinguished from a
   genuine throttle purely from records already replayed: a genuine
   throttle always sets `throttled_at_limit` for the first time or to a
   STRICTLY larger value, while an idempotent replay's `applied_daily_limit`

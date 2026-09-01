@@ -1529,6 +1529,7 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",
+    "PAUSE_UNSUPPORTED",
     "THROTTLE_PERFORMED",
     "THROTTLE_UNSUPPORTED",
     "THROTTLE_FAILED",
@@ -1562,6 +1563,9 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
     if move == "PAUSE_PERFORMED":
         driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
         eval_kwargs = {"sends": 5000, "complaints": 40}
+    elif move == "PAUSE_UNSUPPORTED":
+        driver_kwargs = {"pause_outcome": ActionOutcome.UNSUPPORTED}
+        eval_kwargs = {"sends": 5000, "complaints": 40}
     elif move == "THROTTLE_PERFORMED":
         driver_kwargs = {"throttle_outcome": ActionOutcome.PERFORMED}
         eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": 100}
@@ -1589,26 +1593,40 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
     append_record(log_path, DecisionRecord.from_evaluation(evaluation))
 
 
-@pytest.mark.parametrize("sequence", list(itertools.permutations(_PERMUTATION_MOVES)))
+def _snapshot(store: BreakerStateStore) -> tuple[MailboxBreakerStatus, int | None, int]:
+    """All three fields CLOSE5-2 found `from_log` could disagree with the
+    live path on -- comparing `status_of` alone (as this test originally
+    did) happened to find nothing extra for the CLOSE4-1 move set, but that
+    was luck, not coverage: the stale `throttled_at_limit` CLOSE5-2 fixed
+    never showed up as a status mismatch on its own."""
+    return (
+        store.status_of(_MAILBOX),
+        store.throttled_at_limit(_MAILBOX),
+        store.unsupported_throttle_streak(_MAILBOX),
+    )
+
+
+@pytest.mark.parametrize("sequence", list(itertools.product(_PERMUTATION_MOVES, repeat=3)))
 def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
     sequence: tuple[str, ...], tmp_path: Path
 ) -> None:
     """The invariant CLOSE4-1's bug violated, tested directly rather than
     via one or two hand-picked sequences: replaying the decision log must
-    always reproduce the SAME status a single uninterrupted in-process run
+    always reproduce the SAME (status, throttled_at_limit,
+    unsupported_throttle_streak) a single uninterrupted in-process run
     through the identical sequence of evaluations would have reached.
-    Every permutation of (PAUSE/PERFORMED, THROTTLE/PERFORMED,
-    THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME) is tried -- 720
-    orderings, each applied once to a live `state_store` and once (via the
-    same calls, writing to the same log) followed by a fresh
-    `BreakerStateStore.from_log` rebuild at the very end."""
+
+    `itertools.product(moves, repeat=3)` rather than `permutations` --
+    CLOSE5-2 was found only once repeated moves were covered (`permutations`
+    never repeats an element), and 3 moves at a time keeps the sweep at 343
+    sequences (7 moves) rather than needing all 7 in every sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
         _apply_move(move, live_store, log_path)
 
     replayed_store = BreakerStateStore.from_log(log_path)
-    assert replayed_store.status_of(_MAILBOX) == live_store.status_of(_MAILBOX), sequence
+    assert _snapshot(replayed_store) == _snapshot(live_store), sequence
 
 
 def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(
