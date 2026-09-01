@@ -335,6 +335,77 @@ most one extra, correctly-computed call per restart.
 `test_repeated_throttle_verdict_does_not_re_halve_the_daily_limit` (unchanged)
 confirms the six-identical-ticks case still holds.
 
+## Addendum (2026-09-01): a FAILED pause attempt was a permanent latch, and PAUSE_FAILED now recovers like THROTTLED does
+
+An external audit (CLOSE9-1) found that `MailboxBreakerStatus.PAUSE_FAILED`
+had a latch bug this ADR's own CLOSE-3b addendum already fixed for
+`THROTTLED`, and never carried over: `mark_pause_failed`'s
+`throttled_at_limit` memo is correct advice for the VERY NEXT evaluation
+("don't re-halve an already-throttled limit just because the pause on top
+of it failed" -- CLOSE-3c), but nothing ever moved a mailbox OFF
+`PAUSE_FAILED` at all. `cmd_resume` refused it (only `PAUSED` and
+`THROTTLED` were accepted). CLOSE-3b's sustained-OK recovery checked only
+`THROTTLED`. So a mailbox whose pause attempt failed once stayed
+`PAUSE_FAILED` -- and its stale `throttled_at_limit` memo stayed live --
+through any number of subsequent healthy evaluations, forever. Reproduced:
+30 consecutive healthy evaluations after one `PAUSE_FAILED`, then a fresh
+breach at 30x Gmail's ceiling with the operator's real daily limit now
+100 (down from the stale 400 on file) -- `_act` read this as "mailbox
+already throttled at this limit; no action taken (idempotent)" and made
+**zero** real provider calls, permanently, for a mailbox that had been
+healthy for a month.
+
+### Why this is a DIFFERENT question from "never auto-resume PAUSED"
+
+This ADR's core decision -- never auto-resume a `PAUSED` mailbox -- rests
+on a real pause having landed at the provider: revenue-risking sending has
+actually STOPPED, and restarting it without a human looking first is the
+failure mode this ADR exists to prevent (see "Decision Drivers" above).
+`PAUSE_FAILED` is the opposite case: the provider explicitly said no, so
+the mailbox never stopped sending at all. It is closer in shape to
+`THROTTLED` (a real action was attempted, the mailbox is still live
+either way, and CLOSE-3b already lets sustained healthy evidence clear
+`THROTTLED` automatically) than to `PAUSED` (a real action landed,
+sending genuinely stopped, and only a human may restart it). Treating
+`PAUSE_FAILED` as automatically-recoverable is therefore consistent with
+this ADR's existing THROTTLED precedent, not an exception carved into it.
+
+### Decision Outcome
+
+`PAUSE_FAILED` now recovers exactly like `THROTTLED` does, on both paths:
+
+1. `cmd_resume` now accepts `PAUSE_FAILED` alongside `PAUSED` and
+   `THROTTLED` -- a human can unstick it immediately, the same way
+   CLOSE3-3 let a human clear a stuck `THROTTLED` mailbox. The refusal
+   message for every other status now names what CAN be resumed, instead
+   of only naming what the mailbox isn't.
+2. `evaluate()`'s and `from_log`'s sustained-recovery check (CLOSE-3b) now
+   fires for `PAUSE_FAILED` the same as it already does for `THROTTLED`: a
+   `Verdict.OK` evaluation (real evidence, not `INSUFFICIENT_DATA` --
+   CLOSE7-1's own guard already ensures that) moves the mailbox to
+   `ACTIVE` and clears `throttled_at_limit`.
+
+Both clear `throttled_at_limit`, which is the part that actually matters:
+CLOSE-3c's original property (a failed pause must not make the
+IMMEDIATELY NEXT throttle re-halve an already-throttled limit) still
+holds, because nothing about this changes what happens on the evaluation
+right after the failed pause -- only what happens after SUSTAINED healthy
+evidence, which is a different question this ADR's own THROTTLED
+precedent already answered the same way.
+
+### Confirmation
+
+`tests/test_breaker.py`'s `test_pause_failed_recovers_after_thirty_healthy_days`
+is the reproduction, run to completion rather than stopped at the bug: 30
+healthy evaluations after a FAILED pause, then a fresh breach, asserting a
+REAL `throttle()` call happens. `test_resume_accepts_a_pause_failed_mailbox`
+covers the human path. `test_failed_pause_does_not_let_a_later_throttle_re_halve`
+(CLOSE-3c's own test, unchanged) confirms the immediately-next-evaluation
+property this addendum does not touch. A live-versus-should property test
+(not a live-versus-replay one -- see `tests/test_breaker.py`'s blind-spot
+list, item 8) asserts that no bounded run of healthy evaluations can leave
+a mailbox in a state from which no provider action is ever possible again.
+
 ## More Information
 
 See `engine/breaker.py`'s `BreakerStateStore` docstring and

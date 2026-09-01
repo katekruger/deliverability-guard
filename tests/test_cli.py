@@ -8,12 +8,15 @@ call) plus a real config loaded from a temp directory, per the audit's own
 definition of done for this item.
 """
 
+import errno
 import io
+import os
 import sys
 from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 import deliverability_guard.cli as cli_module
@@ -545,6 +548,61 @@ def test_resume_clears_a_throttled_mailbox(tmp_path: Path) -> None:
     assert event.mailbox_id == "a@example.com"
 
 
+def test_resume_accepts_a_pause_failed_mailbox(tmp_path: Path) -> None:
+    """CLOSE9-1: before this, `resume` refused `PAUSE_FAILED` outright, and
+    nothing else could move a mailbox off it either -- a permanent latch.
+    `resume` now accepts it the same way it already accepts THROTTLED
+    (CLOSE3-3): a human, explicitly named, clearing a stuck mailbox back
+    to ACTIVE, with `throttled_at_limit` cleared alongside it so the next
+    genuine breach isn't read as an idempotent repeat of a stale one."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_throttled(mailbox, current_daily_limit=200)
+    state_store.mark_pause_failed(mailbox)
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+    assert state_store.throttled_at_limit(mailbox) is None
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+
+
+def test_resume_refusal_message_names_what_can_be_resumed(tmp_path: Path) -> None:
+    """CLOSE9-1: the refusal message used to only say what the mailbox
+    WASN'T ("is not paused or throttled"), a dead end. It now names the
+    statuses `resume` actually acts on, so an operator reading it knows
+    what to look for instead of just what didn't match."""
+    out = io.StringIO()
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
+
+    assert exit_code == 1
+    printed = out.getvalue()
+    assert "PAUSED" in printed
+    assert "THROTTLED" in printed
+    assert "PAUSE_FAILED" in printed
+
+
 def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
@@ -717,6 +775,158 @@ def test_main_resume_end_to_end(tmp_path: Path) -> None:
     assert exit_code == 1
 
 
+# --- CLOSE9-2: `resume`'s own write failure must not traceback or collide
+# with exit 1 ("refused") --------------------------------------------------
+
+
+def test_main_resume_against_a_read_only_log_directory_gets_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE9-2's reproduction: `cmd_resume` was called bare in `main`, with
+    no exception handler at all, despite writing to disk via
+    `append_resume_record`. A read-only mount, a full disk, or a decision
+    log directory owned by a different user than the one running `resume`
+    (a daemon user vs. a human operator, say) are all realistic ways for
+    that write to fail. Before this fix: a bare traceback, and Python's
+    default exit code for an uncaught exception (1) collides with this
+    project's OWN exit-code map, which already assigns 1 to "resume was
+    refused" -- an operator wrapper reading exit 1 here would conclude
+    the wrong thing entirely."""
+    if hasattr(os, "geteuid") and os.geteuid() == 0:
+        pytest.skip("root bypasses file permission checks; this test needs a real one")
+
+    log_dir = tmp_path / "logs"
+    log_dir.mkdir()
+    log_path = log_dir / "decisions.jsonl"
+    # A mailbox that's actually PAUSED, so `cmd_resume` gets past its own
+    # refusal check and reaches the write that's about to fail -- this test
+    # is about the WRITE failing, not about a legitimate refusal.
+    evaluation = evaluate(
+        driver=FakeDriver(),
+        mailbox=MailboxRef(provider="fake", mailbox_id="a@example.com"),
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+    # `open(path, "a")` on an EXISTING file checks the FILE's own write
+    # permission, not the directory's -- chmod the file itself read-only,
+    # not just the directory, or the append silently succeeds anyway.
+    log_path.chmod(0o400)
+    log_dir.chmod(0o500)  # read + execute, no write -- belt and suspenders
+    try:
+        config_path = _config(tmp_path, decision_log=str(log_path))
+
+        exit_code = main(["--config", str(config_path), "resume", "a@example.com", "--by", "kate"])
+    finally:
+        log_dir.chmod(0o700)  # restore so pytest's own tmp_path cleanup can remove it
+        log_path.chmod(0o600)
+
+    assert exit_code != 1  # must never be confused with "refused"
+    assert exit_code == 3
+
+
+def test_main_resume_survives_an_injected_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The deterministic, platform-independent version of the same
+    property: `append_resume_record` itself raising `OSError(ENOSPC)`
+    (a full disk) must produce a documented exit code, one clean message,
+    and no traceback -- not exit 1, not an uncaught exception."""
+
+    def _raising_append_resume_record(path: Path, record: object) -> None:
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(cli_module, "append_resume_record", _raising_append_resume_record)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    log_path = tmp_path / "decisions.jsonl"
+    evaluation = evaluate(
+        driver=FakeDriver(),
+        mailbox=mailbox,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+    config_path = _config(tmp_path, decision_log=str(log_path))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "resume", "a@example.com", "--by", "kate"])
+
+    assert exit_code == 3
+    assert exit_code != 1
+    assert "Traceback" not in err.getvalue()
+    assert len(err.getvalue().strip().splitlines()) == 1
+
+
+@pytest.mark.parametrize(
+    ("command_args", "trigger"),
+    [
+        (["check"], "build_driver"),
+        (["run", "--ticks", "1"], "build_driver"),
+        (["status", "a@example.com"], None),
+        (["resume", "a@example.com", "--by", "kate"], "append_resume_record"),
+    ],
+    ids=["check", "run", "status", "resume"],
+)
+def test_no_cli_command_lets_an_unanticipated_exception_escape_main(
+    command_args: list[str],
+    trigger: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLOSE9-2's own closing instruction: re-run the class over every
+    command path, not just `resume`. `check`/`run` already had a catch-all
+    (CLOSE8-2); this pins that `status` (pure read, nothing to fail) and
+    `resume` (now fixed) both hold the same property -- no uncaught
+    exception of any kind escapes `main`, for any command."""
+    if trigger == "build_driver":
+
+        def _raising_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+            raise RuntimeError("unanticipated failure")
+
+        monkeypatch.setattr(cli_module, "build_driver", _raising_build_driver)
+    elif trigger == "append_resume_record":
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        log_path = tmp_path / "decisions.jsonl"
+        evaluation = evaluate(
+            driver=FakeDriver(),
+            mailbox=mailbox,
+            sends=5000,
+            complaints=40,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=BreakerStateStore(),
+            dry_run=False,
+            now=_NOW,
+        )
+        append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+        def _raising_append_resume_record(path: Path, record: object) -> None:
+            raise RuntimeError("unanticipated failure")
+
+        monkeypatch.setattr(cli_module, "append_resume_record", _raising_append_resume_record)
+
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), *command_args])
+
+    assert exit_code is not None
+    assert "Traceback" not in err.getvalue()
+
+
 def test_main_check_reports_an_unknown_provider_cleanly(tmp_path: Path) -> None:
     text = _VALID_YAML.replace("provider: fake", "provider: not-a-real-provider")
     config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
@@ -767,6 +977,46 @@ def test_main_check_reports_an_httpx_transport_error_with_its_own_exit_code(
     exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 3
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: httpx.InvalidURL("bad url"),
+        lambda: httpx.CookieConflict("dup"),
+        lambda: httpx.StreamConsumed(),
+    ],
+    ids=["InvalidURL", "CookieConflict", "StreamConsumed"],
+)
+def test_main_check_survives_httpx_exceptions_outside_httpxerror(
+    make_exc: Callable[[], Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE9-4: the per-driver exception table (CHANGELOG.md's CLOSE8-2
+    entry) originally claimed `httpx.HTTPError` covers what the four
+    `httpx`-based drivers can raise -- false for three families:
+    `httpx.InvalidURL` and `httpx.CookieConflict` are bare `Exception`
+    subclasses, and the `StreamError` family (`StreamConsumed` here) is a
+    `RuntimeError`, none of them `httpx.HTTPError`. All three still fall
+    through to CLOSE8-2's own catch-all and produce a clean exit 3 with no
+    traceback -- verified here directly, so the table's CORRECTED claim
+    (fallthrough, not the `httpx.HTTPError`-specific handler) is backed by
+    a test, not just a corrected sentence."""
+    exc = make_exc()
+    assert not isinstance(exc, httpx.HTTPError)  # confirms these really are the uncovered family
+    failing_driver = _TransportFailingDriver(exc)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    assert "Traceback" not in err.getvalue()
 
 
 def test_main_check_reports_a_provider_error_with_its_own_exit_code(

@@ -353,9 +353,24 @@ class BreakerStateStore:
           `action_outcome` and always pops the streak.
         - Ladder PAUSE (raw breach, floor- or streak-escalated): same as
           compliance-gated, streak cleared before `_act` runs -- agrees.
-        - Ladder THROTTLE/PERFORMED: status/limit via `_act`'s THROTTLE
-          branch (limit set to `current_daily_limit`), streak cleared --
-          agrees with the THROTTLE/PERFORMED branch below.
+        - Ladder THROTTLE/PERFORMED, a genuinely NEW throttle (no limit
+          recorded yet, or the recorded one has grown past what's on
+          file): status/limit via `_act`'s THROTTLE branch (limit set to
+          `current_daily_limit`), streak cleared -- agrees with the
+          THROTTLE/PERFORMED branch below.
+        - Ladder THROTTLE/PERFORMED, `_act`'s limit-idempotent sub-case
+          (CLOSE9-5: this row didn't exist before -- the already-PAUSED
+          sub-case two rows down got its own, this one didn't, even though
+          the SAME distinction applies): `current_daily_limit` hasn't grown
+          past the recorded `throttled_at_limit`, so `_act` returns
+          PERFORMED without ever calling `driver.throttle()` -- status and
+          limit are BOTH left exactly as they were (not "set to
+          `current_daily_limit`," which is only true for a genuinely new
+          throttle), streak cleared. Still agrees with the THROTTLE/
+          PERFORMED branch below (CLOSE4-1's own `is_idempotent_replay`
+          check exists specifically to mirror this), but the two live-path
+          sub-cases have different EFFECTS on `throttled_at_limit`, so they
+          earn separate rows here.
         - Ladder THROTTLE/UNSUPPORTED: status/limit untouched, streak
           incremented -- agrees with THROTTLE/UNSUPPORTED below.
         - Ladder THROTTLE/FAILED: status/limit untouched, streak cleared --
@@ -579,9 +594,9 @@ class BreakerStateStore:
                 # resurfacing through a door the permutation sweep couldn't
                 # see until `ZERO_SENDS` was added to its move set.
                 pass
-            elif (
-                record.verdict is Verdict.OK
-                and status.get(mailbox) is MailboxBreakerStatus.THROTTLED
+            elif record.verdict is Verdict.OK and status.get(mailbox) in (
+                MailboxBreakerStatus.THROTTLED,
+                MailboxBreakerStatus.PAUSE_FAILED,
             ):
                 # CLOSE3-3: mirrors `evaluate()`'s own sustained-recovery
                 # check (`state_store.mark_active` on a THROTTLED mailbox
@@ -594,6 +609,25 @@ class BreakerStateStore:
                 # means `data_state is DataState.OK` (the elif just above
                 # already caught the only other possibility for a `Verdict.
                 # OK` record), so this really is evidence, not silence.
+                #
+                # CLOSE9-1: `PAUSE_FAILED` joined this branch. A pause that
+                # FAILED never actually stopped the mailbox -- unlike
+                # PAUSED, where a real `pause()` call landed and only a
+                # human may undo it (ADR 0003) -- so it is the same shape
+                # as THROTTLED, not the same shape as PAUSED: a real action
+                # was attempted and the mailbox is still sending regardless
+                # of outcome. Before this, `mark_pause_failed`'s own
+                # `throttled_at_limit` memo (deliberately never cleared, so
+                # a later THROTTLE stays idempotent instead of re-halving)
+                # combined with NOTHING ever clearing `PAUSE_FAILED` itself
+                # meant a mailbox whose pause attempt failed once was
+                # permanently inert: `cmd_resume` refused it (neither
+                # PAUSED nor THROTTLED), and no automatic recovery path
+                # existed either, so the ladder's own idempotent-throttle
+                # check kept comparing every future evaluation against a
+                # limit from an episode that might be 30 healthy days in
+                # the past -- forever. See ADR 0003's addendum for the
+                # policy reasoning.
                 status[mailbox] = MailboxBreakerStatus.ACTIVE
                 throttled_at_limit.pop(mailbox, None)
                 unsupported_streak.pop(mailbox, None)
@@ -644,10 +678,21 @@ class BreakerStateStore:
     def mark_pause_failed(self, mailbox: MailboxRef) -> None:
         """A pause attempt got a definitive FAILED from the provider
         (CLOSE-3c). Deliberately distinct from `mark_active`: this mailbox
-        has NOT been verified healthy, so it must not look pristine to a
-        subsequent THROTTLE evaluation. Unlike `mark_active`, this does
+        has NOT been verified healthy, so it must not look pristine to the
+        VERY NEXT THROTTLE evaluation. Unlike `mark_active`, this does
         *not* clear `throttled_at_limit` -- that memory is exactly what
-        keeps a later THROTTLE idempotent instead of re-halving."""
+        keeps a later THROTTLE idempotent instead of re-halving.
+
+        This is NOT a permanent latch (CLOSE9-1): `PAUSE_FAILED` has two
+        ways back to `ACTIVE`, both clearing `throttled_at_limit` when they
+        fire -- `resume_after_human_review` (a human decides), and
+        `evaluate()`'s/`from_log`'s own sustained-OK recovery check, which
+        now treats `PAUSE_FAILED` the same as `THROTTLED` (see ADR 0003's
+        addendum). Before this, nothing ever moved a mailbox off
+        `PAUSE_FAILED` at all: `cmd_resume` refused it, and CLOSE-3b's
+        recovery only ever checked `THROTTLED` -- so this memory, right for
+        the NEXT evaluation, latched forever with no evaluation ever
+        allowed to be "next enough" to escape it."""
         self._status[mailbox] = MailboxBreakerStatus.PAUSE_FAILED
 
     def mark_active(self, mailbox: MailboxRef) -> None:
@@ -926,13 +971,25 @@ def evaluate(
         # Escalate through PAUSE (and therefore the human-review gate, ADR
         # 0003) instead of writing another identical UNSUPPORTED record.
         verdict = Verdict.PAUSE
-    elif verdict is Verdict.OK and state_store.status_of(mailbox) is MailboxBreakerStatus.THROTTLED:
+    elif verdict is Verdict.OK and state_store.status_of(mailbox) in (
+        MailboxBreakerStatus.THROTTLED,
+        MailboxBreakerStatus.PAUSE_FAILED,
+    ):
         # CLOSE-3b: a sustained OK verdict is the ladder's own recovery path
         # for THROTTLE (unlike PAUSE, which never auto-recovers -- ADR
         # 0003). Without this, a mailbox that gets throttled once stays
         # THROTTLED forever even after it's genuinely healthy again, and a
         # later re-degradation reads as an idempotent no-op instead of a
         # fresh throttle.
+        #
+        # CLOSE9-1: `PAUSE_FAILED` joined this recovery path too -- see the
+        # matching branch in `from_log` for the full reasoning and ADR
+        # 0003's addendum for the policy decision. A pause that FAILED
+        # never actually stopped anything, so treating it like THROTTLED
+        # (a real action attempted, mailbox still live, eligible for
+        # sustained-recovery) rather than like PAUSED (a real action that
+        # landed, human-gated on purpose) is the consistent reading of
+        # what `PAUSE_FAILED` actually means.
         state_store.mark_active(mailbox)
 
     if verdict is not Verdict.THROTTLE:

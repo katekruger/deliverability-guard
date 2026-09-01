@@ -157,6 +157,176 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_breaker.py`: the blind-spot list kept alive again**
+  (CLOSE9-5). Items 1, 2, 4, and 5 -- re-read with fresh eyes every round
+  since CLOSE7-4 and left open each time -- were specific enough to be
+  cheap to sweep, and all four came back MEASURED CLEAN: interleaved
+  two-mailbox sequences (item 1, 0/4,096), a `current_daily_limit` that
+  grows and shrinks non-monotonically across repeated throttles (item 2,
+  0/6,859 at length 3), the floor- and streak-escalation paths to PAUSE
+  swept as their own moves (item 4, 0/130,321 at length 4), and randomized
+  sequences of length 5-9 beyond the main sweep's fixed `repeat=3` (item
+  5, 0/200,000). Marked measured-clean with those counts rather than
+  deleted -- a list that shows what it checked is worth more than one
+  showing only what's left -- with the same caveat attached to each: clean
+  at this depth is not clean forever, and every sweep is reproducible and
+  should be re-run when the code it's checking changes shape. Item 3
+  gained a caveat of its own: `COMPLIANCE_PAUSE` in the sweep is pinned to
+  `pause_outcome=PERFORMED` only, and the FAILED/UNSUPPORTED
+  compliance-gated outcomes CLOSE9-1's own tests cover are NOT covered by
+  the sweep itself. Item 6 gained CLOSE9-4's correction in place.
+
+  New item 8, the headline lesson of this round: every sweep in this file
+  compares LIVE against REPLAY -- an equivalence question -- and CLOSE9-1
+  was invisible to all of them, because the live path and `from_log`
+  agreed at every step and were simply both wrong. An equivalence test can
+  only ever catch two implementations disagreeing; it cannot catch a wrong
+  answer both give the SAME way. CLOSE9-1's own live-vs-should property
+  test is this project's first test of that different kind, and the list
+  now asks, explicitly, for the question to be asked of every future
+  sweep addition: "might these disagree," or "might they quietly agree on
+  something wrong."
+
+  Also, while in the per-branch state table (`engine/breaker.py`'s
+  `from_log` docstring and this file's own CLOSE8-1 entry): the "Ladder
+  THROTTLE, PERFORMED" row said `throttled_at_limit` is "set to
+  `current_daily_limit`" -- true for a genuinely new throttle, not true
+  for `_act`'s limit-idempotent sub-case, where the limit is left alone
+  and no provider call happens. The already-PAUSED sub-case two rows down
+  got its own row for exactly this reason; this one hadn't. Split into
+  two rows, matching.
+
+- **`tests/test_source_inspect.py`: the checker built for CLOSE8-3 did not
+  catch CLOSE8-3's own vacuous-guard shape** (external audit finding
+  CLOSE9-3). The original checker was a single-line regex,
+  `r"(?<!not )\bin\s+inspect\.getsource\("`, scanning a NON-recursive
+  glob (`Path(__file__).resolve().parent.glob("test_*.py")`). Two
+  confirmed holes: (1) CLOSE8-3's actual vacuous guard split the pattern
+  across two statements (`source = inspect.getsource(f)`, then later
+  `source.index(...)`) -- reverting `test_act_checks_paused_status_
+  before_ever_calling_throttle` to that exact shape and re-running the
+  checker: green. (2) The glob never descended into `tests/experimental/`,
+  `tests/providers/`, `tests/signals/`, `tests/loops/`,
+  `tests/identity/`, or `tests/audit/` -- a bare offending pattern placed
+  in any of them: also green. The file's own docstring claimed it "makes
+  a THIRD bare occurrence something the suite itself catches" --
+  measured false for the shape the second occurrence actually had, and
+  for six of the suite's directories. (Mitigating: the BEHAVIOURAL
+  consequence of the underlying mutation is still caught in depth by ~60
+  other test failures elsewhere in the suite -- this was a defence-in-depth
+  gap in the meta-checker, not a live escape hatch for the real defect.)
+
+  Fixed by replacing the regex with an `ast`-based checker: it parses each
+  file, tracks which names are bound directly to `inspect.getsource(...)`
+  (never wrapped by `source_body`) within a function -- including nested
+  `def`s, since both CLOSE7-3's and CLOSE8-3's own mutations built a
+  nested stand-in function -- then flags any `in` comparison or
+  `.index()`/`.find()` call against either that name or an inline
+  `inspect.getsource(...)` call, however many statements apart. The glob
+  is now `rglob`, recursive into every subdirectory. Reapplying the exact
+  two-statement mutation (reverted, re-tested, re-restored) now fails the
+  checker; two new regression tests pin the two-statement shape and
+  subdirectory recursion directly against synthetic source, independent
+  of any real file. Docstring corrected to describe what the checker
+  actually catches, including the two prior holes by name.
+
+- **`cli.py`: `resume` had no exception handler at all, and its uncaught
+  failure exit code collided with a documented one** (external audit
+  finding CLOSE9-2 -- production-reachable, and CLOSE8-2's class in the
+  one command CLOSE8-2 didn't touch). `main` wrapped `check`/`run` in
+  multiple handlers, including CLOSE8-2's own catch-all, and wrapped
+  `load_config`/`BreakerStateStore.from_log`/`build_driver` -- but
+  `cmd_resume` was called bare, despite writing to disk via
+  `append_resume_record`. Reproduced with a real unprivileged user against
+  a real read-only decision-log file (`chmod 0o400`, no monkeypatching):
+  `PermissionError` tracebacked straight out of `cli.main`. Two things
+  were wrong, not one: a bare traceback contradicts `CliError`'s own
+  docstring ("never a traceback a cron job's error email has to
+  explain"), and Python's default exit code for an uncaught exception is
+  1 -- which this project's OWN exit-code map already assigns to "`check`
+  found a breach (or `resume` was refused)." An operator wrapper reading
+  exit 1 here would conclude the resume was refused when the write
+  actually failed entirely differently, confirmed with an injected
+  `OSError(ENOSPC)` too.
+
+  Fixed by wrapping `resume`'s `cmd_resume` call in the same broad
+  `except Exception` pattern `check`/`run` already have, mapping to exit
+  3 (documented as "a provider transport failure ... or a decision-log
+  write failure") -- never 1, so it can never be confused with a genuine
+  refusal. Then the class was re-run, per the round's own opening
+  instruction, over every `cli.main` command path, not just `resume`:
+  `build_driver(...)`'s own call sites for `check`/`run` were ALSO only
+  wrapped in `except CliError`, resting on a docstring-only contract that
+  it never raises anything else -- merged into the same shared try/except
+  as `cmd_check`/`cmd_run` (with `CliError` still checked first, exit
+  code unaffected) so a future driver constructor bug gets the same
+  safety net rather than a second, separate gap.
+
+  | Command | Shared pre-dispatch | Command-specific exception surface | Handling |
+  |---|---|---|---|
+  | `check` | `load_config` (`ConfigError`, exit 2); `BreakerStateStore.from_log` (`BreakerStateStoreLoadError`, exit 2) | `build_driver` (`CliError`, exit 2) and `cmd_check`/`evaluate_all_mailboxes` (`httpx.HTTPError`/`ProviderError`/`ValueError`/anything else, exit 3) -- one shared try/except (CLOSE9-2) | All mapped |
+  | `run` | same as `check` | same as `check`, plus `KeyboardInterrupt` (clean stop, exit 0) | All mapped |
+  | `status` | same as `check` | none -- `cmd_status` only reads `state_store` (already loaded) and prints; no external I/O of its own | Nothing to catch -- confirmed by test, not assumed |
+  | `resume` | same as `check` | `cmd_resume` -- `append_resume_record` writes to disk (`OSError` and subclasses: `PermissionError`, `ENOSPC`, ...) -- now wrapped (CLOSE9-2), exit 3 | All mapped |
+
+  Tests: the real read-only-file reproduction; an injected
+  `OSError(ENOSPC)`; and one property test per command (`check`, `run`,
+  `status`, `resume`) asserting no uncaught exception of any kind escapes
+  `cli.main`.
+
+- **`engine/breaker.py`, `cli.py`: one FAILED pause attempt permanently
+  disabled throttling for that mailbox** (external audit finding CLOSE9-1
+  -- a safety defect, not a consistency one; no permutation sweep could
+  ever see it, because the live path and `from_log` agreed at every step
+  and were simply both wrong). `mark_pause_failed` deliberately keeps
+  `throttled_at_limit` alive so the VERY NEXT evaluation stays idempotent
+  instead of re-halving (CLOSE-3c) -- correct advice for that one
+  evaluation. But nothing ever moved a mailbox OFF `PAUSE_FAILED` at all:
+  `cmd_resume` refused it (only `PAUSED`/`THROTTLED` were accepted), and
+  CLOSE-3b's sustained-OK recovery checked only `THROTTLED`. So the
+  "next evaluation" memo latched forever, and `_act`'s idempotency check
+  kept comparing every future breach against a limit from an episode that
+  could be arbitrarily far in the past.
+
+  Reproduction: throttle to 200, a pause attempt FAILS, thirty consecutive
+  healthy evaluations, then a fresh breach against a real, changed
+  operator daily limit (100, down from the stale 400 on file). Before the
+  fix: `_act` read this as "mailbox already throttled at this limit; no
+  action taken (idempotent)" and made ZERO real provider calls -- for a
+  mailbox that had been healthy for a month. After: a genuine
+  `throttle()` call.
+
+  Fixed two ways. (1) `cmd_resume` now accepts `PAUSE_FAILED` alongside
+  `PAUSED` and `THROTTLED` -- a human can unstick it immediately, the
+  refusal message now names what CAN be resumed instead of only what a
+  mailbox isn't. (2) `PAUSE_FAILED` now recovers automatically too:
+  `evaluate()`'s and `from_log`'s sustained-OK recovery check (CLOSE-3b)
+  now fires for `PAUSE_FAILED` the same as it already does for
+  `THROTTLED`, clearing both status and `throttled_at_limit`. This needed
+  a real policy decision, not just a bug fix -- `PAUSE_FAILED` means the
+  provider never actually stopped the mailbox, which is the same shape as
+  `THROTTLED` (a real action attempted, mailbox still live, eligible for
+  sustained recovery), not the same shape as `PAUSED` (a real action that
+  LANDED, human-gated on purpose by ADR 0003). See [ADR 0003's
+  2026-09-01 addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-09-01-a-failed-pause-attempt-was-a-permanent-latch-and-pause_failed-now-recovers-like-throttled-does)
+  for the full reasoning. CLOSE-3c's own property -- a failed pause must
+  not let the IMMEDIATELY NEXT throttle re-halve -- is untouched by
+  either change and still holds (confirmed by its own existing,
+  unmodified test).
+
+  New test class, not just new tests: a live-versus-SHOULD property
+  (`test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_
+  unactionable`), swept over every starting move in the permutation
+  sweep's own move set, asserting that thirty healthy evaluations after
+  ANY starting state leave the mailbox somewhere a provider action is
+  still reachable (`ACTIVE`, or `PAUSED` -- ADR 0003's own intentional
+  permanent state, always resumable by a human). This is a genuinely
+  different kind of test from every sweep in this project so far: it
+  doesn't compare two implementations against each other, it checks one
+  against what's actually correct -- see `tests/test_breaker.py`'s
+  blind-spot list, item 8, for why that distinction is the headline
+  lesson of this round.
+
 - **`tests/test_breaker.py`: the blind-spot list kept alive, item 3 marked
   closed rather than deleted** (CLOSE8-4). The list at
   `tests/test_breaker.py:1627` (round 7's own artifact) found CLOSE8-1
@@ -241,22 +411,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   | Driver | Read-path exception source | Where it lands |
   |---|---|---|
-  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) | `cli.main`'s existing `httpx.HTTPError` handler |
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and the `StreamError` family (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, a `RuntimeError`) [CORRECTED, CLOSE9-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
   | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
-  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers) | same two handlers |
-  | `lemlist.py` | same shape | same two handlers |
-  | `apollo.py` | same shape | same two handlers |
+  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers, same three-family gap) | same handlers |
+  | `lemlist.py` | same shape | same handlers |
+  | `apollo.py` | same shape | same handlers |
   | `ses.py` | `botocore.exceptions.ClientError`/`BotoCoreError` from `CloudWatchClient.get_metric_statistics` | translated to `RateLimitExceededError`/`ProviderError` at the driver boundary (CLOSE8-2, this entry) -- `cli.main`'s existing `ProviderError` handler |
   | `ses.py` | `botocore.exceptions.NoRegionError` at construction (`boto3.client(...)`, no region configured anywhere) | caught in `build_driver`, re-raised as `CliError` (CLOSE8-2) -- exit 2 |
   | `noop.py` | none -- no external client of any kind | n/a |
 
-  Every httpx-based driver was already safe -- confirmed, not assumed:
-  `httpx.HTTPError` is the base of both httpx exception families
-  (`RequestError` and `HTTPStatusError`), so `cli.main`'s existing handler
-  already covers every network/timeout/status failure those four drivers
-  can produce, and every parse failure already raises `MalformedResponseError`
-  via the shared `_parsing.py` helpers. `ses.py` -- the one driver with a
-  DIFFERENT client library underneath -- was the only real gap.
+  **Correction (CLOSE9-4):** this table originally claimed `httpx.HTTPError`
+  covers "what those drivers can raise" for all four `httpx`-based
+  drivers -- false. `httpx.InvalidURL` and `httpx.CookieConflict` are bare
+  `Exception` subclasses, not `httpx.HTTPError`; the `StreamError` family
+  is a `RuntimeError`. None of the three are reachable through this
+  project's own drivers today in practice (base URLs are hardcoded
+  constants, so `InvalidURL` in particular has no live path), and CLOSE8-2's
+  own catch-all DOES still turn all three into a clean exit 3 with no
+  traceback -- verified through a real `check` for `ConnectError`,
+  `InvalidURL`, `CookieConflict`, and `StreamConsumed` alike, all exit 3,
+  no traceback. But the message for the three uncovered families is the
+  GENERIC catch-all one, not the provider-specific "provider request
+  failed" this row's original wording implied, and the enumeration this
+  table exists to BE didn't itself hold up under its own standard (blind-
+  spot item 6: "enumerated ... BEFORE it ships, not after" -- this shipped
+  and missed three families). Left uncorrected in the handler itself
+  deliberately, not fixed: the fallthrough behavior is already correct
+  and safe, and this is a documentation-accuracy fix, not a functional
+  gap, per AGENTS.md's "no new features beyond what closes the finding."
 
   Also, per this round's own opening instruction, `cli.main` gained a
   final, broad `except Exception` around both `check`'s and `run`'s
@@ -319,7 +501,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `sends==0` or `complaints>sends`, not compliance-gated | untouched | untouched | untouched | dedicated `OK`+`INSUFFICIENT_DATA` elif -- untouched (agrees) |
   | `compliance_gate_tripped`, any `data_state` | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared (CLOSE8-1) | PAUSE branch -- status/limit via `action_outcome`, streak popped unconditionally (agrees, post-fix) |
   | Ladder PAUSE (raw breach, floor- or streak-escalated) | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared before `_act` runs | PAUSE branch (agrees) |
-  | Ladder THROTTLE, PERFORMED | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, PERFORMED -- a genuinely NEW throttle | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, PERFORMED -- `_act`'s limit-idempotent sub-case (CLOSE9-5 correction: this row didn't exist before, though the already-PAUSED sub-case two rows down got its own) | untouched -- `driver.throttle()` is never called | untouched, NOT "set to `current_daily_limit`" -- that's only true for a genuinely new throttle | cleared | THROTTLE/PERFORMED branch, `is_idempotent_replay` case (agrees) |
   | Ladder THROTTLE, UNSUPPORTED | untouched | untouched | incremented | THROTTLE/UNSUPPORTED branch (agrees) |
   | Ladder THROTTLE, FAILED | untouched | untouched | cleared | THROTTLE/FAILED branch (agrees) |
   | Ladder OK (sustained recovery from THROTTLED) | `mark_active` | cleared | cleared | OK-recovery elif (agrees) |
