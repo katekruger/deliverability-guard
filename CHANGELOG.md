@@ -157,6 +157,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`README.md`: the exit-code map had drifted stale** (external audit
+  finding CLOSE10-1). CLOSE9-2 updated `cli.py`'s module docstring and the
+  `--help` epilog to document exit 3 as also covering a decision-log
+  write failure, not just a provider transport failure -- `README.md:60`
+  was never touched, so a cron author reading only the README got `resume`
+  exiting 3 with no documented meaning for it. Brought back in sync.
+  `AGENTS.md` gained a new non-negotiable (project-specific #5): a
+  checkable fact restated in prose in more than one place will drift: pick
+  one source of truth and have the others point at it, the same lesson
+  `campaign-preflight` already encoded in its own `AGENTS.md`.
+
 - **`tests/test_breaker.py`: the blind-spot list kept alive again**
   (CLOSE9-5). Items 1, 2, 4, and 5 -- re-read with fresh eyes every round
   since CLOSE7-4 and left open each time -- were specific enough to be
