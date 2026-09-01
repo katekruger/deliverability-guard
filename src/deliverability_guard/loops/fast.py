@@ -172,6 +172,7 @@ def evaluate_all_mailboxes(
     cusum_threshold: float = DEFAULT_CUSUM_THRESHOLD,
     on_cusum_alarm: Callable[[MailboxRef, CusumResult], None] | None = None,
     compliance_gate_tripped_for: Callable[[MailboxRef], bool] | None = None,
+    on_evaluation: Callable[[BreakerEvaluation], None] | None = None,
 ) -> list[BreakerEvaluation]:
     """Pull every mailbox's stats since `since`, aggregate, and evaluate
     each one through the breaker -- building each mailbox's same-domain peer
@@ -211,32 +212,51 @@ def evaluate_all_mailboxes(
     setup (see `experimental.postmaster_coverage`'s own docstring for the
     same caveat about Postmaster ingestion generally). This closes the
     WIRING gap the chokepoint had; it is not, on its own, a live integration.
+
+    `on_evaluation`, when given, is called with each mailbox's
+    `BreakerEvaluation` immediately after `engine.breaker.evaluate` returns
+    it -- BEFORE moving on to the next mailbox in `totals` (CLOSE6-1). This
+    is the one place a caller can durably persist a decision record as it
+    happens rather than after the whole batch: `cli.cmd_check` and
+    `loops.controller.run`'s fast tick both used to evaluate every mailbox
+    first and append decision records in a SEPARATE loop afterward, so a
+    later mailbox's evaluation raising (e.g. a provider transport failure
+    mid-`pause()` call) meant NO record was written for any mailbox in that
+    tick -- including an earlier mailbox whose PAUSE had just been
+    genuinely confirmed at the provider. A confirmed PAUSE with no durable
+    record of it is exactly the gap ADR 0003's human-review gate exists to
+    close: without one, a subsequent evaluation has no way to know the
+    mailbox was ever paused, and can throttle or re-decide it as if
+    nothing had happened. `on_evaluation` runs even when a LATER mailbox's
+    evaluation goes on to raise, since Python evaluates loop bodies in
+    order and this call happens before the loop advances.
     """
     totals = aggregate_mailbox_stats(driver.read_mailbox_stats(since))
     peer_groups = _peer_groups(totals)
     results: list[BreakerEvaluation] = []
     for total in totals:
-        results.append(
-            evaluate(
-                driver=driver,
-                mailbox=total.mailbox,
-                sends=total.sends,
-                complaints=total.complaints,
-                prior=prior,
-                thresholds=thresholds,
-                state_store=state_store,
-                dry_run=dry_run,
-                now=now,
-                current_daily_limit=total.current_daily_limit,
-                peer_group=peer_groups[total.mailbox],
-                max_pooled_ess=max_pooled_ess,
-                compliance_gate_tripped=(
-                    compliance_gate_tripped_for(total.mailbox)
-                    if compliance_gate_tripped_for is not None
-                    else False
-                ),
-            )
+        result = evaluate(
+            driver=driver,
+            mailbox=total.mailbox,
+            sends=total.sends,
+            complaints=total.complaints,
+            prior=prior,
+            thresholds=thresholds,
+            state_store=state_store,
+            dry_run=dry_run,
+            now=now,
+            current_daily_limit=total.current_daily_limit,
+            peer_group=peer_groups[total.mailbox],
+            max_pooled_ess=max_pooled_ess,
+            compliance_gate_tripped=(
+                compliance_gate_tripped_for(total.mailbox)
+                if compliance_gate_tripped_for is not None
+                else False
+            ),
         )
+        results.append(result)
+        if on_evaluation is not None:
+            on_evaluation(result)
         if cusum_states is not None:
             trend = cusum_step(
                 cusum_states.get(total.mailbox, CusumState()),

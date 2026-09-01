@@ -160,9 +160,34 @@ def cmd_check(
     from config; CUSUM state starts fresh each invocation, since `check` is
     a one-shot process with nowhere to persist a running trend statistic
     between invocations -- `run` is where CUSUM accumulates real history).
+
+    Each mailbox's decision record is appended via `on_evaluation` --
+    immediately after THAT mailbox is evaluated, not in a separate loop
+    after every mailbox in the fleet has been (CLOSE6-1). Evaluating the
+    whole fleet first and appending records afterward meant a later
+    mailbox's evaluation raising (a provider transport failure, e.g. mid-
+    `pause()`) left NO record durable for the tick at all -- including an
+    earlier mailbox whose PAUSE had just been genuinely confirmed at the
+    provider, defeating ADR 0003's human-review gate from the other
+    direction the moment the process restarted.
     """
     since = now.date() - timedelta(days=1)
-    results = evaluate_all_mailboxes(
+    exit_code = _EXIT_OK
+    evaluated_any = False
+
+    def on_evaluation(result: BreakerEvaluation) -> None:
+        nonlocal exit_code, evaluated_any
+        evaluated_any = True
+        append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
+        print(
+            f"{result.mailbox.mailbox_id}: {result.verdict.name} "
+            f"(sends={result.sends}, complaints={result.complaints})",
+            file=out,
+        )
+        if result.verdict is not Verdict.OK:
+            exit_code = _EXIT_BREACH_OR_REFUSED
+
+    evaluate_all_mailboxes(
         driver=driver,
         since=since,
         prior=config.prior,
@@ -172,22 +197,12 @@ def cmd_check(
         now=now,
         max_pooled_ess=config.max_pooled_ess,
         cusum_states={},
+        on_evaluation=on_evaluation,
     )
 
-    if not results:
+    if not evaluated_any:
         print("no mailboxes reported any stats", file=out)
         return _EXIT_OK
-
-    exit_code = _EXIT_OK
-    for result in results:
-        append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
-        print(
-            f"{result.mailbox.mailbox_id}: {result.verdict.name} "
-            f"(sends={result.sends}, complaints={result.complaints})",
-            file=out,
-        )
-        if result.verdict is not Verdict.OK:
-            exit_code = _EXIT_BREACH_OR_REFUSED
     return exit_code
 
 
@@ -211,11 +226,24 @@ def cmd_run(
     until the caller interrupts it -- `main` catches `KeyboardInterrupt`
     around this call so Ctrl-C is a clean shutdown, not a traceback. Tests
     pass a small `max_ticks` instead of relying on an interrupt.
+
+    Each mailbox's decision record is appended via `on_evaluation`, not
+    `on_fast_tick` (CLOSE6-1): `on_fast_tick` only runs once a whole tick's
+    batch of mailboxes has finished evaluating, so if a later mailbox in
+    the same tick raises (a provider transport failure), `on_fast_tick`
+    never runs at all for that tick -- losing the decision record for
+    every mailbox already evaluated, including one whose PAUSE the
+    provider had just genuinely confirmed. `on_evaluation` runs per
+    mailbox, immediately, so an earlier mailbox's record survives a later
+    one's failure. `on_fast_tick` is kept for its per-tick `[fast] ...`
+    console summary only.
     """
+
+    def on_evaluation(result: BreakerEvaluation) -> None:
+        append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
 
     def on_fast_tick(results: list[BreakerEvaluation]) -> None:
         for result in results:
-            append_record(config.decision_log_path, DecisionRecord.from_evaluation(result))
             print(
                 f"[fast] {result.mailbox.mailbox_id}: {result.verdict.name} "
                 f"(sends={result.sends}, complaints={result.complaints})",
@@ -237,6 +265,7 @@ def cmd_run(
         sleep=sleep,
         max_ticks=max_ticks,
         max_pooled_ess=config.max_pooled_ess,
+        on_evaluation=on_evaluation,
         on_fast_tick=on_fast_tick,
         on_slow_tick=on_slow_tick,
     )

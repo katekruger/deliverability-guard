@@ -157,6 +157,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: a confirmed PAUSE could be discarded if a later mailbox in
+  the same batch failed** (external audit finding CLOSE6-1). `cmd_check`
+  evaluated the whole fleet via `loops.fast.evaluate_all_mailboxes` and
+  only THEN appended a decision record per mailbox, in a second loop;
+  `cmd_run`'s fast tick had the identical shape via `on_fast_tick`, which
+  only runs once a whole tick's batch has finished. If any mailbox's
+  evaluation raised after an earlier mailbox was genuinely paused at the
+  provider (a transport failure, e.g. mid-`pause()`), no record was
+  written for ANY mailbox in that batch or tick — including the confirmed
+  PAUSE. A subsequent `check` then had no way to know that mailbox was
+  ever paused, and if its evidence had since drifted into the THROTTLE
+  band, issued a REAL `driver.throttle()` call against it — defeating ADR
+  0003's human-review gate from the other direction. Reproduction: two
+  same-domain mailboxes, the second mailbox's `pause()` raising
+  `RateLimitExceededError` after the first mailbox's `pause()` genuinely
+  succeeded — before this fix, `check` exited 3 with a zero-byte decision
+  log and the first mailbox's confirmed PAUSE nowhere recorded; a
+  follow-up `check` against drifted evidence then issued a real
+  `driver.throttle()` call on it. `loops.fast.evaluate_all_mailboxes`
+  gained `on_evaluation`, called with each mailbox's `BreakerEvaluation`
+  immediately after that mailbox is evaluated — not after the batch —
+  threaded through `loops.controller.run` alongside the existing
+  `on_fast_tick`. `cmd_check` and `cmd_run` now append each decision
+  record from `on_evaluation`; `on_fast_tick` is kept for its per-tick
+  console summary only. Exit code 3 for the transport failure itself is
+  unchanged — a partial batch that persisted correctly is still a failed
+  run.
+
 - **`engine/breaker.py`: a PAUSED mailbox auto-un-paused through THROTTLE
   then OK, with no human review** (external audit finding CLOSE5-1 — the
   serious one). `_act`'s THROTTLE branch never consulted `state_store.

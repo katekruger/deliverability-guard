@@ -206,6 +206,215 @@ def test_check_appends_a_decision_record_per_mailbox(tmp_path: Path) -> None:
     assert records[0].verdict is Verdict.OK
 
 
+# --- CLOSE6-1: a decision record must be durable before the next mailbox's
+# provider action, not written in a second loop after the whole batch -----
+
+
+class _PauseFailsOnNthCallDriver:
+    """A driver whose Nth `pause()` call (1-indexed, across ALL mailboxes)
+    raises a transport-level error instead of returning -- standing in for
+    a real provider connection dropping partway through a multi-mailbox
+    batch, without any actual network access. Earlier and later `pause()`
+    calls succeed normally, `PERFORMED`."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS, Capability.PAUSE, Capability.THROTTLE})
+
+    def __init__(
+        self, stats_to_return: list[MailboxDayStats], *, raise_on_call: int, exc: Exception
+    ) -> None:
+        self.stats_to_return = stats_to_return
+        self._raise_on_call = raise_on_call
+        self._exc = exc
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.throttle_calls: list[tuple[str, int]] = []
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        return self.stats_to_return
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        if len(self.pause_calls) == self._raise_on_call:
+            raise self._exc
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def test_check_persists_an_earlier_confirmed_pause_when_a_later_mailbox_transport_fails(
+    tmp_path: Path,
+) -> None:
+    """CLOSE6-1's reproduction: `cmd_check` used to evaluate the whole
+    fleet and only THEN append decision records in a second loop. If any
+    mailbox's evaluation raised after an earlier mailbox was genuinely
+    paused at the provider, no record was written for ANY mailbox --
+    including the confirmed PAUSE. A subsequent `check` would then have no
+    way to know mailbox A was ever paused, and could throttle it for real
+    if its evidence had since drifted into the THROTTLE band -- defeating
+    ADR 0003's human-review gate from the other direction."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=2, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_check(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            now=_NOW,
+            out=io.StringIO(),
+        )
+
+    assert [c.mailbox_id for c in driver.pause_calls] == ["a@example.com", "b@example.com"]  # type: ignore[union-attr]
+
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) == 1
+    assert records[0].mailbox_id == "a@example.com"
+    assert records[0].verdict is Verdict.PAUSE
+    assert records[0].action_outcome is ActionOutcome.PERFORMED
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox_a) == MailboxBreakerStatus.PAUSED
+
+    # The follow-up check: mailbox A's evidence has since drifted into the
+    # THROTTLE band. A must stay behind the human-review gate -- no real
+    # throttle call against it.
+    second_driver = FakeDriver(stats_to_return=[_stats(mailbox_a, date(2026, 1, 1), 1000, 5)])
+    cmd_check(
+        driver=second_driver,
+        config=config,
+        state_store=restored,
+        now=_NOW + timedelta(days=1),
+        out=io.StringIO(),
+    )
+    assert second_driver.throttle_calls == []
+    assert restored.status_of(mailbox_a) == MailboxBreakerStatus.PAUSED
+
+
+def test_check_persists_the_first_two_mailboxes_when_the_third_fails(tmp_path: Path) -> None:
+    """The three-mailbox variant: a failure on the LAST mailbox in a batch
+    of three must still leave the first two durably recorded."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailboxes = [
+        MailboxRef(provider="fake", mailbox_id=f"{letter}@example.com") for letter in "abc"
+    ]
+    stats = [_stats(m, date(2025, 12, 31), 5000, 40) for m in mailboxes]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=3, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_check(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            now=_NOW,
+            out=io.StringIO(),
+        )
+
+    records = read_records(log_path)
+    assert [r.mailbox_id for r in records] == ["a@example.com", "b@example.com"]
+    assert all(r.verdict is Verdict.PAUSE for r in records)
+
+
+def test_run_fast_tick_persists_an_earlier_confirmed_pause_when_a_later_mailbox_fails(
+    tmp_path: Path,
+) -> None:
+    """Same reproduction, through `cmd_run`'s fast tick: `on_fast_tick`
+    only fires after a WHOLE tick's batch finishes, so before CLOSE6-1
+    `cmd_run` had the identical bug -- a later mailbox's failure meant no
+    record was appended for the tick at all."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=2, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_run(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            threshold_store=ThresholdStore(config.thresholds),
+            now=lambda: _NOW,
+            sleep=lambda _seconds: None,
+            out=io.StringIO(),
+            max_ticks=1,
+        )
+
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) == 1
+    assert records[0].mailbox_id == "a@example.com"
+    assert records[0].verdict is Verdict.PAUSE
+
+
+def test_main_check_exit_code_3_is_unchanged_when_an_earlier_mailbox_was_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial batch that persisted correctly is still a failed run --
+    exit code 3, exactly as an all-or-nothing transport failure already
+    produces."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    driver = _PauseFailsOnNthCallDriver(
+        stats, raise_on_call=2, exc=RateLimitExceededError("429s all the way down")
+    )
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
 # --- status -------------------------------------------------------------
 
 
