@@ -157,6 +157,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: a WARN record could un-pause a mailbox, and
+  nothing would fail** (external audit finding CLOSE6-2). The code itself
+  was correct; the invariant guarding it was not. Two gaps: (1) `WARN` and
+  `PAUSE_FAILED` were absent from `tests/test_breaker.py`'s permutation
+  sweep (`_PERMUTATION_MOVES`) -- the two-line mutation `if record.verdict
+  is Verdict.WARN: status[mailbox] = MailboxBreakerStatus.ACTIVE` in
+  `from_log`'s final `else` passed the full suite, ruff, and pyright clean.
+  Adding both moves (343 -> 729 three-move sequences) makes that exact
+  mutation fail 50 of them. (2) `test_only_resume_after_human_review_
+  moves_paused_back_to_active`'s NAME claimed exclusivity but its body only
+  asserted resume works; added the other half
+  (`..._exclusivity`, parametrized over every non-RESUME move, driven
+  entirely through the live path) so the claim its own name makes is
+  actually checked. Separately, and unrelated to either test gap:
+  `from_log`'s PAUSE `UNSUPPORTED`/`FAILED` branches had no already-PAUSED
+  guard, unlike `_act`'s own live-path PAUSE branch, which short-circuits
+  to an idempotent PERFORMED result before ever calling `driver.pause()`
+  again once a mailbox is PAUSED -- meaning `_act` can never itself
+  PRODUCE an UNSUPPORTED or FAILED PAUSE outcome for an already-PAUSED
+  mailbox. The live path (and therefore the permutation sweep, which only
+  ever drives `evaluate()`) can't reach this sequence at all; a
+  hand-edited, merged, or restored-from-backup log can, and replaying one
+  silently un-paused a mailbox with no `ResumeRecord` anywhere in the log.
+  Fixed by adding the same already-PAUSED guard the THROTTLE/PERFORMED
+  branch already has (CLOSE5-1), verified with two new tests that build
+  the adversarial log directly (`_apply_move`/`evaluate()` structurally
+  cannot construct it). Also: `pyproject.toml` gained `fail_under = 100`
+  under `[tool.coverage.report]` -- this repo's headline "100% branch
+  coverage" claim had no floor enforcing it; the WARN mutation above drops
+  coverage to 99% and the suite stayed green without this.
+
 - **`cli.py`: a confirmed PAUSE could be discarded if a later mailbox in
   the same batch failed** (external audit finding CLOSE6-1). `cmd_check`
   evaluated the whole fleet via `loops.fast.evaluate_all_mailboxes` and

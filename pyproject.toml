@@ -116,3 +116,9 @@ branch = true
 [tool.coverage.report]
 exclude_lines = ["pragma: no cover", "if TYPE_CHECKING:", "\\.\\.\\."]
 show_missing = true
+# CLOSE6-2: this repo's headline quality signal has been "100% branch
+# coverage" for four audit rounds running, but nothing enforced it -- a
+# regression that dropped coverage still passed CI green. Gate on it for
+# real. This is a floor this project actually intends to hold, not a
+# convention.
+fail_under = 100

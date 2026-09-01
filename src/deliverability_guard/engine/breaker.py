@@ -222,6 +222,20 @@ class BreakerStateStore:
         `throttled_at_limit`), which is a different bug from "should not
         have changed state at all."
 
+        CLOSE6-2 added a guard the PAUSE `UNSUPPORTED`/`FAILED` branches
+        never had: once a mailbox's status entering one of those records is
+        already PAUSED, that record is left with no effect, mirroring
+        `_act`'s own already-PAUSED short-circuit -- `_act`'s PAUSE branch
+        can never itself PRODUCE a FAILED or UNSUPPORTED outcome for an
+        already-PAUSED mailbox, so a record claiming one can only come from
+        a log that's been hand-edited, merged, or restored from a stale
+        backup. Before this guard, replaying such a record silently
+        un-paused a mailbox behind ADR 0003's human-review gate with no
+        `ResumeRecord` anywhere in the log -- not reachable through the
+        live path this repo's own CLI can produce, but very much something
+        an operator inspecting or repairing a JSONL file by hand could
+        produce.
+
         `path` not existing at all means there is genuinely no history yet
         (a brand-new deployment) -- returns an empty store, where every
         mailbox correctly defaults to ACTIVE. `path` existing but failing to
@@ -316,6 +330,26 @@ class BreakerStateStore:
             if record.verdict is Verdict.PAUSE:
                 if record.action_outcome is ActionOutcome.PERFORMED:
                     status[mailbox] = MailboxBreakerStatus.PAUSED
+                elif status.get(mailbox) is MailboxBreakerStatus.PAUSED:
+                    # CLOSE6-2: `_act`'s PAUSE branch short-circuits to an
+                    # idempotent PERFORMED result the instant a mailbox is
+                    # already PAUSED -- it never calls `driver.pause()`
+                    # again, so it can never itself produce a FAILED or
+                    # UNSUPPORTED PAUSE record for a mailbox that's already
+                    # PAUSED. The FAILED and UNSUPPORTED branches just below
+                    # therefore have no live-path analogue to mirror once a
+                    # PAUSE/PERFORMED record for this mailbox has already
+                    # been replayed -- unlike the THROTTLE/PERFORMED branch
+                    # below, which DOES have to handle exactly this
+                    # already-PAUSED case, because `_act`'s THROTTLE branch
+                    # (CLOSE5-1) can genuinely still emit one. A log
+                    # containing such a record here can only be hand-edited,
+                    # merged, or restored from a stale backup -- and
+                    # replaying it must not silently un-pause a mailbox
+                    # behind ADR 0003's human-review gate just because the
+                    # record's own outcome claims otherwise. Leave status
+                    # (and `throttled_at_limit`) exactly as they are.
+                    pass
                 elif record.action_outcome is ActionOutcome.FAILED:
                     # Mirrors `_act`'s live-path distinction (CLOSE-3c): a
                     # FAILED pause is not "verified healthy."
