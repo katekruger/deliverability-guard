@@ -234,6 +234,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   verb) pairs each driver structurally declines, so it never makes a live
   call against the capabilities the HTTP-backed drivers actually implement.
 
+- **The log-growth cycle on a paused mailbox** (external audit finding
+  CLOSE5-4 — verified, not assumed, to be a side effect of CLOSE5-1's fix
+  rather than a separate defect). Before CLOSE5-1, ten consecutive `check`
+  processes against a provider with no daily limit escalated to PAUSE,
+  un-paused via the CLOSE5-1 bug, and re-escalated with period 4 forever —
+  a real provider `pause()` call every four runs, and an unbounded, cyclic
+  decision log. Re-running the same ten-process harness after CLOSE5-1:
+  the mailbox reaches PAUSED once and stays there, with exactly one real
+  provider `pause()` call — the cycle is gone, as a direct consequence of
+  the mailbox's status no longer being un-paused mid-cycle. The log still
+  grows one record per `check` invocation (a defensible audit trail, per
+  the finding's own framing), but every record for an already-PAUSED
+  mailbox now carries CLOSE5-1's own "mailbox is paused; ... refused
+  pending human review" detail rather than reporting a bare, unexplained
+  `THROTTLE` — an honest record, not a misleading one.
+
 - **`README.md`: the capability matrix's "campaign only" pause marks
   described driver-API surface the breaker itself never reaches** (external
   audit finding CLOSE4-3, a documentation decision rather than a bug).

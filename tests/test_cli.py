@@ -995,6 +995,37 @@ def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
     assert driver.throttle_calls == []  # current_daily_limit is always None -- never a real call
 
 
+def test_ten_separate_check_invocations_after_pause_write_an_honest_already_paused_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE5-4: verified rather than assumed. Before CLOSE5-1's fix, the
+    verdict cycle after escalation ran forever (a real `pause()` call every
+    four runs) and each record for a PAUSED mailbox reported a bare
+    `THROTTLE` verdict with no indication anything was refused -- exactly
+    what CLOSE5-4 worried an operator tailing cron mail would see. Neither
+    is true anymore: every record recorded for the mailbox once it's PAUSED
+    carries CLOSE5-1's own "mailbox is paused; ... refused pending human
+    review" detail, an honest record rather than a bare, unexplained
+    THROTTLE."""
+    driver = _NoLimitDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _NoLimitDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(10):
+        main(["--config", str(config_path), "check"])
+
+    records = read_records(tmp_path / "decisions.jsonl")
+    post_pause_records = records[4:]  # runs 5-10, after run 4's escalation to PAUSE
+    assert len(post_pause_records) == 6
+    for record in post_pause_records:
+        assert record.action_detail is not None
+        assert "paused" in record.action_detail
+
+
 def test_from_log_restart_between_tick_one_and_two_is_a_no_op(tmp_path: Path) -> None:
     """A restart between the very first throttle and the second identical
     evaluation specifically: tick 2 must be idempotent, not a fresh
