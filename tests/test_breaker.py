@@ -1,6 +1,7 @@
 """Tests for engine/breaker.py: the ladder, idempotent pause, and dry-run identity."""
 
 import dataclasses
+import itertools
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -320,14 +321,18 @@ def test_state_store_from_log_bounds_repeated_unsupported_throttle_records(
     log_path = tmp_path / "decisions.jsonl"
     driver = FakeDriver(throttle_outcome=ActionOutcome.UNSUPPORTED)
     for _ in range(10):
+        # CLOSE4-2: all ten iterations run, unconditionally -- unattended
+        # re-running is exactly the documented deployment (`check` is "the
+        # smallest thing you can put in cron," and nobody watches cron).
+        # Breaking out early on PAUSED status used to be the only thing
+        # standing between this test and CLOSE4-1's bug: once escalated to
+        # PAUSE, a THROTTLE/UNSUPPORTED record replayed afterward used to
+        # un-pause the mailbox, and the very next tick would throttle-escalate
+        # and pause it AGAIN -- a real provider call every four runs, forever,
+        # not the one call this test now proves happens.
         state_store = (
             BreakerStateStore.from_log(log_path) if log_path.exists() else BreakerStateStore()
         )
-        if state_store.status_of(_MAILBOX) is MailboxBreakerStatus.PAUSED:
-            # An operator would investigate a PAUSED mailbox, not keep
-            # re-running `check` against it unattended -- the point already
-            # made is that escalation happened well before ten runs.
-            break
         result = evaluate(
             driver=driver,
             mailbox=_MAILBOX,
@@ -350,6 +355,11 @@ def test_state_store_from_log_bounds_repeated_unsupported_throttle_records(
     ]
     assert len(unsupported_throttle_records) < 10
     assert BreakerStateStore.from_log(log_path).status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+    # CLOSE4-1/CLOSE4-2: once escalated to PAUSE, a THROTTLE/UNSUPPORTED
+    # record replayed afterward must never un-pause the mailbox -- so
+    # exactly ONE real provider pause call happens across all ten runs,
+    # not one every time the streak re-crosses the bound.
+    assert driver.pause_calls == [_MAILBOX]
 
 
 # --- Idempotency: THROTTLE, keyed on the verdict, not the limit ------------
@@ -1342,6 +1352,186 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_later_healthy
 
     restored = BreakerStateStore.from_log(log_path)
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_unsupported_throttle(
+    tmp_path: Path,
+) -> None:
+    """CLOSE4-1: on the live path, `_act`'s THROTTLE branch never touches
+    `state_store` when the outcome is UNSUPPORTED (no `mark_active` call
+    anywhere in that branch) -- so a PAUSED mailbox whose current daily
+    limit later reads as unknown stays PAUSED. `from_log` used to
+    unconditionally set `status[mailbox] = ACTIVE` for this outcome,
+    un-pausing a mailbox the ladder is supposed to leave behind the
+    human-review gate (ADR 0003) until a human calls `resume`."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    pause_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(pause_eval))
+    assert pause_eval.verdict is Verdict.PAUSE
+    assert pause_eval.action is not None
+    assert pause_eval.action.outcome is ActionOutcome.PERFORMED
+
+    unsupported_throttle_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=None,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(unsupported_throttle_eval))
+    assert unsupported_throttle_eval.verdict is Verdict.THROTTLE
+    assert unsupported_throttle_eval.action is not None
+    assert unsupported_throttle_eval.action.outcome is ActionOutcome.UNSUPPORTED
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+    # The streak still increments -- CLOSE3-2's escalation must not be lost
+    # by fixing CLOSE4-1.
+    assert restored.unsupported_throttle_streak(_MAILBOX) == 1
+
+
+def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_failed_throttle(
+    tmp_path: Path,
+) -> None:
+    """Same bug, the neighbouring branch: `_act`'s THROTTLE branch only
+    calls `mark_throttled` on a PERFORMED outcome -- a FAILED throttle
+    (the driver itself rejected the call) never touches `state_store`
+    either."""
+    log_path = tmp_path / "decisions.jsonl"
+    driver = FakeDriver()
+    pause_eval = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(pause_eval))
+
+    failed_driver = FakeDriver(throttle_outcome=ActionOutcome.FAILED)
+    failed_throttle_eval = evaluate(
+        driver=failed_driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(failed_throttle_eval))
+    assert failed_throttle_eval.verdict is Verdict.THROTTLE
+    assert failed_throttle_eval.action is not None
+    assert failed_throttle_eval.action.outcome is ActionOutcome.FAILED
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+_PERMUTATION_MOVES = (
+    "PAUSE_PERFORMED",
+    "THROTTLE_PERFORMED",
+    "THROTTLE_UNSUPPORTED",
+    "THROTTLE_FAILED",
+    "OK",
+    "RESUME",
+)
+
+
+def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> None:
+    """Apply one move to `state_store` via a real `evaluate()` call (or, for
+    RESUME, `resume_after_human_review`), appending exactly the record the
+    live path itself would append. Shared verbatim between the live
+    reference sequence and the sequence being replayed into the log --
+    the only difference between the two is WHEN `from_log` rebuilds from
+    those records, never what produced them."""
+    if move == "RESUME":
+        state_store.resume_after_human_review(_MAILBOX)
+        append_resume_record(
+            log_path,
+            ResumeRecord(
+                resumed_at=_NOW,
+                provider=_MAILBOX.provider,
+                mailbox_id=_MAILBOX.mailbox_id,
+                resumed_by="kate",
+            ),
+        )
+        return
+
+    driver_kwargs: dict[str, object] = {}
+    eval_kwargs: dict[str, object] = {"sends": 5000, "complaints": 40}
+    if move == "PAUSE_PERFORMED":
+        driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 5000, "complaints": 40}
+    elif move == "THROTTLE_PERFORMED":
+        driver_kwargs = {"throttle_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": 100}
+    elif move == "THROTTLE_UNSUPPORTED":
+        eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": None}
+    elif move == "THROTTLE_FAILED":
+        driver_kwargs = {"throttle_outcome": ActionOutcome.FAILED}
+        eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": 100}
+    elif move == "OK":
+        eval_kwargs = {"sends": 5000, "complaints": 0}
+    else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES
+        raise AssertionError(f"unhandled move {move!r}")
+
+    driver = FakeDriver(**driver_kwargs)  # type: ignore[arg-type]
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        **eval_kwargs,  # type: ignore[arg-type]
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+
+@pytest.mark.parametrize("sequence", list(itertools.permutations(_PERMUTATION_MOVES)))
+def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
+    sequence: tuple[str, ...], tmp_path: Path
+) -> None:
+    """The invariant CLOSE4-1's bug violated, tested directly rather than
+    via one or two hand-picked sequences: replaying the decision log must
+    always reproduce the SAME status a single uninterrupted in-process run
+    through the identical sequence of evaluations would have reached.
+    Every permutation of (PAUSE/PERFORMED, THROTTLE/PERFORMED,
+    THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME) is tried -- 720
+    orderings, each applied once to a live `state_store` and once (via the
+    same calls, writing to the same log) followed by a fresh
+    `BreakerStateStore.from_log` rebuild at the very end."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    for move in sequence:
+        _apply_move(move, live_store, log_path)
+
+    replayed_store = BreakerStateStore.from_log(log_path)
+    assert replayed_store.status_of(_MAILBOX) == live_store.status_of(_MAILBOX), sequence
 
 
 def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(

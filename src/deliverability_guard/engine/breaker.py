@@ -194,7 +194,20 @@ class BreakerStateStore:
     @classmethod
     def from_log(cls, path: Path) -> "BreakerStateStore":
         """Rebuild pause/throttle state by replaying `audit.log`'s decision
-        records in order, most-recent-wins per mailbox.
+        records in order. NOT simple most-recent-wins (CLOSE4-1): the
+        governing rule is that a record whose action did not actually touch
+        the real provider must not change state either, exactly mirroring
+        `_act`'s own live-path behavior for that same outcome. Getting this
+        wrong is subtle -- three of `_act`'s branches (THROTTLE/UNSUPPORTED,
+        THROTTLE/FAILED, and a THROTTLE/PERFORMED that was actually `_act`'s
+        own idempotent no-op) never touch `state_store` on the live path,
+        and replaying any of them as if they had un-paused a mailbox a
+        `PAUSE`/`PERFORMED` record earlier in the log had put behind the
+        human-review gate (ADR 0003). `tests/test_breaker.py`'s
+        `test_from_log_replay_matches_the_live_path_over_every_move_ordering`
+        checks this invariant directly, over every ordering of a small move
+        set, rather than only the specific sequences that have already been
+        found broken.
 
         `path` not existing at all means there is genuinely no history yet
         (a brand-new deployment) -- returns an empty store, where every
@@ -295,30 +308,72 @@ class BreakerStateStore:
                     # FAILED pause is not "verified healthy."
                     status[mailbox] = MailboxBreakerStatus.PAUSE_FAILED
                 else:
+                    # UNSUPPORTED. Unlike THROTTLE's UNSUPPORTED/FAILED
+                    # branches below (CLOSE4-1), this unconditional ACTIVE
+                    # DOES mirror the live path: `_act`'s PAUSE branch calls
+                    # `state_store.mark_active` unconditionally for a
+                    # definitively-UNSUPPORTED pause ("no reason to treat
+                    # this mailbox as anything but pristine going forward").
+                    # It's also structurally unreachable from an
+                    # already-PAUSED mailbox either way -- `_act`'s PAUSE
+                    # branch short-circuits to an idempotent PERFORMED
+                    # result BEFORE ever calling the driver when status is
+                    # already PAUSED, so a genuinely-PAUSED mailbox can
+                    # never produce a fresh PAUSE/UNSUPPORTED record.
                     status[mailbox] = MailboxBreakerStatus.ACTIVE
                 unsupported_streak.pop(mailbox, None)
             elif record.verdict is Verdict.THROTTLE:
                 if record.action_outcome is ActionOutcome.PERFORMED:
-                    status[mailbox] = MailboxBreakerStatus.THROTTLED
-                    if record.applied_daily_limit is not None:
-                        throttled_at_limit[mailbox] = record.applied_daily_limit
+                    # A PERFORMED throttle can itself be `_act`'s idempotent
+                    # no-op ("mailbox already throttled at this limit; no
+                    # action taken") -- which, like UNSUPPORTED/FAILED just
+                    # below, never touches `state_store` on the live path,
+                    # so it must not overwrite a PAUSED status here either.
+                    # It's distinguishable from a GENUINE throttle purely
+                    # from the records replayed so far: `_act` only reaches
+                    # its idempotent branch when a limit is already
+                    # recorded and this record's `applied_daily_limit`
+                    # doesn't exceed it (mirroring the live check
+                    # `current_daily_limit <= recorded_limit` in `_act`) --
+                    # a genuine throttle always either sets the limit for
+                    # the first time (nothing recorded yet) or records a
+                    # STRICTLY larger one (`_act` only falls through to a
+                    # real `driver.throttle()` call when
+                    # `current_daily_limit > recorded_limit`).
+                    previously_recorded_limit = throttled_at_limit.get(mailbox)
+                    is_idempotent_replay = (
+                        previously_recorded_limit is not None
+                        and record.applied_daily_limit is not None
+                        and record.applied_daily_limit <= previously_recorded_limit
+                    )
+                    if not is_idempotent_replay:
+                        status[mailbox] = MailboxBreakerStatus.THROTTLED
+                        if record.applied_daily_limit is not None:
+                            throttled_at_limit[mailbox] = record.applied_daily_limit
                     unsupported_streak.pop(mailbox, None)
                 elif record.action_outcome is ActionOutcome.UNSUPPORTED:
-                    # CLOSE3-2: a provider that structurally can't execute
-                    # this throttle (or whose `current_daily_limit` is
-                    # unknown) never marks the mailbox THROTTLED -- same as
-                    # the live path (`_act` never calls `mark_throttled` for
-                    # an UNSUPPORTED outcome) -- but the streak of how many
-                    # times in a row this has happened DOES persist, so a
-                    # process that restarts between every evaluation still
-                    # escalates to PAUSE after a bounded number, instead of
-                    # resetting the count on every single restart.
-                    status[mailbox] = MailboxBreakerStatus.ACTIVE
-                    throttled_at_limit.pop(mailbox, None)
+                    # CLOSE4-1: unlike PAUSE's UNSUPPORTED branch above,
+                    # `_act`'s THROTTLE branch does NOT call `mark_active` --
+                    # or touch `state_store` at all -- when the outcome is
+                    # UNSUPPORTED (missing `current_daily_limit`, or a
+                    # driver with no throttle primitive). A record that did
+                    # not act must not change status or `throttled_at_limit`
+                    # here either: this used to unconditionally reset both
+                    # to ACTIVE/cleared, silently un-pausing a mailbox that
+                    # a PAUSE/PERFORMED record earlier in the log had put
+                    # behind the human-review gate (ADR 0003). Only the
+                    # streak of consecutive UNSUPPORTED throttles (CLOSE3-2)
+                    # is genuinely tracked outside `state_store`'s
+                    # status/limit, so only it changes here.
                     unsupported_streak[mailbox] = unsupported_streak.get(mailbox, 0) + 1
                 else:  # FAILED
-                    status[mailbox] = MailboxBreakerStatus.ACTIVE
-                    throttled_at_limit.pop(mailbox, None)
+                    # Same reasoning as UNSUPPORTED just above: `_act` only
+                    # calls `mark_throttled` on a PERFORMED outcome, so a
+                    # FAILED throttle leaves status/throttled_at_limit alone
+                    # on the live path too. The streak DOES reset here,
+                    # mirroring `evaluate()`'s own
+                    # `clear_unsupported_throttle_streak` call for a FAILED
+                    # throttle outcome.
                     unsupported_streak.pop(mailbox, None)
             elif (
                 record.verdict is Verdict.OK
