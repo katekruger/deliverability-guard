@@ -938,6 +938,28 @@ def test_evaluate_never_calls_resume_after_human_review() -> None:
     )
 
 
+def test_dry_run_parameter_has_no_default_on_evaluate_or_act() -> None:
+    """CLOSE6-3: README.md's own claim -- 'no code path can pause or
+    throttle without `dry_run=False`, set on purpose' -- had no signature
+    guard, despite `tests/test_slow_loop.py`'s
+    `test_tune_thresholds_signature_has_no_capability_carrying_parameter`
+    already using exactly this `inspect.signature` idiom for a different
+    claim in this repo. `evaluate`'s and `_act`'s own docstrings already
+    say `dry_run` has no default so every call site must decide
+    explicitly -- this is that claim, checked."""
+    import inspect
+
+    from deliverability_guard.engine import breaker as breaker_module
+
+    evaluate_signature = inspect.signature(breaker_module.evaluate)
+    assert evaluate_signature.parameters["dry_run"].default is inspect.Parameter.empty
+
+    act_signature = inspect.signature(
+        breaker_module._act  # pyright: ignore[reportPrivateUsage]
+    )
+    assert act_signature.parameters["dry_run"].default is inspect.Parameter.empty
+
+
 # --- Dry-run identity -------------------------------------------------------
 
 
@@ -1547,10 +1569,12 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",
     "PAUSE_UNSUPPORTED",
+    "PAUSE_FAILED",
     "THROTTLE_PERFORMED",
     "THROTTLE_UNSUPPORTED",
     "THROTTLE_FAILED",
     "OK",
+    "WARN",
     "RESUME",
 )
 
@@ -1583,6 +1607,9 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
     elif move == "PAUSE_UNSUPPORTED":
         driver_kwargs = {"pause_outcome": ActionOutcome.UNSUPPORTED}
         eval_kwargs = {"sends": 5000, "complaints": 40}
+    elif move == "PAUSE_FAILED":
+        driver_kwargs = {"pause_outcome": ActionOutcome.FAILED}
+        eval_kwargs = {"sends": 5000, "complaints": 40}
     elif move == "THROTTLE_PERFORMED":
         driver_kwargs = {"throttle_outcome": ActionOutcome.PERFORMED}
         eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": 100}
@@ -1593,6 +1620,12 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         eval_kwargs = {"sends": 20_000, "complaints": 30, "current_daily_limit": 100}
     elif move == "OK":
         eval_kwargs = {"sends": 5000, "complaints": 0}
+    elif move == "WARN":
+        # Handcrafted to land in the warn band, same as
+        # test_warn_verdict_takes_no_provider_action -- WARN never reaches
+        # `_act`, so it must leave an already-PAUSED (or any other) status
+        # untouched on the live path.
+        eval_kwargs = {"sends": 20_000, "complaints": 20}
     else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES
         raise AssertionError(f"unhandled move {move!r}")
 
@@ -1635,8 +1668,9 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     `itertools.product(moves, repeat=3)` rather than `permutations` --
     CLOSE5-2 was found only once repeated moves were covered (`permutations`
-    never repeats an element), and 3 moves at a time keeps the sweep at 343
-    sequences (7 moves) rather than needing all 7 in every sequence."""
+    never repeats an element), and 3 moves at a time keeps the sweep at 729
+    sequences (9 moves, CLOSE6-2 added `PAUSE_FAILED` and `WARN`) rather than
+    needing all 9 in every sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
@@ -1644,6 +1678,111 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE6-2: a hand-edited/merged/restored log must not un-pause -------
+#
+# The live path itself can NEVER produce a PAUSE/UNSUPPORTED or
+# PAUSE/FAILED record for an already-PAUSED mailbox: `_act`'s PAUSE branch
+# short-circuits to an idempotent PERFORMED result before ever calling
+# `driver.pause()` again once a mailbox is PAUSED, so `_apply_move` above
+# (which always goes through a real `evaluate()` call) structurally cannot
+# reach this sequence -- these tests build the log directly instead, the
+# same way a hand-edited, merged, or restored-from-backup JSONL file
+# would.
+
+
+def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_forged_unsupported_record(
+    tmp_path: Path,
+) -> None:
+    """CLOSE6-2: `from_log`'s PAUSE/`UNSUPPORTED` branch used to set status
+    unconditionally, with no already-PAUSED check -- unlike `_act`'s own
+    live-path branch, which can never reach an UNSUPPORTED outcome once a
+    mailbox is already PAUSED at all. A log containing
+    [PAUSE/PERFORMED, PAUSE/UNSUPPORTED] for the same mailbox is not
+    something the live path can write, but replaying one un-paused the
+    mailbox anyway, with no `ResumeRecord` anywhere in the log."""
+    log_path = tmp_path / "decisions.jsonl"
+    pause_eval = evaluate(
+        driver=FakeDriver(pause_outcome=ActionOutcome.PERFORMED),
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    assert pause_eval.verdict is Verdict.PAUSE
+    append_record(log_path, DecisionRecord.from_evaluation(pause_eval))
+
+    forged_unsupported = dataclasses.replace(
+        DecisionRecord.from_evaluation(pause_eval),
+        action_outcome=ActionOutcome.UNSUPPORTED,
+        action_detail="forged: pretends this provider can never pause this target",
+    )
+    append_record(log_path, forged_unsupported)
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_forged_failed_record(
+    tmp_path: Path,
+) -> None:
+    """Same defect shape, the neighbouring branch: `from_log`'s PAUSE/
+    `FAILED` branch had the same missing guard."""
+    log_path = tmp_path / "decisions.jsonl"
+    pause_eval = evaluate(
+        driver=FakeDriver(pause_outcome=ActionOutcome.PERFORMED),
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=False,
+        now=_NOW,
+    )
+    assert pause_eval.verdict is Verdict.PAUSE
+    append_record(log_path, DecisionRecord.from_evaluation(pause_eval))
+
+    forged_failed = dataclasses.replace(
+        DecisionRecord.from_evaluation(pause_eval),
+        action_outcome=ActionOutcome.FAILED,
+        action_detail="forged: pretends a second pause attempt failed",
+    )
+    append_record(log_path, forged_failed)
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+    # Not PAUSE_FAILED either -- the guard leaves status untouched entirely,
+    # it doesn't substitute a different automatic transition.
+    assert restored.status_of(_MAILBOX) is not MailboxBreakerStatus.PAUSE_FAILED
+
+
+@pytest.mark.parametrize("move", [m for m in _PERMUTATION_MOVES if m != "RESUME"])
+def test_only_resume_after_human_review_moves_paused_back_to_active_exclusivity(
+    move: str, tmp_path: Path
+) -> None:
+    """CLOSE6-2: `test_only_resume_after_human_review_moves_paused_back_to_
+    active` (above, in the `BreakerStateStore: never auto-resume` section)
+    is NAMED for an exclusivity claim -- "only" resume moves PAUSED back to
+    ACTIVE -- but its body only ever asserted that resume works, never that
+    every OTHER move fails to. This is the other half: starting from
+    PAUSED, every move in `_PERMUTATION_MOVES` except RESUME must leave the
+    mailbox PAUSED, driven entirely through the live path (`_apply_move`,
+    the same helper the permutation sweep uses) so this is a genuine
+    behavioral guarantee, not a source-level grep."""
+    log_path = tmp_path / "decisions.jsonl"
+    state_store = BreakerStateStore()
+    _apply_move("PAUSE_PERFORMED", state_store, log_path)
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+    _apply_move(move, state_store, log_path)
+
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
 def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(

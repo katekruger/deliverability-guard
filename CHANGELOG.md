@@ -157,6 +157,136 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: a paused mailbox's stdout line said `THROTTLE` with no
+  indication anything was refused** (external audit finding CLOSE6-4,
+  first half). The honest "mailbox is paused; throttle refused pending
+  human review" detail (ADR 0003, CLOSE5-1) existed only in the decision
+  log; `cmd_check` and `cmd_run`'s fast tick printed only
+  `f"{mailbox_id}: {verdict.name} (sends=..., complaints=...)"`, so an
+  operator running `check` from cron and tailing its output — not the
+  JSONL log — saw a bare, unexplained `THROTTLE` forever once a mailbox
+  was paused. Both now append the action's own `detail` (via a new shared
+  `_format_verdict_line` helper) whenever `BreakerEvaluation.action` is
+  set, i.e. for THROTTLE and PAUSE; OK and WARN never set `action`, so
+  their lines are unchanged.
+
+- **`README.md` §"Quick start": dry-run daemon vs. cron parity, decided
+  and documented** (CLOSE6-4, second half). Three ticks of identical
+  PAUSE-worthy evidence under `dry_run: true`: a `run` daemon (one
+  process, memory persists between ticks) reports "would pause" once,
+  then "already paused" from tick two onward; three separate `check`
+  invocations (cron; `from_log` rebuilt fresh each time) report "would
+  pause" every single time. Decision: keep this — the in-process store
+  must keep accumulating dry-run mutations (AGENTS.md: dry-run decisions
+  must be identical to what the live path would decide, and a live
+  daemon's second tick genuinely IS idempotent), while `from_log` must
+  keep skipping dry-run records across a restart (CLOSE-4: a dry-run
+  action never touched the real provider, so it must never be read back
+  as durable pause history). Both properties are individually correct and
+  already tested; the tension between them is what's new here.
+  README.md's dry-run paragraph gained a sentence making the distinction
+  explicit — decisions are identical *per evaluation*, not accumulated
+  identically *per process* — and a new test,
+  `test_dry_run_daemon_and_cron_never_make_a_real_call_but_diverge_in_
+  reporting`, pins exactly this: zero real provider calls either way, and
+  the documented difference in what each shape reports.
+
+- **`README.md`: four more unguarded absolute claims, and one stale
+  CHANGELOG sentence** (external audit finding CLOSE6-3, the same shape as
+  CLOSE5-3, applied to the claims that finding didn't reach). Each claim
+  was true when written and had no executable guard behind it:
+  (1) "PAUSE actually executes against exactly one provider (`instantly`),
+  and THROTTLE against exactly one (`smartlead`); no single provider can
+  do both" (README:118) — the `CampaignRef` half of this sentence was
+  guarded in CLOSE5-3, this half wasn't; added
+  `test_pause_and_throttle_via_mailboxref_reach_exactly_one_provider_each`
+  to `tests/test_provider_conformance.py`, exercising Instantly's `pause`
+  and Smartlead's `throttle` against recorded fixtures (never live) and
+  reusing CLOSE5-3's existing UNSUPPORTED coverage for every other
+  (driver, verb) pair. (2) "they share one code path
+  (`loops.fast.evaluate_all_mailboxes`)" (README:56) — added
+  `test_check_and_run_share_the_same_evaluation_chokepoint` to
+  `tests/test_cli.py`, the same source-level idiom already used for the
+  `CampaignRef` and `resume_after_human_review` claims. (3) "no code path
+  can pause or throttle without `dry_run=False`, set on purpose"
+  (README:90) — added
+  `test_dry_run_parameter_has_no_default_on_evaluate_or_act` to
+  `tests/test_breaker.py`, the same `inspect.signature` idiom
+  `tests/test_slow_loop.py`'s `test_tune_thresholds_signature_has_no_
+  capability_carrying_parameter` already established for a different
+  claim. (4) "`resume <mailbox>` is the only way a paused mailbox becomes
+  active again ... there is no automatic path back from `PAUSED`"
+  (README:58) — closed by CLOSE6-2's new exclusivity test above, no
+  separate change needed here. README:101's "every driver's
+  `pause()`/`throttle()` is always callable and returns an explicit
+  'unsupported' result" is left as-is per its own test's documented
+  caveat (10 of 12 (driver, verb) pairs covered; the other 2 would be live
+  calls). Also corrected `CHANGELOG.md`'s CLOSE4-1 entry, which still said
+  the permutation sweep asserted equality "over all 720 orderings of six
+  representative moves" — stale since CLOSE5-2 changed the comparison
+  (three fields, not one) and move count, and stale again after CLOSE6-2
+  above; reworded to point at the entries that carry the current numbers
+  instead of repeating a count that goes stale every time the set grows.
+
+- **`engine/breaker.py`: a WARN record could un-pause a mailbox, and
+  nothing would fail** (external audit finding CLOSE6-2). The code itself
+  was correct; the invariant guarding it was not. Two gaps: (1) `WARN` and
+  `PAUSE_FAILED` were absent from `tests/test_breaker.py`'s permutation
+  sweep (`_PERMUTATION_MOVES`) -- the two-line mutation `if record.verdict
+  is Verdict.WARN: status[mailbox] = MailboxBreakerStatus.ACTIVE` in
+  `from_log`'s final `else` passed the full suite, ruff, and pyright clean.
+  Adding both moves (343 -> 729 three-move sequences) makes that exact
+  mutation fail 50 of them. (2) `test_only_resume_after_human_review_
+  moves_paused_back_to_active`'s NAME claimed exclusivity but its body only
+  asserted resume works; added the other half
+  (`..._exclusivity`, parametrized over every non-RESUME move, driven
+  entirely through the live path) so the claim its own name makes is
+  actually checked. Separately, and unrelated to either test gap:
+  `from_log`'s PAUSE `UNSUPPORTED`/`FAILED` branches had no already-PAUSED
+  guard, unlike `_act`'s own live-path PAUSE branch, which short-circuits
+  to an idempotent PERFORMED result before ever calling `driver.pause()`
+  again once a mailbox is PAUSED -- meaning `_act` can never itself
+  PRODUCE an UNSUPPORTED or FAILED PAUSE outcome for an already-PAUSED
+  mailbox. The live path (and therefore the permutation sweep, which only
+  ever drives `evaluate()`) can't reach this sequence at all; a
+  hand-edited, merged, or restored-from-backup log can, and replaying one
+  silently un-paused a mailbox with no `ResumeRecord` anywhere in the log.
+  Fixed by adding the same already-PAUSED guard the THROTTLE/PERFORMED
+  branch already has (CLOSE5-1), verified with two new tests that build
+  the adversarial log directly (`_apply_move`/`evaluate()` structurally
+  cannot construct it). Also: `pyproject.toml` gained `fail_under = 100`
+  under `[tool.coverage.report]` -- this repo's headline "100% branch
+  coverage" claim had no floor enforcing it; the WARN mutation above drops
+  coverage to 99% and the suite stayed green without this.
+
+- **`cli.py`: a confirmed PAUSE could be discarded if a later mailbox in
+  the same batch failed** (external audit finding CLOSE6-1). `cmd_check`
+  evaluated the whole fleet via `loops.fast.evaluate_all_mailboxes` and
+  only THEN appended a decision record per mailbox, in a second loop;
+  `cmd_run`'s fast tick had the identical shape via `on_fast_tick`, which
+  only runs once a whole tick's batch has finished. If any mailbox's
+  evaluation raised after an earlier mailbox was genuinely paused at the
+  provider (a transport failure, e.g. mid-`pause()`), no record was
+  written for ANY mailbox in that batch or tick — including the confirmed
+  PAUSE. A subsequent `check` then had no way to know that mailbox was
+  ever paused, and if its evidence had since drifted into the THROTTLE
+  band, issued a REAL `driver.throttle()` call against it — defeating ADR
+  0003's human-review gate from the other direction. Reproduction: two
+  same-domain mailboxes, the second mailbox's `pause()` raising
+  `RateLimitExceededError` after the first mailbox's `pause()` genuinely
+  succeeded — before this fix, `check` exited 3 with a zero-byte decision
+  log and the first mailbox's confirmed PAUSE nowhere recorded; a
+  follow-up `check` against drifted evidence then issued a real
+  `driver.throttle()` call on it. `loops.fast.evaluate_all_mailboxes`
+  gained `on_evaluation`, called with each mailbox's `BreakerEvaluation`
+  immediately after that mailbox is evaluated — not after the batch —
+  threaded through `loops.controller.run` alongside the existing
+  `on_fast_tick`. `cmd_check` and `cmd_run` now append each decision
+  record from `on_evaluation`; `on_fast_tick` is kept for its per-tick
+  console summary only. Exit code 3 for the transport failure itself is
+  unchanged — a partial batch that persisted correctly is still a failed
+  run.
+
 - **`engine/breaker.py`: a PAUSED mailbox auto-un-paused through THROTTLE
   then OK, with no human review** (external audit finding CLOSE5-1 — the
   serious one). `_act`'s THROTTLE branch never consulted `state_store.
@@ -292,9 +422,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   STRICTLY larger value, while an idempotent replay's `applied_daily_limit`
   never exceeds what's already tracked. A new property-style test
   (`test_from_log_replay_matches_the_live_path_over_every_move_ordering`)
-  asserts replayed status equals live-path status over all 720 orderings of
-  six representative moves (PAUSE/PERFORMED, THROTTLE/PERFORMED,
-  THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME) — the invariant meant
+  asserts replayed status equals live-path status over move sequences drawn
+  from a set of representative moves (PAUSE/PERFORMED, THROTTLE/PERFORMED,
+  THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME at the time this entry
+  was written — CLOSE5-2 and CLOSE6-2 below both extended the move set and
+  the comparison further; see those entries for the current numbers, since
+  this sentence goes stale every time the set grows) — the invariant meant
   to stop this exact defect shape recurring a fifth time. Ten consecutive
   `check` processes against a provider with no daily limit now reach PAUSED
   once, on run 4, and stay there through run 10, with exactly one real

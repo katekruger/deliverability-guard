@@ -78,6 +78,7 @@ def run(
     on_fast_tick: Callable[[list[BreakerEvaluation]], None] | None = None,
     on_slow_tick: Callable[[ThresholdAdjustment], None] | None = None,
     on_cusum_alarm: Callable[[MailboxRef, CusumResult], None] | None = None,
+    on_evaluation: Callable[[BreakerEvaluation], None] | None = None,
 ) -> None:
     """Run the two-loop controller.
 
@@ -106,6 +107,16 @@ def run(
     accumulates evidence over the daemon's lifetime rather than resetting
     every tick -- see `loops.fast.evaluate_all_mailboxes`'s own docstring
     for why that matters.
+
+    `on_evaluation`, when given, is passed straight through to
+    `evaluate_all_mailboxes` and therefore called once per mailbox,
+    immediately after that mailbox's own evaluation -- not after the whole
+    tick's batch, the way `on_fast_tick` below is (CLOSE6-1). A caller that
+    needs to durably persist each decision record before the next
+    mailbox's provider action is attempted (e.g. `cli.cmd_run`) must use
+    this, not `on_fast_tick`: if a later mailbox's evaluation in the same
+    tick raises, `on_fast_tick` is never called for that tick at all, but
+    `on_evaluation` has already run for every mailbox evaluated so far.
     """
     if max_ticks is not None and max_ticks <= 0:
         return
@@ -135,6 +146,7 @@ def run(
             cusum_slack=cusum_slack,
             cusum_threshold=cusum_threshold,
             on_cusum_alarm=on_cusum_alarm,
+            on_evaluation=on_evaluation,
         )
         if on_fast_tick is not None:
             on_fast_tick(results)

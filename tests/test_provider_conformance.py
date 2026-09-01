@@ -27,6 +27,7 @@ from deliverability_guard.providers.lemlist import LemlistCampaignDriver, Lemlis
 from deliverability_guard.providers.noop import NoopDriver
 from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
 from deliverability_guard.providers.smartlead import SmartleadCampaignDriver, SmartleadDriver
+from fixtures.http import queued_client, response
 
 
 class _FakeSesV2Client:
@@ -135,3 +136,87 @@ def test_every_driver_declines_an_unsupported_capability_without_raising() -> No
     for driver, verb in cases:
         result = driver.pause(mailbox) if verb == "pause" else driver.throttle("a@example.com", 100)
         assert result.outcome is ActionOutcome.UNSUPPORTED, (driver.name, verb)
+
+
+def test_pause_and_throttle_via_mailboxref_reach_exactly_one_provider_each() -> None:
+    """CLOSE6-3: README.md's capability-matrix paragraph claims 'PAUSE
+    actually executes against exactly one provider (`instantly`), and
+    THROTTLE against exactly one (`smartlead`); no single provider can do
+    both' -- the `CampaignRef` half of that same sentence gained an
+    executable guard in CLOSE5-3
+    (`test_engine_breaker_module_never_constructs_a_campaign_ref`), but
+    this half never did.
+
+    `engine.breaker.evaluate`'s ladder only ever constructs a `MailboxRef`
+    (that CLOSE5-3 guard is what pins that down), so what matters here is
+    each driver's response to `pause(MailboxRef)`/`throttle(...)`
+    specifically -- not `driver.capabilities`, which several of these
+    providers declare for their CAMPAIGN-level primitives even though the
+    breaker can never reach them. Instantly's `pause` and Smartlead's
+    `throttle` are exercised against recorded fixtures (never live,
+    AGENTS.md); every other (driver, verb) pair here is already proven
+    UNSUPPORTED by `test_every_driver_declines_an_unsupported_capability_
+    without_raising` above -- this test's job is only to confirm the
+    POSITIVE half: that exactly one driver PERFORMS each verb."""
+    mailbox = MailboxRef(provider="x", mailbox_id="a@example.com")
+
+    instantly = InstantlyDriver(
+        api_key="x",
+        client=queued_client(
+            [response(200, "instantly/pause_account_200.json")],
+            base_url="https://api.instantly.ai",
+        ),
+    )
+    smartlead = SmartleadCampaignDriver(
+        inner=SmartleadDriver(
+            api_key="x",
+            client=queued_client(
+                [response(200, "smartlead/email_account_update_200.json")],
+                base_url="https://server.smartlead.ai/api/v1",
+            ),
+            sleep=lambda _seconds: None,
+        ),
+        campaign_id="c",
+    )
+    others: list[ProviderDriver] = [
+        SmartleadCampaignDriver(inner=SmartleadDriver(api_key="x"), campaign_id="c"),
+        LemlistCampaignDriver(inner=LemlistDriver(api_key="x"), campaign_id="c"),
+        ApolloCampaignDriver(inner=ApolloDriver(api_key="x"), campaign_id="c"),
+        SesConfigurationSetDriver(
+            inner=SesDriver(
+                sesv2_client=_FakeSesV2Client(), cloudwatch_client=_FakeCloudWatchClient()
+            ),
+            configuration_set_name="cs",
+        ),
+        NoopDriver(),
+    ]
+
+    pausers = [instantly, *others]
+    pause_outcomes = {driver.name: driver.pause(mailbox).outcome for driver in pausers}
+    assert pause_outcomes["instantly"] is ActionOutcome.PERFORMED
+    performed_pausers = [
+        name for name, outcome in pause_outcomes.items() if outcome is ActionOutcome.PERFORMED
+    ]
+    assert performed_pausers == ["instantly"]
+
+    throttlers: list[ProviderDriver] = [
+        InstantlyDriver(api_key="x"),
+        smartlead,
+        LemlistCampaignDriver(inner=LemlistDriver(api_key="x"), campaign_id="c"),
+        ApolloCampaignDriver(inner=ApolloDriver(api_key="x"), campaign_id="c"),
+        SesConfigurationSetDriver(
+            inner=SesDriver(
+                sesv2_client=_FakeSesV2Client(), cloudwatch_client=_FakeCloudWatchClient()
+            ),
+            configuration_set_name="cs",
+        ),
+        NoopDriver(),
+    ]
+    throttle_outcomes = {
+        driver.name: driver.throttle("a@example.com", 100).outcome for driver in throttlers
+    }
+    assert throttle_outcomes["smartlead"] is ActionOutcome.PERFORMED
+    performed_throttlers = [
+        name for name, outcome in throttle_outcomes.items() if outcome is ActionOutcome.PERFORMED
+    ]
+    assert performed_throttlers == ["smartlead"]

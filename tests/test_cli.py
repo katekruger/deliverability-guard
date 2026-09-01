@@ -206,6 +206,249 @@ def test_check_appends_a_decision_record_per_mailbox(tmp_path: Path) -> None:
     assert records[0].verdict is Verdict.OK
 
 
+# --- CLOSE6-1: a decision record must be durable before the next mailbox's
+# provider action, not written in a second loop after the whole batch -----
+
+
+class _PauseFailsOnNthCallDriver:
+    """A driver whose Nth `pause()` call (1-indexed, across ALL mailboxes)
+    raises a transport-level error instead of returning -- standing in for
+    a real provider connection dropping partway through a multi-mailbox
+    batch, without any actual network access. Earlier and later `pause()`
+    calls succeed normally, `PERFORMED`."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS, Capability.PAUSE, Capability.THROTTLE})
+
+    def __init__(
+        self, stats_to_return: list[MailboxDayStats], *, raise_on_call: int, exc: Exception
+    ) -> None:
+        self.stats_to_return = stats_to_return
+        self._raise_on_call = raise_on_call
+        self._exc = exc
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.throttle_calls: list[tuple[str, int]] = []
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        return self.stats_to_return
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        if len(self.pause_calls) == self._raise_on_call:
+            raise self._exc
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def test_check_persists_an_earlier_confirmed_pause_when_a_later_mailbox_transport_fails(
+    tmp_path: Path,
+) -> None:
+    """CLOSE6-1's reproduction: `cmd_check` used to evaluate the whole
+    fleet and only THEN append decision records in a second loop. If any
+    mailbox's evaluation raised after an earlier mailbox was genuinely
+    paused at the provider, no record was written for ANY mailbox --
+    including the confirmed PAUSE. A subsequent `check` would then have no
+    way to know mailbox A was ever paused, and could throttle it for real
+    if its evidence had since drifted into the THROTTLE band -- defeating
+    ADR 0003's human-review gate from the other direction."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=2, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_check(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            now=_NOW,
+            out=io.StringIO(),
+        )
+
+    assert [c.mailbox_id for c in driver.pause_calls] == ["a@example.com", "b@example.com"]  # type: ignore[union-attr]
+
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) == 1
+    assert records[0].mailbox_id == "a@example.com"
+    assert records[0].verdict is Verdict.PAUSE
+    assert records[0].action_outcome is ActionOutcome.PERFORMED
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(mailbox_a) == MailboxBreakerStatus.PAUSED
+
+    # The follow-up check: mailbox A's evidence has since drifted into the
+    # THROTTLE band. A must stay behind the human-review gate -- no real
+    # throttle call against it.
+    second_driver = FakeDriver(stats_to_return=[_stats(mailbox_a, date(2026, 1, 1), 1000, 5)])
+    cmd_check(
+        driver=second_driver,
+        config=config,
+        state_store=restored,
+        now=_NOW + timedelta(days=1),
+        out=io.StringIO(),
+    )
+    assert second_driver.throttle_calls == []
+    assert restored.status_of(mailbox_a) == MailboxBreakerStatus.PAUSED
+
+
+def test_check_persists_the_first_two_mailboxes_when_the_third_fails(tmp_path: Path) -> None:
+    """The three-mailbox variant: a failure on the LAST mailbox in a batch
+    of three must still leave the first two durably recorded."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailboxes = [
+        MailboxRef(provider="fake", mailbox_id=f"{letter}@example.com") for letter in "abc"
+    ]
+    stats = [_stats(m, date(2025, 12, 31), 5000, 40) for m in mailboxes]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=3, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_check(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            now=_NOW,
+            out=io.StringIO(),
+        )
+
+    records = read_records(log_path)
+    assert [r.mailbox_id for r in records] == ["a@example.com", "b@example.com"]
+    assert all(r.verdict is Verdict.PAUSE for r in records)
+
+
+def test_run_fast_tick_persists_an_earlier_confirmed_pause_when_a_later_mailbox_fails(
+    tmp_path: Path,
+) -> None:
+    """Same reproduction, through `cmd_run`'s fast tick: `on_fast_tick`
+    only fires after a WHOLE tick's batch finishes, so before CLOSE6-1
+    `cmd_run` had the identical bug -- a later mailbox's failure meant no
+    record was appended for the tick at all."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    exc = RateLimitExceededError("429s all the way down")
+    driver = _PauseFailsOnNthCallDriver(stats, raise_on_call=2, exc=exc)
+
+    with pytest.raises(RateLimitExceededError):
+        cmd_run(
+            driver=driver,
+            config=config,
+            state_store=BreakerStateStore(),
+            threshold_store=ThresholdStore(config.thresholds),
+            now=lambda: _NOW,
+            sleep=lambda _seconds: None,
+            out=io.StringIO(),
+            max_ticks=1,
+        )
+
+    assert log_path.exists()
+    records = read_records(log_path)
+    assert len(records) == 1
+    assert records[0].mailbox_id == "a@example.com"
+    assert records[0].verdict is Verdict.PAUSE
+
+
+def test_main_check_exit_code_3_is_unchanged_when_an_earlier_mailbox_was_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A partial batch that persisted correctly is still a failed run --
+    exit code 3, exactly as an all-or-nothing transport failure already
+    produces."""
+    from deliverability_guard.providers.base import RateLimitExceededError
+
+    mailbox_a = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    mailbox_b = MailboxRef(provider="fake", mailbox_id="b@example.com")
+    stats = [
+        _stats(mailbox_a, date(2025, 12, 31), 5000, 40),
+        _stats(mailbox_b, date(2025, 12, 31), 5000, 40),
+    ]
+    driver = _PauseFailsOnNthCallDriver(
+        stats, raise_on_call=2, exc=RateLimitExceededError("429s all the way down")
+    )
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+# --- CLOSE6-4: a paused mailbox's stdout line must say why, not just THROTTLE
+
+
+def test_check_prints_the_action_detail_for_a_paused_mailbox_refused_throttle(
+    tmp_path: Path,
+) -> None:
+    """CLOSE6-4's reproduction: a mailbox already PAUSED whose evidence
+    keeps landing in the THROTTLE band used to print a bare
+    `THROTTLE (sends=..., complaints=...)` on every subsequent `check` --
+    the honest 'mailbox is paused; throttle refused pending human review'
+    detail (ADR 0003, CLOSE5-1) existed only in the decision log, never on
+    the stdout an operator running `check` from cron actually reads."""
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("dry_run: true", "dry_run: false")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    config = load_config(config_path)
+
+    mailbox = MailboxRef(provider="fake", mailbox_id="ops@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_paused(mailbox)
+
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 1000, 5)])
+    out = io.StringIO()
+
+    exit_code = cmd_check(driver=driver, config=config, state_store=state_store, now=_NOW, out=out)
+
+    assert exit_code == 1
+    printed = out.getvalue()
+    assert "ops@example.com: THROTTLE" in printed
+    assert "mailbox is paused; throttle refused pending human review" in printed
+    assert driver.throttle_calls == []
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+
+
 # --- status -------------------------------------------------------------
 
 
@@ -961,6 +1204,70 @@ def test_daemon_and_cron_agree_on_a_smartlead_shaped_three_move_sequence(
     assert cron_store.throttled_at_limit(mailbox) == daemon_store.throttled_at_limit(mailbox)
 
 
+def test_dry_run_daemon_and_cron_never_make_a_real_call_but_diverge_in_reporting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE6-4's dry-run question: three ticks of identical PAUSE-worthy
+    evidence under `dry_run: true`.
+
+    Decision made here: the in-process `BreakerStateStore` keeps
+    accumulating dry-run mutations across ticks (`_act`'s PAUSE branch
+    always calls `state_store.mark_paused`, dry-run or not) -- that is
+    what makes a dry-run daemon's SECOND tick report the exact same
+    idempotent "already paused" decision a LIVE daemon's second tick would
+    reach, per AGENTS.md's "dry-run must produce decisions identical to
+    the live path." `BreakerStateStore.from_log` continues to skip
+    dry-run records when rebuilding across a restart (CLOSE-4, unchanged
+    by this decision) -- a dry-run action never touched the real provider,
+    so it must never be read back as durable pause history.
+
+    Put together: a long-lived dry-run `run` daemon (one process, memory
+    persists between ticks) reports "already paused" from its second tick
+    onward, while a dry-run `check` invoked from cron (a fresh process
+    every time, so `from_log` correctly forgets the fake pause on every
+    restart) reports "would pause" on every single invocation. The
+    property that must hold regardless of shape -- and is what this test
+    pins -- is that BOTH make zero real provider calls, always."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    stats = [_stats(mailbox, date(2025, 12, 31), 5000, 40)]
+
+    daemon_driver = FakeDriver(stats_to_return=stats)
+
+    def _fake_build_driver_daemon(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return daemon_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver_daemon)
+
+    def _no_sleep(seconds: float) -> None:
+        pass
+
+    monkeypatch.setattr(cli_module.time, "sleep", _no_sleep)
+    daemon_log = tmp_path / "daemon-decisions.jsonl"
+    daemon_config = _config(tmp_path, text=_VALID_YAML, decision_log=str(daemon_log))
+    main(["--config", str(daemon_config), "run", "--ticks", "3"])
+
+    assert daemon_driver.pause_calls == []
+
+    cron_driver = FakeDriver(stats_to_return=stats)
+
+    def _fake_build_driver_cron(provider: str, *, env: Mapping[str, str]) -> FakeDriver:
+        return cron_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver_cron)
+    cron_log = tmp_path / "cron-decisions.jsonl"
+    cron_config = _config(tmp_path, text=_VALID_YAML, decision_log=str(cron_log))
+    for _ in range(3):
+        main(["--config", str(cron_config), "check"])
+
+    assert cron_driver.pause_calls == []
+
+    daemon_details = [r.action_detail for r in read_records(daemon_log)]
+    cron_details = [r.action_detail for r in read_records(cron_log)]
+    assert daemon_details[0] == cron_details[0] == f"[DRY RUN] would pause {mailbox!r}"
+    assert daemon_details[1:] == ["mailbox already paused; no action taken (idempotent)"] * 2
+    assert cron_details[1:] == [f"[DRY RUN] would pause {mailbox!r}"] * 2
+
+
 def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1363,3 +1670,22 @@ def test_close1_run_actually_executes_pooled_posterior_and_cusum_step(
     assert exit_code == 0
     assert len(pooled_posterior_calls) == 5
     assert len(cusum_step_calls) == 5
+
+
+def test_check_and_run_share_the_same_evaluation_chokepoint() -> None:
+    """CLOSE6-3: README.md's own claim -- `check` and `run`'s fast tick
+    "share one code path (`loops.fast.evaluate_all_mailboxes`), so the two
+    can't drift apart" -- had no executable guard. A source-level check,
+    in the same idiom this repo already uses for
+    `test_evaluate_never_calls_resume_after_human_review` and
+    `test_engine_breaker_module_never_constructs_a_campaign_ref`: both
+    `cmd_check` and `loops.controller.run` must reference
+    `evaluate_all_mailboxes` by name -- if either one stopped calling it
+    (e.g. reimplementing its own aggregation-and-evaluation loop), this
+    fails without needing to notice the behavioral drift first."""
+    import inspect
+
+    from deliverability_guard.loops import controller as controller_module
+
+    assert "evaluate_all_mailboxes" in inspect.getsource(cli_module.cmd_check)
+    assert "evaluate_all_mailboxes" in inspect.getsource(controller_module.run)
