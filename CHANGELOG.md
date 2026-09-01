@@ -157,6 +157,182 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_breaker.py`: the blind-spot list kept alive, item 3 marked
+  closed rather than deleted** (CLOSE8-4). The list at
+  `tests/test_breaker.py:1627` (round 7's own artifact) found CLOSE8-1
+  exactly where it said it would -- item 3 named `compliance_gate_tripped`
+  as untested with "'believed' is doing the same load-bearing work item 1
+  flags," and the streak divergence CLOSE8-1 found is precisely that.
+  Marked CLOSED in place, with what closed it and why, rather than
+  deleted -- the same "mark resolved, don't erase" instinct
+  `campaign-preflight`'s own report uses, because a list that shows what
+  it caught is worth more than one that only shows what's left. Items 1,
+  2, 4, and 5 re-read with fresh eyes and left open (still real, nothing
+  this round closed or ruled out); item 1 (cross-mailbox state leakage) is
+  flagged as the one worth picking up next. Two new items added, both
+  taught by this round directly: driver read-path exception types are
+  never enumerated ahead of time (CLOSE8-2 found `ses.py`'s gap only after
+  it was already live), and the `in`-over-`getsource` failure shape --
+  now appeared twice, in two different functions, in two different rounds
+  -- is a standing question to ask of every future source-level guard,
+  not just the two instances already fixed.
+
+- **`tests/test_breaker.py`: the second vacuous `getsource`-based guard,
+  two files from the one CLOSE7-3 fixed** (external audit finding
+  CLOSE8-3). `test_act_checks_paused_status_before_ever_calling_throttle`
+  used raw `inspect.getsource(breaker_module._act)` and an `in`-flavoured
+  `.index()` comparison. `_act` has no docstring, so CLOSE7-3's
+  docstring-stripping `source_body` alone would not have caught this --
+  but raw `getsource` ALSO includes comments, and a mutation that deleted
+  the real `MailboxBreakerStatus.PAUSED` check while leaving a COMMENT
+  naming it (`# MUTATION (audit): the real ... guard is gone; only this
+  comment mentions MailboxBreakerStatus.PAUSED now.` followed by `if
+  False:`) still passed this test unchanged -- confirmed against the real
+  mutation, applied and reverted. `source_body` now strips comments too
+  (via `tokenize`, which correctly leaves a `#` inside a string literal
+  alone, unlike a naive text scan), and this guard is routed through it.
+
+  All five `getsource`-based assertion sites in this suite were reviewed
+  against the same question: three (`CampaignRef` in `engine/breaker.py`,
+  `resume_after_human_review` x2) assert `not in` and are immune by
+  construction -- a docstring or comment mention can only make a `not in`
+  assertion correctly fail, never incorrectly pass. One
+  (`loops/slow.py`'s import check) is a real `ast` walk, not a text
+  search, and was never vulnerable either. This PAUSE/throttle guard was
+  the fifth and last one that needed fixing.
+
+  This failure shape has now appeared twice in two rounds (CLOSE7-3,
+  CLOSE8-3), so it's made structural rather than merely documented: a new
+  test, `tests/test_source_inspect.py`, scans every test file for a bare
+  `in inspect.getsource(...)` outside the two known, deliberate
+  vacuous-vs-fixed demonstrations, and fails the suite if a third one ever
+  appears -- a future occurrence is now something CI catches, not
+  something the next audit has to find.
+
+- **`providers/ses.py`, `cli.py`: real AWS/`botocore` errors tracebacked
+  `check`/`run` with no exit code at all** (external audit finding
+  CLOSE8-2, production-reachable today -- unlike CLOSE8-1's latent one).
+  `SesDriver._daily_sums`'s CloudWatch call had no exception handling,
+  unlike every SES write path (`_set_configuration_set_sending`,
+  `pause_account`, `resume_account`), which already wraps its own
+  `botocore` call in `except Exception`. An expired token, an IAM
+  permission gap, a CloudWatch rate limit, or a network failure each
+  raised straight out of `read_mailbox_stats` -- `botocore` exceptions are
+  neither `httpx.HTTPError`, nor `ProviderError`, nor `ValueError`, and
+  `cli.main` caught only those. Same at construction: `boto3.client(...)`
+  raises `NoRegionError` immediately when no region is configured
+  anywhere, and `build_driver`'s `ses` branch was wrapped only in `except
+  CliError`, whose own docstring promises "never a traceback a cron job's
+  error email has to explain."
+
+  Fixed by translating `botocore.exceptions.ClientError`/`BotoCoreError`
+  into this project's own vocabulary at the read-path boundary --
+  `RateLimitExceededError` for a `Throttling`-shaped `ClientError`
+  (matching every other driver's own 429 framing: back off and
+  re-evaluate, this isn't evidence about the mailbox), `ProviderError`
+  for everything else -- so `cli.main`'s EXISTING `ProviderError` handler
+  picks it up with no further wiring. `NoRegionError` at construction is
+  now caught in `build_driver` and re-raised as `CliError`, exit 2,
+  grouped with every other missing-configuration case.
+
+  Then the class was re-run over every driver's read path, per this
+  round's own opening instruction (round 7 fixed an instance and named
+  the class without re-running it; this is that step, done):
+
+  | Driver | Read-path exception source | Where it lands |
+  |---|---|---|
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) | `cli.main`'s existing `httpx.HTTPError` handler |
+  | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
+  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers) | same two handlers |
+  | `lemlist.py` | same shape | same two handlers |
+  | `apollo.py` | same shape | same two handlers |
+  | `ses.py` | `botocore.exceptions.ClientError`/`BotoCoreError` from `CloudWatchClient.get_metric_statistics` | translated to `RateLimitExceededError`/`ProviderError` at the driver boundary (CLOSE8-2, this entry) -- `cli.main`'s existing `ProviderError` handler |
+  | `ses.py` | `botocore.exceptions.NoRegionError` at construction (`boto3.client(...)`, no region configured anywhere) | caught in `build_driver`, re-raised as `CliError` (CLOSE8-2) -- exit 2 |
+  | `noop.py` | none -- no external client of any kind | n/a |
+
+  Every httpx-based driver was already safe -- confirmed, not assumed:
+  `httpx.HTTPError` is the base of both httpx exception families
+  (`RequestError` and `HTTPStatusError`), so `cli.main`'s existing handler
+  already covers every network/timeout/status failure those four drivers
+  can produce, and every parse failure already raises `MalformedResponseError`
+  via the shared `_parsing.py` helpers. `ses.py` -- the one driver with a
+  DIFFERENT client library underneath -- was the only real gap.
+
+  Also, per this round's own opening instruction, `cli.main` gained a
+  final, broad `except Exception` around both `check`'s and `run`'s
+  evaluation loops, after every more specific handler. The previous
+  (CLOSE7-2) entry in this file claimed "no future driver bug or
+  malformed response can traceback either command, even one this fix
+  doesn't anticipate" -- measured false: a `KeyError`, `TypeError`,
+  `AttributeError`, or an unwrapped `RuntimeError` from a driver each
+  still tracebacked with no exit code. That claim is now true rather than
+  softened: every exception type without a more specific handler above it
+  maps to exit 3 with a one-line message, which is the only way to
+  actually keep that promise -- there is no way to enumerate every
+  exception type every current and future driver's client library might
+  ever raise.
+
+- **`engine/breaker.py`: a compliance-forced PAUSE diverged live-vs-replay
+  on the unsupported-throttle streak** (external audit finding CLOSE8-1 --
+  blind-spot list item 3, `tests/test_breaker.py:1627`, found exactly what
+  it was written to point at). `evaluate()`'s `compliance_gate_tripped`
+  branch returns before the normal path's `if verdict is not Verdict.
+  THROTTLE: state_store.clear_unsupported_throttle_streak(mailbox)` line,
+  so a compliance-forced PAUSE left a pre-existing streak counting on the
+  LIVE path, while `from_log`'s PAUSE branch unconditionally pops the
+  streak for every PAUSE record it replays (it has no way to tell a
+  compliance-forced PAUSE apart from an ordinary one -- `DecisionRecord`
+  doesn't persist `compliance_gate_tripped`). Reproduction: `THROTTLE_
+  UNSUPPORTED x2 -> COMPLIANCE_PAUSE(FAILED) -> THROTTLE_UNSUPPORTED`
+  reached LIVE=`('PAUSE_FAILED', None, 3)` vs REPLAY=`('PAUSE_FAILED',
+  None, 1)` -- the live streak sitting AT
+  `_MAX_UNSUPPORTED_THROTTLE_STREAK` while the replayed one wasn't meant a
+  daemon covering that exact history made a SECOND real `driver.pause()`
+  call on the next evaluation (a genuine CLOSE3-2 streak escalation) while
+  the cron-shaped form (restarting between every evaluation) computed
+  THROTTLE/UNSUPPORTED instead and never called the provider at all -- the
+  same "daemon acts for real, cron doesn't" shape CLOSE3-2, CLOSE4-1, and
+  CLOSE5-2 each closed for a neighbouring path. Latent today
+  (`compliance_gate_tripped` has no CLI caller yet -- see `loops/fast.py`'s
+  own docstring and `test_reachability.py`'s exemption for
+  `signals.postmaster`), live the moment Postmaster is wired.
+
+  Fixed by having the compliance branch call
+  `clear_unsupported_throttle_streak` explicitly before returning,
+  matching every other PAUSE-producing path. `from_log`'s own docstring
+  previously claimed a compliance-forced PAUSE "replays correctly with no
+  change needed" -- true for status and `throttled_at_limit`, false for
+  the streak; corrected. `COMPLIANCE_PAUSE` added to the permutation sweep
+  (1,000 -> 1,331 sequences).
+
+  The per-branch table this finding was supposed to produce the first
+  time (CLOSE7-1 audited `data_state` alone; this is the same audit run
+  again against all three state dimensions -- status, `throttled_at_
+  limit`, `unsupported_streak` -- for every branch of `evaluate()`/`_act`
+  against the matching replay branch in `from_log`, written down in full
+  here since it doesn't fit `engine/breaker.py`'s own docstring inside the
+  100-column limit):
+
+  | Producer (`evaluate`/`_act`) | status | `throttled_at_limit` | `unsupported_streak` | Replay branch (`from_log`) |
+  |---|---|---|---|---|
+  | `sends<0` / `complaints<0` | raises, never persisted | raises, never persisted | raises, never persisted | n/a -- no record ever written |
+  | `sends==0` or `complaints>sends`, not compliance-gated | untouched | untouched | untouched | dedicated `OK`+`INSUFFICIENT_DATA` elif -- untouched (agrees) |
+  | `compliance_gate_tripped`, any `data_state` | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared (CLOSE8-1) | PAUSE branch -- status/limit via `action_outcome`, streak popped unconditionally (agrees, post-fix) |
+  | Ladder PAUSE (raw breach, floor- or streak-escalated) | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared before `_act` runs | PAUSE branch (agrees) |
+  | Ladder THROTTLE, PERFORMED | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, UNSUPPORTED | untouched | untouched | incremented | THROTTLE/UNSUPPORTED branch (agrees) |
+  | Ladder THROTTLE, FAILED | untouched | untouched | cleared | THROTTLE/FAILED branch (agrees) |
+  | Ladder OK (sustained recovery from THROTTLED) | `mark_active` | cleared | cleared | OK-recovery elif (agrees) |
+  | Ladder OK (not a recovery) / WARN | untouched | untouched | cleared | final `else` (agrees) |
+  | `_act` PAUSE: already PAUSED (idempotent) | untouched | untouched | (caller clears, see above) | already-PAUSED guard (CLOSE6-2, agrees) |
+  | `_act` PAUSE: PERFORMED | `mark_paused` | untouched | (caller clears, see above) | PAUSE/PERFORMED branch (agrees) |
+  | `_act` PAUSE: UNSUPPORTED | `mark_active` | cleared (`mark_active`) | (caller clears, see above) | PAUSE/UNSUPPORTED branch (agrees) |
+  | `_act` PAUSE: FAILED | `mark_pause_failed` | untouched | (caller clears, see above) | PAUSE/FAILED branch (agrees) |
+  | `_act` THROTTLE: already PAUSED (CLOSE5-1) | untouched | untouched | cleared -- not via the `is not THROTTLE` line (verdict here IS THROTTLE), but `_act` returns PERFORMED so `evaluate()`'s own PERFORMED-outcome branch clears it | THROTTLE/PERFORMED, already-PAUSED sub-case (agrees) |
+
+  Every row agrees, post-fix. Nothing else in the table needed a change --
+  CLOSE8-1's fix is the only cell that was ever wrong.
+
 - **`tests/test_cli.py`: the `check`/`run` drift guard was vacuous**
   (external audit finding CLOSE7-3).
   `test_check_and_run_share_the_same_evaluation_chokepoint` asserted

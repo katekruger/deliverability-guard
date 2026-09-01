@@ -357,18 +357,67 @@ def test_act_checks_paused_status_before_ever_calling_throttle() -> None:
     crude source-level check, but it is what would have caught this. `_act`
     must consult `MailboxBreakerStatus.PAUSED` before it can ever reach
     `effective_driver.throttle(...)` -- the same ordering its PAUSE branch
-    has always had relative to `effective_driver.pause(...)`."""
-    import inspect
+    has always had relative to `effective_driver.pause(...)`.
 
+    CLOSE8-3: this guard used raw `inspect.getsource`, unguarded -- `_act`
+    has no docstring (so CLOSE7-3's `source_body` fix alone would not have
+    caught this), but raw `getsource` ALSO includes comments, and a
+    mutation that deleted the real check while leaving behind a comment
+    naming `MailboxBreakerStatus.PAUSED` passed this test unchanged. Now
+    routed through `source_body` (which strips comments too, as of
+    CLOSE8-3), so `.index()` can only find the name in actual CODE --
+    and raises `ValueError`, failing this test outright, if the mutation
+    removes the check entirely and leaves nothing but a comment behind."""
     from deliverability_guard.engine import breaker as breaker_module
+    from fixtures.source_inspect import source_body
 
-    source = inspect.getsource(breaker_module._act)  # pyright: ignore[reportPrivateUsage]
+    source = source_body(breaker_module._act)  # pyright: ignore[reportPrivateUsage]
     paused_check_index = source.index("MailboxBreakerStatus.PAUSED")
     throttle_call_index = source.index("effective_driver.throttle(")
     assert paused_check_index < throttle_call_index, (
         "_act must consult PAUSED status before ever calling driver.throttle() "
         "-- CLOSE5-1: a PAUSED mailbox must never receive a real throttle call"
     )
+
+
+def test_act_paused_status_guard_catches_the_comment_only_mutation_the_vacuous_one_missed() -> None:
+    """CLOSE8-3's own reproduction, kept as a regression test, in the same
+    shape as `test_check_and_run_drift_guard_catches_a_hand_duplicated_
+    loop_the_vacuous_one_missed` in `tests/test_cli.py`: a stand-in
+    function shaped exactly like the audit's own mutation -- the real
+    `MailboxBreakerStatus.PAUSED` check replaced with `if False:`, with a
+    COMMENT left behind naming it, and no docstring at all (so this is a
+    genuinely different failure mode than CLOSE7-3's docstring-only one).
+
+    The vacuous (pre-CLOSE8-3) guard -- raw `inspect.getsource` -- passes
+    against this, because the comment mention is enough for `.index()` to
+    find both names in the right order. The fixed guard (`source_body`
+    with comment-stripping) must not: with the comment gone, `.index()`
+    can't find `MailboxBreakerStatus.PAUSED` in the code at all and raises
+    `ValueError`, which is a genuine test failure, not a silent pass."""
+    import inspect
+
+    from fixtures.source_inspect import source_body
+
+    def mutated_act(verdict: str) -> str:
+        # MUTATION (audit): the real MailboxBreakerStatus.PAUSED guard is
+        # gone; only this comment mentions MailboxBreakerStatus.PAUSED now.
+        if verdict == "THROTTLE":
+            if False:
+                return "refused"
+            return "effective_driver.throttle(mailbox_id, new_limit)"
+        return "paused"
+
+    # The vacuous guard this test file used to have: passes purely because
+    # the comment mentions the name and happens to sit before the call.
+    vacuous_source = inspect.getsource(mutated_act)
+    assert vacuous_source.index("MailboxBreakerStatus.PAUSED") < vacuous_source.index(
+        "effective_driver.throttle("
+    )
+    # The fixed guard: the name only ever existed in a comment, so once
+    # comments are stripped it isn't in the code at all.
+    with pytest.raises(ValueError, match="substring not found"):
+        source_body(mutated_act).index("MailboxBreakerStatus.PAUSED")
 
 
 def test_engine_breaker_module_never_constructs_a_campaign_ref() -> None:
@@ -1624,14 +1673,16 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
-# --- What the sweep below still cannot see (CLOSE7-4) ---------------------
+# --- What the sweep below still cannot see (CLOSE7-4, updated CLOSE8-4) ---
 #
-# Written down deliberately, not fixed here -- per the round-7 audit's own
-# closing instruction: the highest-value thing a session like this one can
-# do is name what the sweep is still blind to, even where nothing gets
-# closed. Four rounds running, this sweep has found exactly what it was
-# pointed at and missed everything it wasn't -- these are the places it
-# isn't pointed yet:
+# Written down deliberately -- per the round-7 audit's own closing
+# instruction: the highest-value thing a session like this one can do is
+# name what the sweep is still blind to, even where nothing gets closed.
+# Kept updated rather than deleted once an item DOES close, the way
+# `campaign-preflight`'s own report marks a finding resolved instead of
+# erasing it -- a list that shows what it caught is worth more than one
+# that only shows what's left. Five rounds running, this sweep has found
+# exactly what it was pointed at and missed everything it wasn't:
 #
 # 1. Every move here is against ONE mailbox (`_MAILBOX`). Cross-mailbox
 #    state leakage -- one mailbox's record somehow perturbing another's
@@ -1639,7 +1690,10 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    keys its dicts by `MailboxRef`, so this is probably fine, but
 #    "probably fine" is exactly the kind of claim this project's other
 #    audit findings have repeatedly shown needs an executable check, not
-#    an assumption.
+#    an assumption. Re-read for CLOSE8-4 and still open -- the
+#    single-mailbox scope of every move here is structural to how
+#    `_apply_move`/`_snapshot` are built, not a small addition; this is
+#    the item worth picking up next.
 # 2. `THROTTLE_PERFORMED` always uses a fixed `current_daily_limit=100`.
 #    The sweep never exercises a limit that GROWS between throttles (an
 #    operator manually raising it back up outside the breaker), nor
@@ -1647,14 +1701,18 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    same sequence -- only ever "still 100, or whatever `_act` computed
 #    last." CLOSE4-1's `is_idempotent_replay` logic is keyed on exactly
 #    this comparison, and its edge cases beyond "never changes" or "grows
-#    once" are unswept.
-# 3. `compliance_gate_tripped` (the hard PAUSE gate from
-#    `signals.postmaster.forces_hard_gate`) has no move at all.
-#    `DecisionRecord` doesn't persist whether a PAUSE was compliance-forced
-#    or ladder-derived, so a compliance-forced PAUSE record replays
-#    identically to an ordinary one today -- believed harmless, since
-#    `from_log` only ever reads `verdict`/`action_outcome`, but "believed"
-#    is doing the same load-bearing work item 1 above flags.
+#    once" are unswept. Re-read for CLOSE8-4 and still open.
+# 3. CLOSED (CLOSE8-1). `compliance_gate_tripped` (the hard PAUSE gate from
+#    `signals.postmaster.forces_hard_gate`) had no move, and this item's
+#    own "believed harmless... but 'believed' is doing the same
+#    load-bearing work item 1 above flags" turned out to be exactly right:
+#    the streak dimension (never the status/limit ones) diverged live-vs-
+#    replay, because `evaluate()`'s compliance branch skipped the same
+#    `clear_unsupported_throttle_streak` call every OTHER PAUSE-producing
+#    path made. `COMPLIANCE_PAUSE` is now in `_PERMUTATION_MOVES` below.
+#    This is the list doing exactly what it was written to do -- naming a
+#    gap precisely enough that finding what was in it was mechanical, not
+#    exploratory.
 # 4. The floor-escalation (CLOSE-3d, a throttle whose halved result would
 #    be <= the floor) and unsupported-streak-escalation (CLOSE3-2) paths
 #    to PAUSE are never swept as their OWN move -- only a fresh ladder
@@ -1662,16 +1720,39 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    `sends=5000, complaints=40`) is. Both escalation paths produce a
 #    verdict=PAUSE record exactly like the ladder's own PAUSE does, so this
 #    is likely another "same shape, untested independently" gap rather
-#    than a known divergence.
+#    than a known divergence. Re-read for CLOSE8-4 and still open --
+#    unlike item 3, nothing this round touched makes this one more or
+#    less likely to be live.
 # 5. No sequence longer than 3 moves is ever swept (`repeat=3`), and no
 #    move appears more than 3 times total across a sequence. A defect
 #    requiring a 4th- or 5th-order interaction -- CLOSE5-2 needed 3 moves
 #    with a repeat that `permutations` alone couldn't produce; nothing
 #    guarantees the next one needs only 3 either -- would be invisible
-#    here by construction, not by oversight.
-#
-# None of these are closed by this round. They're named so the next
-# session doesn't have to rediscover them by finding the bug first.
+#    here by construction, not by oversight. Re-read for CLOSE8-4 and
+#    still open.
+# 6. NEW (CLOSE8-4, from CLOSE8-2). No driver's read-path exception types
+#    were ever enumerated against what `cli.main` actually catches, until
+#    CLOSE8-2 did it once, by hand, after `SesDriver._daily_sums` already
+#    tracebacked in production. The four `httpx`-based drivers turned out
+#    fine (`httpx.HTTPError` covers all of them, `MalformedResponseError`
+#    covers the rest), but that was verified this round, not before it --
+#    the next driver added to this project (a tenth surveyed platform, a
+#    new client library) needs the same enumeration done for it BEFORE it
+#    ships, not after a live account produces the exception nobody
+#    thought to catch. See CHANGELOG.md's CLOSE8-2 entry for the table.
+# 7. NEW (CLOSE8-4, from CLOSE8-3). The `in`-over-`inspect.getsource`
+#    failure shape (a docstring or comment mention alone making an `in`
+#    assertion pass, without the code it claims to check actually being
+#    there) has now appeared twice, in two different rounds, in two
+#    different functions. It is now checked structurally
+#    (`tests/test_source_inspect.py`), but that only guards THIS specific
+#    pattern in THIS suite -- whenever a future round adds any new
+#    source-level guard, of any shape, the standing question is "does this
+#    assertion pass only because the CODE has the property being checked,
+#    or could a comment/docstring/unrelated string alone make it pass?"
+#    `not in` is safe by construction; `in` needs `source_body` or an
+#    equivalent structural check (an `ast` walk, an explicit line-order
+#    comparison on already-stripped source, ...).
 
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",
@@ -1683,6 +1764,7 @@ _PERMUTATION_MOVES = (
     "OK",
     "WARN",
     "ZERO_SENDS",
+    "COMPLIANCE_PAUSE",
     "RESUME",
 )
 
@@ -1760,6 +1842,12 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         # forces the early return regardless of `driver_kwargs`, so there's
         # nothing to configure on the driver at all.
         eval_kwargs = {"sends": 0, "complaints": 0}
+    elif move == "COMPLIANCE_PAUSE":
+        # CLOSE8-1: the hard compliance gate -- always Verdict.PAUSE,
+        # regardless of sends/complaints (healthy evidence on purpose, to
+        # isolate that it's the GATE forcing PAUSE, not the evidence).
+        driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 5000, "complaints": 0, "compliance_gate_tripped": True}
     elif move == "DRY_RUN_PAUSE":
         # CLOSE7-4: same PAUSE-worthy evidence as PAUSE_PERFORMED, but
         # evaluated with `dry_run=True` below -- see `_DRY_RUN_MOVES`'s own
@@ -1809,9 +1897,9 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
     `itertools.product(moves, repeat=3)` rather than `permutations` --
     CLOSE5-2 was found only once repeated moves were covered (`permutations`
     never repeats an element), and 3 moves at a time keeps the sweep at
-    1,000 sequences (10 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
-    CLOSE7-1 added `ZERO_SENDS`) rather than needing all 10 in every
-    sequence."""
+    1,331 sequences (11 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
+    CLOSE7-1 added `ZERO_SENDS`, CLOSE8-1 added `COMPLIANCE_PAUSE`) rather
+    than needing all 11 in every sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
@@ -1819,6 +1907,194 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE8-1: a compliance-forced PAUSE must clear the streak too --------
+
+
+def _apply_compliance_pause(
+    outcome: ActionOutcome, state_store: BreakerStateStore, log_path: Path
+) -> None:
+    """A compliance-gate-forced PAUSE with a specific provider outcome --
+    healthy evidence on purpose (`sends=5000, complaints=0`), to isolate
+    that it's the GATE forcing PAUSE, not the evidence."""
+    driver = FakeDriver(pause_outcome=outcome)
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+
+def test_throttle_unsupported_then_compliance_pause_performed_agrees_on_all_three_fields(
+    tmp_path: Path,
+) -> None:
+    """CLOSE8-1's first isolated reproduction:
+    `THROTTLE_UNSUPPORTED -> COMPLIANCE_PAUSE(PERFORMED)`. Before the fix:
+    LIVE=('PAUSED', None, 1), REPLAY=('PAUSED', None, 0) -- the streak
+    diverges even though status and limit already agreed."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_compliance_pause(ActionOutcome.PERFORMED, live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSED, None, 0)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_throttle_unsupported_then_compliance_pause_failed_agrees_on_all_three_fields(
+    tmp_path: Path,
+) -> None:
+    """The second isolated reproduction:
+    `THROTTLE_UNSUPPORTED -> COMPLIANCE_PAUSE(FAILED)`. Before the fix:
+    LIVE=('PAUSE_FAILED', None, 1), REPLAY=('PAUSE_FAILED', None, 0)."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_compliance_pause(ActionOutcome.FAILED, live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSE_FAILED, None, 0)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_repeated_throttle_unsupported_around_a_compliance_pause_agrees(tmp_path: Path) -> None:
+    """The third isolated reproduction, the one that shows this is
+    consequential rather than cosmetic:
+    `THROTTLE_UNSUPPORTED x2 -> COMPLIANCE_PAUSE(FAILED) -> THROTTLE_
+    UNSUPPORTED`. Before the fix, the compliance PAUSE left the LIVE
+    streak at 2 (untouched), so the trailing `THROTTLE_UNSUPPORTED` took it
+    to 3 -- `_MAX_UNSUPPORTED_THROTTLE_STREAK` -- while REPLAY (which always
+    popped the streak for any PAUSE record) reached only 1: LIVE=
+    ('PAUSE_FAILED', None, 3), REPLAY=('PAUSE_FAILED', None, 1). A live
+    streak sitting AT the escalation threshold while the replayed one isn't
+    is what makes the NEXT evaluation on each path take a genuinely
+    different action (see
+    `test_compliance_pause_daemon_and_cron_escalate_the_same_way` below).
+    After the fix, the compliance PAUSE clears the live streak too, so both
+    paths agree at 1 -- checked here, not 3."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 2
+
+    _apply_compliance_pause(ActionOutcome.FAILED, live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 0  # cleared by the fix
+
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSE_FAILED, None, 1)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_compliance_pause_daemon_and_cron_escalate_the_same_way(tmp_path: Path) -> None:
+    """The behavioural consequence, daemon vs cron, on the exact prefix
+    from `test_repeated_throttle_unsupported_around_a_compliance_pause_
+    agrees` above: two `THROTTLE_UNSUPPORTED`, a `COMPLIANCE_PAUSE(FAILED)`,
+    a third `THROTTLE_UNSUPPORTED` -- reaching a streak of 3, exactly
+    `_MAX_UNSUPPORTED_THROTTLE_STREAK`. A FOURTH evaluation, still
+    THROTTLE-worthy evidence with `current_daily_limit` still unknown, must
+    escalate to a real PAUSE either way. Before the fix: the daemon (one
+    live `state_store`, streak genuinely at 3) escalates and calls
+    `driver.pause()` for real; the cron form (`state_store` rebuilt via
+    `from_log` between every evaluation, streak reset to 1 by the
+    compliance record) computes THROTTLE/UNSUPPORTED instead and never
+    calls the provider at all -- the exact "daemon acts for real, cron
+    doesn't" shape CLOSE3-2/CLOSE4-1/CLOSE5-2 each closed for a
+    neighbouring path."""
+
+    def _run_prefix_plus_fourth_evaluation(
+        state_store: BreakerStateStore, log_path: Path, *, restart_between_evaluations: bool
+    ) -> FakeDriver:
+        # Shared across all evaluations. `pause_outcome=FAILED` keeps the
+        # mailbox OUT of PAUSED after the compliance step -- if it
+        # PERFORMED (FakeDriver's default), `_act`'s THROTTLE branch would
+        # short-circuit as paused-idempotent for every evaluation after
+        # (CLOSE5-1), which would mask the streak-escalation question this
+        # test exists to ask.
+        driver = FakeDriver(pause_outcome=ActionOutcome.FAILED)
+        for _ in range(2):  # the 1st and 2nd THROTTLE_UNSUPPORTED evaluations
+            evaluation = evaluate(
+                driver=driver,
+                mailbox=_MAILBOX,
+                sends=20_000,
+                complaints=30,
+                current_daily_limit=None,
+                prior=DEFAULT_PRIOR,
+                thresholds=DEFAULT_LADDER,
+                state_store=state_store,
+                dry_run=False,
+                now=_NOW,
+            )
+            append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+            if restart_between_evaluations:
+                state_store = BreakerStateStore.from_log(log_path)
+
+        compliance_eval = evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=5000,
+            complaints=0,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            compliance_gate_tripped=True,
+        )
+        append_record(log_path, DecisionRecord.from_evaluation(compliance_eval))
+        if restart_between_evaluations:
+            state_store = BreakerStateStore.from_log(log_path)
+
+        for _ in range(2):  # the 3rd and the escalating 4th THROTTLE_UNSUPPORTED evaluation
+            evaluation = evaluate(
+                driver=driver,
+                mailbox=_MAILBOX,
+                sends=20_000,
+                complaints=30,
+                current_daily_limit=None,
+                prior=DEFAULT_PRIOR,
+                thresholds=DEFAULT_LADDER,
+                state_store=state_store,
+                dry_run=False,
+                now=_NOW,
+            )
+            append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+            if restart_between_evaluations:
+                state_store = BreakerStateStore.from_log(log_path)
+
+        return driver
+
+    daemon_store = BreakerStateStore()
+    daemon_driver = _run_prefix_plus_fourth_evaluation(
+        daemon_store, tmp_path / "daemon.jsonl", restart_between_evaluations=False
+    )
+
+    cron_driver = _run_prefix_plus_fourth_evaluation(
+        BreakerStateStore(), tmp_path / "cron.jsonl", restart_between_evaluations=True
+    )
+
+    assert daemon_driver.pause_calls == cron_driver.pause_calls
+    assert daemon_driver.throttle_calls == cron_driver.throttle_calls
+
+    final_daemon = BreakerStateStore.from_log(tmp_path / "daemon.jsonl")
+    final_cron = BreakerStateStore.from_log(tmp_path / "cron.jsonl")
+    assert final_daemon.status_of(_MAILBOX) == final_cron.status_of(_MAILBOX)
 
 
 # --- CLOSE7-4: the dry-run asymmetry, pinned rather than left as a gap ----

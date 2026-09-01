@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import TextIO
 
 import httpx
+from botocore.exceptions import NoRegionError
 
 from deliverability_guard.audit.log import (
     DecisionRecord,
@@ -150,8 +151,22 @@ def build_driver(provider: str, *, env: Mapping[str, str]) -> ProviderDriver:
         # constructs deterministically from the same config source
         # everything else here reads from.
         region_name = env.get("AWS_REGION")
+        try:
+            inner = SesDriver(region_name=region_name)
+        except NoRegionError as exc:
+            # CLOSE8-2: `boto3.client(...)` raises this at CONSTRUCTION time
+            # (region resolution, unlike credential resolution, happens
+            # immediately, not on the first real request) when no region is
+            # configured anywhere -- env, shared config, or here. A missing
+            # region is a setup problem exactly like a missing credential
+            # just above, not a live provider failure, so it gets the same
+            # exit code as every other "you forgot to configure something"
+            # case in this function, not a bare traceback.
+            raise CliError(
+                "AWS_REGION is not set and no region is configured elsewhere (see .env.example)"
+            ) from exc
         return SesConfigurationSetDriver(
-            inner=SesDriver(region_name=region_name),
+            inner=inner,
             configuration_set_name=configuration_set_name,
         )
     if provider == "noop":
@@ -443,6 +458,26 @@ def main(argv: Sequence[str] | None = None) -> int:
             # undocumented traceback.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except Exception as exc:  # CLOSE8-2, see this except's own comment below
+            # CLOSE8-2: the CHANGELOG's CLOSE7-2 entry claimed "no future
+            # driver bug or malformed response can traceback either
+            # command, even one this fix doesn't anticipate" -- measured
+            # false. Only `ValueError` was ever caught; a `KeyError`,
+            # `TypeError`, `AttributeError`, an unwrapped `RuntimeError`
+            # from a driver, or anything else this project's own drivers
+            # don't yet anticipate all tracebacked with no exit code,
+            # entirely outside the documented 0/1/2/3 map -- the exact
+            # thing `CliError`'s docstring, and that claim, both promise
+            # never happens. This is deliberately the LAST except clause:
+            # every exception type this module already gives a more
+            # specific, more useful message for is caught above and never
+            # reaches here. What's left is, by construction, unanticipated
+            # -- and unanticipated is exactly the case a cron entry point
+            # must never turn into a bare traceback for, because there is
+            # no way to enumerate every exception type every current and
+            # future driver's client library might ever raise.
+            print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "run":
         try:
@@ -470,6 +505,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValueError as exc:
             # CLOSE7-2: see the identical `check` handler just above.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except Exception as exc:  # CLOSE8-2, see the identical `check` handler above
+            print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "status":
