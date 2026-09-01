@@ -16,12 +16,17 @@ so the one-shot and continuous forms cannot drift apart from each other.
 Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
 was refused), 2 a config/setup error (bad YAML, unknown provider, missing
 credential), 3 a provider transport failure (network error, rate limit
-exhausted, malformed response) OR a decision-log write failure (CLOSE9-2:
-`resume`'s own `append_resume_record` call can fail -- a read-only mount, a
-full disk, a directory owned by a different user -- and that failure must
-never collide with exit 1, which already means "refused") -- distinct from
-1 so a cron wrapper can tell "the fleet is healthy" apart from "we
-couldn't even ask the provider" or "we couldn't record what we did."
+exhausted, malformed response) OR a decision-log write failure -- both
+`resume`'s `append_resume_record` call (CLOSE9-2) and `check`/`run`'s own
+per-mailbox `append_record` calls (CLOSE10-2) write to the same decision
+log and can fail the same ways (a read-only mount, a full disk, a
+directory owned by a different user); each gets its own message naming
+the write failure specifically, distinct from a real provider failure, so
+the catch-all's generic wording stays reserved for something genuinely
+unanticipated -- and exit 3 must never collide with exit 1, which already
+means "refused." Distinct from 1 so a cron wrapper can tell "the fleet is
+healthy" apart from "we couldn't even ask the provider" or "we couldn't
+record what we did."
 """
 
 import argparse
@@ -479,6 +484,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # undocumented traceback.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except OSError as exc:
+            # CLOSE10-2: `on_evaluation`'s own `append_record` call (a LOCAL
+            # decision-log write, not a provider request) used to fall
+            # through to the catch-all below and get the exact same
+            # "unexpected failure evaluating provider data" message a real
+            # provider failure gets -- true exit code, wrong story: a
+            # read-only decision-log directory has nothing to do with the
+            # provider. Caught here, specifically, with the same wording
+            # CLOSE9-2 already gave `resume`'s identical write path, so the
+            # catch-all below keeps its generic wording for things that are
+            # genuinely unexpected, not for a local disk CLOSE9-2 already
+            # named once.
+            print(f"error: could not record a decision: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2, see this except's own comment below
             # CLOSE8-2: the CHANGELOG's CLOSE7-2 entry claimed "no future
             # driver bug or malformed response can traceback either
@@ -538,6 +557,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValueError as exc:
             # CLOSE7-2: see the identical `check` handler just above.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except OSError as exc:
+            # CLOSE10-2: see the identical `check` handler just above.
+            print(f"error: could not record a decision: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2/CLOSE9-2, see the identical `check` handler above
             print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)

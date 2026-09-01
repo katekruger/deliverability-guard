@@ -157,6 +157,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: `check`/`run`'s own decision-log write failure blamed the
+  provider** (external audit finding CLOSE10-2). A read-only decision-log
+  directory makes `on_evaluation`'s own `append_record` call raise
+  `OSError` -- nothing about provider data failed, the mailbox was read
+  and evaluated correctly. Before this fix, that `OSError` fell through to
+  CLOSE8-2's generic catch-all and printed "unexpected failure evaluating
+  provider data," blaming the provider for a local disk problem. The exit
+  code (3) was already right; only the message was wrong. `check` and
+  `run` now catch `OSError` specifically, between `ValueError` and the
+  catch-all, with the same "could not record a decision" wording CLOSE9-2
+  already gave `resume`'s identical write path -- so the catch-all's
+  generic message stays reserved for something genuinely unanticipated,
+  not a local disk failure this project already has a name for.
+
 - **`README.md`: the exit-code map had drifted stale** (external audit
   finding CLOSE10-1). CLOSE9-2 updated `cli.py`'s module docstring and the
   `--help` epilog to document exit 3 as also covering a decision-log

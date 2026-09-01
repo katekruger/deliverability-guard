@@ -1114,6 +1114,73 @@ def test_main_run_reports_a_valueerror_from_evaluation_with_its_own_exit_code(
     assert exit_code == 3
 
 
+# --- CLOSE10-2: check/run's own decision-log write failure must not blame
+# the provider ---------------------------------------------------------
+
+
+def test_main_check_reports_a_decision_log_write_failure_specifically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE10-2: a read-only decision-log directory makes `on_evaluation`'s
+    own `append_record` call raise `OSError` -- nothing about PROVIDER data
+    failed (the mailbox was read and evaluated just fine), but before this
+    fix the exception fell through to CLOSE8-2's generic catch-all and
+    printed "unexpected failure evaluating provider data," blaming the
+    provider for a local disk problem. The exit code (3) was already
+    right; only the message was wrong. Now gets the same specific wording
+    CLOSE9-2 already gave `resume`'s identical write path."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    def _raising_append_record(path: Path, record: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    monkeypatch.setattr(cli_module, "append_record", _raising_append_record)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    printed = err.getvalue()
+    assert "could not record a decision" in printed
+    assert "provider data" not in printed
+    assert "Traceback" not in printed
+
+
+def test_main_run_reports_a_decision_log_write_failure_specifically(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same property, `run` side."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    def _raising_append_record(path: Path, record: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    monkeypatch.setattr(cli_module, "append_record", _raising_append_record)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+    printed = err.getvalue()
+    assert "could not record a decision" in printed
+    assert "provider data" not in printed
+    assert "Traceback" not in printed
+
+
 # --- CLOSE8-2: real botocore/AWS errors get a documented exit code too -----
 
 
