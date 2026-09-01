@@ -1683,6 +1683,7 @@ _PERMUTATION_MOVES = (
     "OK",
     "WARN",
     "ZERO_SENDS",
+    "COMPLIANCE_PAUSE",
     "RESUME",
 )
 
@@ -1760,6 +1761,12 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         # forces the early return regardless of `driver_kwargs`, so there's
         # nothing to configure on the driver at all.
         eval_kwargs = {"sends": 0, "complaints": 0}
+    elif move == "COMPLIANCE_PAUSE":
+        # CLOSE8-1: the hard compliance gate -- always Verdict.PAUSE,
+        # regardless of sends/complaints (healthy evidence on purpose, to
+        # isolate that it's the GATE forcing PAUSE, not the evidence).
+        driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 5000, "complaints": 0, "compliance_gate_tripped": True}
     elif move == "DRY_RUN_PAUSE":
         # CLOSE7-4: same PAUSE-worthy evidence as PAUSE_PERFORMED, but
         # evaluated with `dry_run=True` below -- see `_DRY_RUN_MOVES`'s own
@@ -1809,9 +1816,9 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
     `itertools.product(moves, repeat=3)` rather than `permutations` --
     CLOSE5-2 was found only once repeated moves were covered (`permutations`
     never repeats an element), and 3 moves at a time keeps the sweep at
-    1,000 sequences (10 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
-    CLOSE7-1 added `ZERO_SENDS`) rather than needing all 10 in every
-    sequence."""
+    1,331 sequences (11 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
+    CLOSE7-1 added `ZERO_SENDS`, CLOSE8-1 added `COMPLIANCE_PAUSE`) rather
+    than needing all 11 in every sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
@@ -1819,6 +1826,194 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE8-1: a compliance-forced PAUSE must clear the streak too --------
+
+
+def _apply_compliance_pause(
+    outcome: ActionOutcome, state_store: BreakerStateStore, log_path: Path
+) -> None:
+    """A compliance-gate-forced PAUSE with a specific provider outcome --
+    healthy evidence on purpose (`sends=5000, complaints=0`), to isolate
+    that it's the GATE forcing PAUSE, not the evidence."""
+    driver = FakeDriver(pause_outcome=outcome)
+    evaluation = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+
+
+def test_throttle_unsupported_then_compliance_pause_performed_agrees_on_all_three_fields(
+    tmp_path: Path,
+) -> None:
+    """CLOSE8-1's first isolated reproduction:
+    `THROTTLE_UNSUPPORTED -> COMPLIANCE_PAUSE(PERFORMED)`. Before the fix:
+    LIVE=('PAUSED', None, 1), REPLAY=('PAUSED', None, 0) -- the streak
+    diverges even though status and limit already agreed."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_compliance_pause(ActionOutcome.PERFORMED, live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSED, None, 0)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_throttle_unsupported_then_compliance_pause_failed_agrees_on_all_three_fields(
+    tmp_path: Path,
+) -> None:
+    """The second isolated reproduction:
+    `THROTTLE_UNSUPPORTED -> COMPLIANCE_PAUSE(FAILED)`. Before the fix:
+    LIVE=('PAUSE_FAILED', None, 1), REPLAY=('PAUSE_FAILED', None, 0)."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_compliance_pause(ActionOutcome.FAILED, live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSE_FAILED, None, 0)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_repeated_throttle_unsupported_around_a_compliance_pause_agrees(tmp_path: Path) -> None:
+    """The third isolated reproduction, the one that shows this is
+    consequential rather than cosmetic:
+    `THROTTLE_UNSUPPORTED x2 -> COMPLIANCE_PAUSE(FAILED) -> THROTTLE_
+    UNSUPPORTED`. Before the fix, the compliance PAUSE left the LIVE
+    streak at 2 (untouched), so the trailing `THROTTLE_UNSUPPORTED` took it
+    to 3 -- `_MAX_UNSUPPORTED_THROTTLE_STREAK` -- while REPLAY (which always
+    popped the streak for any PAUSE record) reached only 1: LIVE=
+    ('PAUSE_FAILED', None, 3), REPLAY=('PAUSE_FAILED', None, 1). A live
+    streak sitting AT the escalation threshold while the replayed one isn't
+    is what makes the NEXT evaluation on each path take a genuinely
+    different action (see
+    `test_compliance_pause_daemon_and_cron_escalate_the_same_way` below).
+    After the fix, the compliance PAUSE clears the live streak too, so both
+    paths agree at 1 -- checked here, not 3."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 2
+
+    _apply_compliance_pause(ActionOutcome.FAILED, live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 0  # cleared by the fix
+
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+
+    assert _snapshot(live_store) == (MailboxBreakerStatus.PAUSE_FAILED, None, 1)
+    replayed = BreakerStateStore.from_log(log_path)
+    assert _snapshot(replayed) == _snapshot(live_store)
+
+
+def test_compliance_pause_daemon_and_cron_escalate_the_same_way(tmp_path: Path) -> None:
+    """The behavioural consequence, daemon vs cron, on the exact prefix
+    from `test_repeated_throttle_unsupported_around_a_compliance_pause_
+    agrees` above: two `THROTTLE_UNSUPPORTED`, a `COMPLIANCE_PAUSE(FAILED)`,
+    a third `THROTTLE_UNSUPPORTED` -- reaching a streak of 3, exactly
+    `_MAX_UNSUPPORTED_THROTTLE_STREAK`. A FOURTH evaluation, still
+    THROTTLE-worthy evidence with `current_daily_limit` still unknown, must
+    escalate to a real PAUSE either way. Before the fix: the daemon (one
+    live `state_store`, streak genuinely at 3) escalates and calls
+    `driver.pause()` for real; the cron form (`state_store` rebuilt via
+    `from_log` between every evaluation, streak reset to 1 by the
+    compliance record) computes THROTTLE/UNSUPPORTED instead and never
+    calls the provider at all -- the exact "daemon acts for real, cron
+    doesn't" shape CLOSE3-2/CLOSE4-1/CLOSE5-2 each closed for a
+    neighbouring path."""
+
+    def _run_prefix_plus_fourth_evaluation(
+        state_store: BreakerStateStore, log_path: Path, *, restart_between_evaluations: bool
+    ) -> FakeDriver:
+        # Shared across all evaluations. `pause_outcome=FAILED` keeps the
+        # mailbox OUT of PAUSED after the compliance step -- if it
+        # PERFORMED (FakeDriver's default), `_act`'s THROTTLE branch would
+        # short-circuit as paused-idempotent for every evaluation after
+        # (CLOSE5-1), which would mask the streak-escalation question this
+        # test exists to ask.
+        driver = FakeDriver(pause_outcome=ActionOutcome.FAILED)
+        for _ in range(2):  # the 1st and 2nd THROTTLE_UNSUPPORTED evaluations
+            evaluation = evaluate(
+                driver=driver,
+                mailbox=_MAILBOX,
+                sends=20_000,
+                complaints=30,
+                current_daily_limit=None,
+                prior=DEFAULT_PRIOR,
+                thresholds=DEFAULT_LADDER,
+                state_store=state_store,
+                dry_run=False,
+                now=_NOW,
+            )
+            append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+            if restart_between_evaluations:
+                state_store = BreakerStateStore.from_log(log_path)
+
+        compliance_eval = evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=5000,
+            complaints=0,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            compliance_gate_tripped=True,
+        )
+        append_record(log_path, DecisionRecord.from_evaluation(compliance_eval))
+        if restart_between_evaluations:
+            state_store = BreakerStateStore.from_log(log_path)
+
+        for _ in range(2):  # the 3rd and the escalating 4th THROTTLE_UNSUPPORTED evaluation
+            evaluation = evaluate(
+                driver=driver,
+                mailbox=_MAILBOX,
+                sends=20_000,
+                complaints=30,
+                current_daily_limit=None,
+                prior=DEFAULT_PRIOR,
+                thresholds=DEFAULT_LADDER,
+                state_store=state_store,
+                dry_run=False,
+                now=_NOW,
+            )
+            append_record(log_path, DecisionRecord.from_evaluation(evaluation))
+            if restart_between_evaluations:
+                state_store = BreakerStateStore.from_log(log_path)
+
+        return driver
+
+    daemon_store = BreakerStateStore()
+    daemon_driver = _run_prefix_plus_fourth_evaluation(
+        daemon_store, tmp_path / "daemon.jsonl", restart_between_evaluations=False
+    )
+
+    cron_driver = _run_prefix_plus_fourth_evaluation(
+        BreakerStateStore(), tmp_path / "cron.jsonl", restart_between_evaluations=True
+    )
+
+    assert daemon_driver.pause_calls == cron_driver.pause_calls
+    assert daemon_driver.throttle_calls == cron_driver.throttle_calls
+
+    final_daemon = BreakerStateStore.from_log(tmp_path / "daemon.jsonl")
+    final_cron = BreakerStateStore.from_log(tmp_path / "cron.jsonl")
+    assert final_daemon.status_of(_MAILBOX) == final_cron.status_of(_MAILBOX)
 
 
 # --- CLOSE7-4: the dry-run asymmetry, pinned rather than left as a gap ----

@@ -304,23 +304,81 @@ class BreakerStateStore:
         Every OTHER branch was checked against this same question --
         "does `evaluate()` ever pair this verdict/action_outcome with
         `INSUFFICIENT_DATA`, and if so does this branch already do the
-        right thing?" -- while fixing this. The answer for all of them is
-        yes, already correct, and for the same reason: `evaluate()` can
-        only ever produce `INSUFFICIENT_DATA` two ways -- the `sends == 0`
-        early return just described (always `Verdict.OK`, always
-        `action=None`), or `compliance_gate_tripped` with `sends == 0`
-        (always `Verdict.PAUSE`, with a REAL `action` -- the compliance gate
-        overrides volume, not the other way around). The PAUSE branch above
-        already keys entirely off `action_outcome`, never `data_state`, so a
-        compliance-forced PAUSE on zero sends replays correctly with no
-        change needed -- `data_state` never distinguishes a real action from
-        a fake one there, because `INSUFFICIENT_DATA` paired with PAUSE
-        always means a real `_act` call happened. THROTTLE can never pair
-        with `INSUFFICIENT_DATA` at all (THROTTLE requires `sends > 0` to
-        even compute a verdict past the ladder). The only place
-        `INSUFFICIENT_DATA` could ever masquerade as evidence was the
-        OK-verdict recovery check, which is why that is the only branch
-        that needed to change.
+        right thing?" -- while fixing this. The `status`/`throttled_at_
+        limit` answer for all of them is yes, already correct, and for the
+        same reason: `evaluate()` can only ever produce `INSUFFICIENT_DATA`
+        two ways -- the `sends == 0` early return just described (always
+        `Verdict.OK`, always `action=None`), or `compliance_gate_tripped`
+        with `sends == 0` (always `Verdict.PAUSE`, with a REAL `action` --
+        the compliance gate overrides volume, not the other way around).
+        The PAUSE branch above already keys `status`/`throttled_at_limit`
+        entirely off `action_outcome`, never `data_state`, so a
+        compliance-forced PAUSE replays with the SAME status and limit the
+        live path reaches -- `data_state` never distinguishes a real action
+        from a fake one there, because `INSUFFICIENT_DATA` paired with
+        PAUSE always means a real `_act` call happened.
+
+        CLOSE8-1: that check covered two of THREE state dimensions.
+        `unsupported_streak` was the one CLOSE7-1's own audit didn't
+        re-apply to the branch it was checking next to: `evaluate()`'s
+        compliance-gate branch (this module, near the top of `evaluate`)
+        returns before the normal path's `if verdict is not Verdict.
+        THROTTLE: state_store.clear_unsupported_throttle_streak(mailbox)`
+        line, so a compliance-forced PAUSE leaves a pre-existing streak
+        counting on the LIVE path -- while this PAUSE branch here
+        unconditionally pops the streak for every PAUSE record it replays,
+        with no way to tell a compliance-forced one apart from an ordinary
+        one (`DecisionRecord` doesn't persist `compliance_gate_tripped`).
+        `evaluate()`'s compliance branch now clears the streak explicitly,
+        matching every other PAUSE-producing path. See that branch's own
+        comment for the reproduction and why it mattered
+        (`_MAX_UNSUPPORTED_THROTTLE_STREAK` gates a REAL escalation).
+
+        The full per-branch table, all three dimensions, `evaluate()`/
+        `_act()` against replay here -- written down in full (CHANGELOG.md's
+        CLOSE8-1 entry carries the same table, unwrapped, since a table
+        this wide doesn't fit this file's 100-column limit) because
+        CLOSE8-1 is exactly what skipping this the first time costs. Every
+        row agrees, post-CLOSE8-1; CLOSE8-1's fix is the only cell that was
+        ever wrong:
+
+        - `sends<0`/`complaints<0`: raises, nothing ever persisted -- n/a.
+        - `sends==0` or `complaints>sends`, not compliance-gated: all three
+          untouched, live and replay agree (the dedicated `OK`+
+          `INSUFFICIENT_DATA` elif above does nothing, same as the
+          producer).
+        - `compliance_gate_tripped`, any `data_state`: status/limit via
+          `_act`'s PAUSE branch, streak cleared (CLOSE8-1) -- agrees with
+          the PAUSE branch below, which keys status/limit off
+          `action_outcome` and always pops the streak.
+        - Ladder PAUSE (raw breach, floor- or streak-escalated): same as
+          compliance-gated, streak cleared before `_act` runs -- agrees.
+        - Ladder THROTTLE/PERFORMED: status/limit via `_act`'s THROTTLE
+          branch (limit set to `current_daily_limit`), streak cleared --
+          agrees with the THROTTLE/PERFORMED branch below.
+        - Ladder THROTTLE/UNSUPPORTED: status/limit untouched, streak
+          incremented -- agrees with THROTTLE/UNSUPPORTED below.
+        - Ladder THROTTLE/FAILED: status/limit untouched, streak cleared --
+          agrees with THROTTLE/FAILED below.
+        - Ladder OK, sustained recovery from THROTTLED: `mark_active`
+          (status ACTIVE, limit and streak cleared) -- agrees with the
+          OK-recovery elif below.
+        - Ladder OK (not a recovery), or WARN: all three untouched except
+          the streak, which clears -- agrees with the final `else` below.
+        - `_act` PAUSE, already PAUSED (idempotent): all untouched -- agrees
+          with the already-PAUSED guard below (CLOSE6-2).
+        - `_act` PAUSE, PERFORMED: `mark_paused`, limit untouched -- agrees
+          with the PAUSE/PERFORMED branch below.
+        - `_act` PAUSE, UNSUPPORTED: `mark_active` (status ACTIVE, limit
+          cleared) -- agrees with the PAUSE/UNSUPPORTED branch below.
+        - `_act` PAUSE, FAILED: `mark_pause_failed`, limit untouched --
+          agrees with the PAUSE/FAILED branch below.
+        - `_act` THROTTLE, already PAUSED (CLOSE5-1): status/limit
+          untouched; the streak DOES clear, but not via the `verdict is not
+          THROTTLE` line (verdict here IS THROTTLE) -- `_act` returns
+          PERFORMED, so `evaluate()`'s own PERFORMED-outcome branch clears
+          it. Agrees with the THROTTLE/PERFORMED branch's already-PAUSED
+          sub-case below.
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
@@ -774,6 +832,23 @@ def evaluate(
             dry_run=dry_run,
             current_daily_limit=current_daily_limit,
         )
+        # CLOSE8-1: this branch returns before the `if verdict is not
+        # Verdict.THROTTLE: clear_unsupported_throttle_streak(mailbox)` line
+        # near the bottom of the normal (non-compliance) path -- every OTHER
+        # way `evaluate()` can produce a PAUSE (a raw ladder breach, the
+        # floor-escalation guard, the CLOSE3-2 streak-escalation guard) goes
+        # through that line first, but a compliance-forced PAUSE never did.
+        # `from_log`'s PAUSE branch, by contrast, unconditionally pops the
+        # streak for every PAUSE record it replays, with no way to tell a
+        # compliance-forced PAUSE apart from an ordinary one (`DecisionRecord`
+        # doesn't persist `compliance_gate_tripped`) -- so LIVE kept
+        # counting a pre-existing streak through a compliance PAUSE while
+        # REPLAY reset it to 0, and `_MAX_UNSUPPORTED_THROTTLE_STREAK` gates
+        # a REAL escalation to PAUSE. Explicit here, matching the normal
+        # path's own clear, rather than silently relying on `_act` to do it
+        # (it doesn't -- `_act` never touches the streak at all; every
+        # streak mutation happens in `evaluate()` around the `_act` call).
+        state_store.clear_unsupported_throttle_streak(mailbox)
         return BreakerEvaluation(
             evaluated_at=now,
             mailbox=mailbox,

@@ -157,6 +157,67 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: a compliance-forced PAUSE diverged live-vs-replay
+  on the unsupported-throttle streak** (external audit finding CLOSE8-1 --
+  blind-spot list item 3, `tests/test_breaker.py:1627`, found exactly what
+  it was written to point at). `evaluate()`'s `compliance_gate_tripped`
+  branch returns before the normal path's `if verdict is not Verdict.
+  THROTTLE: state_store.clear_unsupported_throttle_streak(mailbox)` line,
+  so a compliance-forced PAUSE left a pre-existing streak counting on the
+  LIVE path, while `from_log`'s PAUSE branch unconditionally pops the
+  streak for every PAUSE record it replays (it has no way to tell a
+  compliance-forced PAUSE apart from an ordinary one -- `DecisionRecord`
+  doesn't persist `compliance_gate_tripped`). Reproduction: `THROTTLE_
+  UNSUPPORTED x2 -> COMPLIANCE_PAUSE(FAILED) -> THROTTLE_UNSUPPORTED`
+  reached LIVE=`('PAUSE_FAILED', None, 3)` vs REPLAY=`('PAUSE_FAILED',
+  None, 1)` -- the live streak sitting AT
+  `_MAX_UNSUPPORTED_THROTTLE_STREAK` while the replayed one wasn't meant a
+  daemon covering that exact history made a SECOND real `driver.pause()`
+  call on the next evaluation (a genuine CLOSE3-2 streak escalation) while
+  the cron-shaped form (restarting between every evaluation) computed
+  THROTTLE/UNSUPPORTED instead and never called the provider at all -- the
+  same "daemon acts for real, cron doesn't" shape CLOSE3-2, CLOSE4-1, and
+  CLOSE5-2 each closed for a neighbouring path. Latent today
+  (`compliance_gate_tripped` has no CLI caller yet -- see `loops/fast.py`'s
+  own docstring and `test_reachability.py`'s exemption for
+  `signals.postmaster`), live the moment Postmaster is wired.
+
+  Fixed by having the compliance branch call
+  `clear_unsupported_throttle_streak` explicitly before returning,
+  matching every other PAUSE-producing path. `from_log`'s own docstring
+  previously claimed a compliance-forced PAUSE "replays correctly with no
+  change needed" -- true for status and `throttled_at_limit`, false for
+  the streak; corrected. `COMPLIANCE_PAUSE` added to the permutation sweep
+  (1,000 -> 1,331 sequences).
+
+  The per-branch table this finding was supposed to produce the first
+  time (CLOSE7-1 audited `data_state` alone; this is the same audit run
+  again against all three state dimensions -- status, `throttled_at_
+  limit`, `unsupported_streak` -- for every branch of `evaluate()`/`_act`
+  against the matching replay branch in `from_log`, written down in full
+  here since it doesn't fit `engine/breaker.py`'s own docstring inside the
+  100-column limit):
+
+  | Producer (`evaluate`/`_act`) | status | `throttled_at_limit` | `unsupported_streak` | Replay branch (`from_log`) |
+  |---|---|---|---|---|
+  | `sends<0` / `complaints<0` | raises, never persisted | raises, never persisted | raises, never persisted | n/a -- no record ever written |
+  | `sends==0` or `complaints>sends`, not compliance-gated | untouched | untouched | untouched | dedicated `OK`+`INSUFFICIENT_DATA` elif -- untouched (agrees) |
+  | `compliance_gate_tripped`, any `data_state` | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared (CLOSE8-1) | PAUSE branch -- status/limit via `action_outcome`, streak popped unconditionally (agrees, post-fix) |
+  | Ladder PAUSE (raw breach, floor- or streak-escalated) | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared before `_act` runs | PAUSE branch (agrees) |
+  | Ladder THROTTLE, PERFORMED | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, UNSUPPORTED | untouched | untouched | incremented | THROTTLE/UNSUPPORTED branch (agrees) |
+  | Ladder THROTTLE, FAILED | untouched | untouched | cleared | THROTTLE/FAILED branch (agrees) |
+  | Ladder OK (sustained recovery from THROTTLED) | `mark_active` | cleared | cleared | OK-recovery elif (agrees) |
+  | Ladder OK (not a recovery) / WARN | untouched | untouched | cleared | final `else` (agrees) |
+  | `_act` PAUSE: already PAUSED (idempotent) | untouched | untouched | (caller clears, see above) | already-PAUSED guard (CLOSE6-2, agrees) |
+  | `_act` PAUSE: PERFORMED | `mark_paused` | untouched | (caller clears, see above) | PAUSE/PERFORMED branch (agrees) |
+  | `_act` PAUSE: UNSUPPORTED | `mark_active` | cleared (`mark_active`) | (caller clears, see above) | PAUSE/UNSUPPORTED branch (agrees) |
+  | `_act` PAUSE: FAILED | `mark_pause_failed` | untouched | (caller clears, see above) | PAUSE/FAILED branch (agrees) |
+  | `_act` THROTTLE: already PAUSED (CLOSE5-1) | untouched | untouched | cleared -- not via the `is not THROTTLE` line (verdict here IS THROTTLE), but `_act` returns PERFORMED so `evaluate()`'s own PERFORMED-outcome branch clears it | THROTTLE/PERFORMED, already-PAUSED sub-case (agrees) |
+
+  Every row agrees, post-fix. Nothing else in the table needed a change --
+  CLOSE8-1's fix is the only cell that was ever wrong.
+
 - **`tests/test_cli.py`: the `check`/`run` drift guard was vacuous**
   (external audit finding CLOSE7-3).
   `test_check_and_run_share_the_same_evaluation_chokepoint` asserted
