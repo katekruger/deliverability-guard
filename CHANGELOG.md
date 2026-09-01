@@ -157,6 +157,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`README.md`: the capability matrix's "campaign only" pause marks
+  described driver-API surface the breaker itself never reaches** (external
+  audit finding CLOSE4-3, a documentation decision rather than a bug).
+  `engine.breaker.evaluate`'s ladder only ever constructs a `MailboxRef`,
+  never a `CampaignRef` — so through the CLI, PAUSE actually executes
+  against exactly one provider (`instantly`) and THROTTLE against exactly
+  one (`smartlead`); no single provider can do both, and Lemlist/Apollo/
+  SES's campaign-level pause methods, while real and tested, are
+  unreachable from the breaker's own evaluation loop. Added a paragraph to
+  the README explaining this explicitly, rather than teaching the ladder to
+  pause a `CampaignRef` (real, undecided v0.2 scope — pausing an entire
+  campaign to handle one mailbox's bad evidence is a disproportionate
+  action this project has not decided the breaker should take
+  automatically).
+
+- **`engine/breaker.py`: `from_log` silently un-paused a PAUSED mailbox**
+  (external audit finding CLOSE4-1, and the cause of CLOSE4-2's
+  never-terminating escalation cycle). Three of `_act`'s branches never
+  touch `state_store` on the live path — a THROTTLE verdict with an
+  UNSUPPORTED or FAILED outcome, and a THROTTLE verdict whose PERFORMED
+  outcome was actually `_act`'s own idempotent no-op — but `from_log`
+  unconditionally set `status[mailbox] = ACTIVE` (or, for the idempotent
+  PERFORMED case, `THROTTLED`) for all three, silently overwriting a
+  PAUSED status a `PAUSE`/`PERFORMED` record earlier in the log had put
+  behind the human-review gate (ADR 0003) — contradicting the gate itself,
+  `from_log`'s own docstring, and README.md:58. Reproduction: ten
+  unattended `check` runs against a provider that reports no daily limit
+  escalated to PAUSE via CLOSE3-2's streak on run 4, then a
+  THROTTLE/UNSUPPORTED record on run 5 un-paused it, and the
+  escalate-then-un-pause cycle repeated with period 4 forever — a real
+  provider `pause()` call every time it escalated, not once. Fixed: a
+  record whose action did not touch the provider now leaves status (and,
+  where relevant, `throttled_at_limit`) untouched during replay, exactly
+  mirroring `_act`. The idempotent-PERFORMED case is distinguished from a
+  genuine throttle purely from records already replayed: a genuine
+  throttle always sets `throttled_at_limit` for the first time or to a
+  STRICTLY larger value, while an idempotent replay's `applied_daily_limit`
+  never exceeds what's already tracked. A new property-style test
+  (`test_from_log_replay_matches_the_live_path_over_every_move_ordering`)
+  asserts replayed status equals live-path status over all 720 orderings of
+  six representative moves (PAUSE/PERFORMED, THROTTLE/PERFORMED,
+  THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME) — the invariant meant
+  to stop this exact defect shape recurring a fifth time. Ten consecutive
+  `check` processes against a provider with no daily limit now reach PAUSED
+  once, on run 4, and stay there through run 10, with exactly one real
+  provider pause call.
+
 - **`cli.py`/`README.md`: two small documentation corrections** (external
   audit finding CLOSE3-6). `build_parser()` set no `epilog`, so `--help`'s
   rendered text had no exit-code content at all, despite a commit message
