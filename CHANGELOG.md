@@ -157,6 +157,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_source_inspect.py`: the checker built for CLOSE8-3 did not
+  catch CLOSE8-3's own vacuous-guard shape** (external audit finding
+  CLOSE9-3). The original checker was a single-line regex,
+  `r"(?<!not )\bin\s+inspect\.getsource\("`, scanning a NON-recursive
+  glob (`Path(__file__).resolve().parent.glob("test_*.py")`). Two
+  confirmed holes: (1) CLOSE8-3's actual vacuous guard split the pattern
+  across two statements (`source = inspect.getsource(f)`, then later
+  `source.index(...)`) -- reverting `test_act_checks_paused_status_
+  before_ever_calling_throttle` to that exact shape and re-running the
+  checker: green. (2) The glob never descended into `tests/experimental/`,
+  `tests/providers/`, `tests/signals/`, `tests/loops/`,
+  `tests/identity/`, or `tests/audit/` -- a bare offending pattern placed
+  in any of them: also green. The file's own docstring claimed it "makes
+  a THIRD bare occurrence something the suite itself catches" --
+  measured false for the shape the second occurrence actually had, and
+  for six of the suite's directories. (Mitigating: the BEHAVIOURAL
+  consequence of the underlying mutation is still caught in depth by ~60
+  other test failures elsewhere in the suite -- this was a defence-in-depth
+  gap in the meta-checker, not a live escape hatch for the real defect.)
+
+  Fixed by replacing the regex with an `ast`-based checker: it parses each
+  file, tracks which names are bound directly to `inspect.getsource(...)`
+  (never wrapped by `source_body`) within a function -- including nested
+  `def`s, since both CLOSE7-3's and CLOSE8-3's own mutations built a
+  nested stand-in function -- then flags any `in` comparison or
+  `.index()`/`.find()` call against either that name or an inline
+  `inspect.getsource(...)` call, however many statements apart. The glob
+  is now `rglob`, recursive into every subdirectory. Reapplying the exact
+  two-statement mutation (reverted, re-tested, re-restored) now fails the
+  checker; two new regression tests pin the two-statement shape and
+  subdirectory recursion directly against synthetic source, independent
+  of any real file. Docstring corrected to describe what the checker
+  actually catches, including the two prior holes by name.
+
 - **`cli.py`: `resume` had no exception handler at all, and its uncaught
   failure exit code collided with a documented one** (external audit
   finding CLOSE9-2 -- production-reachable, and CLOSE8-2's class in the
