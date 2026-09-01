@@ -728,16 +728,41 @@ def evaluate(
     `sends == 0`, since the compliance verdict is an account-level fact
     Google is asserting independent of today's send volume, not something
     derived from today's data at all.
+
+    `sends == 0` OR `complaints > sends` both mean the same thing --
+    there isn't enough coherent data to compute a posterior at all -- and
+    both produce `DataState.INSUFFICIENT_DATA`/`Verdict.OK`/`action=None`
+    (CLOSE7-2). `complaints > sends` is not a caller bug: bounce/complaint
+    feedback lags sends by 24h-3 days (README's own documented lag), so a
+    real provider's aggregation window can legitimately report a bounce
+    against a day whose matching sends haven't landed, or already rolled
+    out of the window. `sends < 0` and `complaints < 0` remain `ValueError`
+    -- those genuinely cannot happen from any real count, coherent or not.
     """
     if sends < 0:
         raise ValueError(f"sends must be >= 0, got {sends}")
-    if not 0 <= complaints <= sends:
-        raise ValueError(f"complaints must be between 0 and sends ({sends}), got {complaints}")
+    if complaints < 0:
+        raise ValueError(f"complaints must be >= 0, got {complaints}")
+
+    # CLOSE7-2: `complaints > sends` is data a real provider can legitimately
+    # produce -- bounce/complaint feedback lags sends by 24h-3 days (this
+    # project's own README), so a query window can catch a bounce reported
+    # against a day whose send count hasn't landed yet, or has already
+    # rolled out of the window. That is a DATA-QUALITY condition, not a
+    # programmer error: raising `ValueError` for it (as this function used
+    # to) tracebacks a real evaluation loop out of `cli.cmd_check`, entirely
+    # outside the documented exit-code map. Treated the same way `sends ==
+    # 0` already is -- `DataState.INSUFFICIENT_DATA`, `Verdict.OK`, no
+    # action -- rather than special-cased differently: both are "the
+    # numbers on hand do not support a verdict," which is exactly what
+    # `DataState` exists to represent (`engine/state.py`'s own module
+    # docstring).
+    data_is_sufficient = sends > 0 and complaints <= sends
 
     if compliance_gate_tripped:
         posterior = (
             _posterior_for(prior, sends, complaints, peer_group, max_pooled_ess)
-            if sends > 0
+            if data_is_sufficient
             else None
         )
         lower_bound = posterior.lower_bound(confidence) if posterior is not None else None
@@ -754,7 +779,7 @@ def evaluate(
             mailbox=mailbox,
             sends=sends,
             complaints=complaints,
-            data_state=DataState.OK if sends > 0 else DataState.INSUFFICIENT_DATA,
+            data_state=DataState.OK if data_is_sufficient else DataState.INSUFFICIENT_DATA,
             prior=prior,
             posterior=posterior,
             lower_bound=lower_bound,
@@ -765,7 +790,7 @@ def evaluate(
             action=action,
         )
 
-    if sends == 0:
+    if not data_is_sufficient:
         return BreakerEvaluation(
             evaluated_at=now,
             mailbox=mailbox,

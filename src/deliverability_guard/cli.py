@@ -434,6 +434,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         except (httpx.HTTPError, ProviderError) as exc:
             print(f"error: provider request failed: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except ValueError as exc:
+            # CLOSE7-2: a provider can report a data shape `evaluate()`
+            # still can't make sense of -- this is the same category as a
+            # transport failure from this CLI's own perspective ("we
+            # couldn't get a real verdict out of what the provider sent
+            # back"), so it gets the same exit code rather than an
+            # undocumented traceback.
+            print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "run":
         try:
@@ -457,6 +466,10 @@ def main(argv: Sequence[str] | None = None) -> int:
             return _EXIT_OK
         except (httpx.HTTPError, ProviderError) as exc:
             print(f"error: provider request failed: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except ValueError as exc:
+            # CLOSE7-2: see the identical `check` handler just above.
+            print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "status":

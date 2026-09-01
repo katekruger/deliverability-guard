@@ -157,6 +157,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`, `engine/changepoint.py`: a bounce-only day crashed
+  `check` with an uncaught `ValueError`** (external audit finding CLOSE7-2).
+  `evaluate()` required `0 <= complaints <= sends` and raised otherwise --
+  but bounce/complaint feedback lags sends by 24h-3 days (this project's
+  own README), so a real provider's aggregation window can legitimately
+  report a complaint/bounce against a day whose matching sends haven't
+  landed yet or already rolled out of the window. `providers/ses.py`
+  demonstrates it plainly: a CloudWatch `Bounce` datapoint on a day with no
+  `Send` datapoint reports `MailboxDayStats(sends=0, bounces=N)`, faithfully
+  and correctly -- the driver does nothing wrong. `cli.main` only caught
+  `httpx.HTTPError`/`ProviderError`, so this tracebacked `check` entirely
+  outside the documented exit-code map, contradicting `CliError`'s own
+  docstring promise. `engine.changepoint.cusum_step`, which
+  `evaluate_all_mailboxes` runs alongside `evaluate()` against the same
+  aggregated totals, had the identical validation and the identical bug.
+
+  Fixed at the root, in both functions (CLOSE7-1's own reasoning applies
+  again): `complaints > sends` is now treated exactly like `sends == 0`
+  already was -- `DataState.INSUFFICIENT_DATA`/`Verdict.OK`/no action in
+  `evaluate()`, an unchanged, non-alarming statistic in `cusum_step()` --
+  rather than a `ValueError`. `sends < 0` and `complaints < 0` remain
+  `ValueError`: those genuinely cannot happen from any real count.
+  `cli.main` also now catches `ValueError` around both `check` and `run`'s
+  evaluation loops, mapping to the existing exit code 3 (provider transport
+  failure) as defense in depth -- so no future driver bug or malformed
+  response can traceback either command, even one this fix doesn't
+  anticipate. Tests: an SES fixture with a bounce-only day exercised end to
+  end through `check` (exit 0, one clean line, `DataState.
+  INSUFFICIENT_DATA` in the decision record); a driver reporting negative
+  sends exercises the new `ValueError` catch directly; a bounce-only-day
+  property test parametrized over every CLI-selectable provider name.
+
 - **`engine/breaker.py`: a zero-send day replayed as a recovery, and cron
   compounded where the daemon did not** (external audit finding CLOSE7-1
   -- CLOSE3-1's compounding failure, resurfaced through a door the

@@ -115,19 +115,73 @@ def test_rejects_negative_sends() -> None:
         )
 
 
-def test_rejects_complaints_greater_than_sends() -> None:
+def test_rejects_negative_complaints() -> None:
     with pytest.raises(ValueError, match="complaints"):
         evaluate(
             driver=FakeDriver(),
             mailbox=_MAILBOX,
             sends=5,
-            complaints=6,
+            complaints=-1,
             prior=DEFAULT_PRIOR,
             thresholds=DEFAULT_LADDER,
             state_store=BreakerStateStore(),
             dry_run=True,
             now=_NOW,
         )
+
+
+def test_complaints_greater_than_sends_is_insufficient_data_not_a_valueerror() -> None:
+    """CLOSE7-2: `complaints > sends` used to raise `ValueError` -- a
+    programmer-error framing for something a real provider can
+    legitimately produce (bounce/complaint feedback lags sends by 24h-3
+    days; a query window can catch a bounce for a day whose sends haven't
+    landed, or already rolled out). Treated the same as `sends == 0` --
+    `DataState.INSUFFICIENT_DATA`, `Verdict.OK`, no action -- rather than
+    a traceback that would propagate out of a real evaluation loop."""
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5,
+        complaints=6,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert result.data_state is DataState.INSUFFICIENT_DATA
+    assert result.verdict is Verdict.OK
+    assert result.action is None
+    assert result.posterior is None
+    assert result.lower_bound is None
+    assert driver.pause_calls == []
+    assert driver.throttle_calls == []
+
+
+def test_complaints_greater_than_sends_under_compliance_gate_still_pauses(tmp_path: Path) -> None:
+    """The compliance-forced-PAUSE analogue: incoherent counts under a
+    hard compliance gate must not crash either, and the gate still wins --
+    Google's own account-level verdict is independent of today's send
+    volume or its internal consistency."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5,
+        complaints=6,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    assert result.verdict is Verdict.PAUSE
+    assert result.data_state is DataState.INSUFFICIENT_DATA
+    assert result.posterior is None
+    assert driver.pause_calls == [_MAILBOX]
 
 
 # --- evaluate(): the ladder itself ----------------------------------------
