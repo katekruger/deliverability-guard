@@ -212,6 +212,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one source of truth and have the others point at it, the same lesson
   `campaign-preflight` already encoded in its own `AGENTS.md`.
 
+- **`tests/test_source_inspect.py`: the CLOSE9-3 guard's own docstring
+  overclaimed its reach** (external audit finding CLOSE10-5 -- a
+  documentation overclaim, explicitly framed by the finding as a judgment
+  call rather than a defect). The guard is a literal-shape matcher pinned
+  to four things at once: the attribute chain `inspect.getsource`
+  specifically, a direct `Name = Call` binding, the operators
+  `in`/`.index`/`.find`, and a `test_`-prefixed enclosing function. Its own
+  docstrings said it catches the vacuous-guard pattern "regardless of how
+  many statements separate the two" -- true only along that one axis
+  (statement distance); nine other shapes were verified to pass it
+  vacuously: `from inspect import getsource`, `import inspect as insp`,
+  an intermediate re-binding (`raw = getsource(f); src = raw`), a walrus
+  (`assert "x" in (src := inspect.getsource(f))`), `Path(mod.__file__)
+  .read_text()`, `.count("x") > 0`, and the check tucked inside a
+  non-`test_`-prefixed helper function. Not fixed by widening the guard:
+  closing all nine would mean re-implementing real taint tracking (which
+  names alias `inspect`, which helper functions are themselves unsafe)
+  inside a test file, a cost this round's own time pressure is the wrong
+  moment to spend against no evidence any of the nine has occurred as a
+  real mutation -- manufacturing that scope now would be the same
+  fabricated-thoroughness mistake CLOSE10-3 chose not to make about a
+  threshold. Chosen instead: narrow the claim. Both docstrings (the module
+  docstring and `test_no_test_function_uses_raw_inspect_getsource_
+  unsafely`'s own) now name what the guard actually pins on, and list all
+  nine known-vacuous shapes by name, so a future audit finds them recorded
+  rather than rediscovering them as news. Pure documentation change: no
+  assertion logic touched, no new test needed beyond the existing suite
+  passing on the (unmodified) checker.
+
 - **`tests/test_breaker.py`: the blind-spot list kept alive again**
   (CLOSE9-5). Items 1, 2, 4, and 5 -- re-read with fresh eyes every round
   since CLOSE7-4 and left open each time -- were specific enough to be

@@ -31,6 +31,43 @@ names are bound directly to `inspect.getsource(...)` -- unwrapped by
 `.index()`/`.find()` call against either that name OR an inline
 `inspect.getsource(...)` call, however many statements apart), and the
 glob is `rglob`, recursive into every subdirectory.
+
+CLOSE10-5: this guard covers the two INSTANCES CLOSE9-3 named, not the
+CLASS of evasion a determined (or merely differently-styled) future
+mutation could take. It is a literal-shape matcher, pinned to four things
+at once: the attribute chain `inspect.getsource` specifically (not
+`from inspect import getsource` or `import inspect as insp`), a direct
+`Name = Call` assignment (not a walrus, an `import`-time alias, or a
+helper function that wraps the call), the operators `in`/`.index`/`.find`
+specifically (not `.count(...) > 0` or a raw byte-offset `re` search over
+a file read directly from disk), and a `test_`-prefixed enclosing function
+(the check itself is only ever invoked from inside one -- a non-`test_`
+helper function calling `inspect.getsource` unsafely, then called BY a
+test, is invisible to it). Nine such evasions were verified to pass this
+guard vacuously before CLOSE10-5 corrected this docstring's own claim
+(which previously said "however many statements apart" as though that
+were the guard's only limitation):
+
+```
+from inspect import getsource        import inspect as insp
+raw = getsource(f); src = raw        assert "x" in (src := inspect.getsource(f))
+Path(mod.__file__).read_text()       inspect.getsource(f).count("x") > 0
+def _src(f): return getsource(f)     the check in a non-test_ helper
+```
+
+`_KNOWN_VACUOUS_DEMONSTRATIONS` also exempts by function NAME, so an
+exemption travels with a name rather than with the file or the specific
+mutation shape -- a name reused by accident (or a rename that collides)
+silently exempts unrelated code too.
+
+This is a recorded judgment call, not a to-do: widening the guard to close
+every one of the nine shapes above would mean re-implementing a real
+taint-tracking analysis (which name is an alias for `inspect`, which
+helper functions are themselves unsafe, ...) inside a test file, at a cost
+this project has not decided is worth paying for a guard whose PRIMARY
+value -- the two real, already-seen shapes -- is already closed. If a
+tenth evasion shows up as a real mutation some future round finds, that is
+the signal to revisit this trade-off with real evidence, not before.
 """
 
 import ast
@@ -167,14 +204,25 @@ def test_no_test_function_uses_raw_inspect_getsource_unsafely(path: Path) -> Non
     """CLOSE8-3's structural guard, fixed for CLOSE9-3's two holes: scans
     every test file, RECURSIVELY (subdirectories included), via `ast`
     rather than a single-line regex -- so a raw `inspect.getsource(...)`
-    result used in an `in` check or `.index()`/`.find()` call is caught
+    result bound directly to a name and then used in an `in` check or
+    `.index()`/`.find()` call, via THAT exact attribute chain, is caught
     regardless of how many statements separate the two, and regardless of
     which subdirectory the file lives in. Outside the two known,
     deliberate demonstrations above, any match means a new source-level
     guard was written the same vulnerable way CLOSE7-3, CLOSE8-3, AND
     CLOSE9-3's own reproduction all found -- fix it by routing through
     `source_body` instead, the same way every real guard in this suite
-    already does."""
+    already does.
+
+    CLOSE10-5: this is a literal-shape matcher, not a general taint
+    tracker -- it does not follow `from inspect import getsource`,
+    `import inspect as insp`, an intermediate re-binding (`raw = src;
+    src2 = raw`), a walrus (`:=`), `.count(...) > 0`, a direct
+    `Path(...).read_text()` re-read of the module's own file, or an
+    unsafe use tucked inside a non-`test_`-prefixed helper function. See
+    the module docstring's "Known scope" note for the full list of shapes
+    verified to pass this guard vacuously; this is a recorded limitation,
+    not a claim the guard doesn't have."""
     tree = ast.parse(path.read_text())
     offending: list[str] = []
     for node in ast.walk(tree):
