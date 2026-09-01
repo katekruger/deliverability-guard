@@ -183,6 +183,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reapplies the exact mutation shape against a stand-in function and
   confirms the vacuous guard passes it while the fixed one doesn't.
 
+- **`tests/test_breaker.py`: the dry-run daemon/cron asymmetry the
+  permutation sweep couldn't see** (CLOSE7-4, a known-gap closure rather
+  than a bug fix). `_apply_move` never passed `dry_run=True`, so the whole
+  class of divergence CLOSE6-4 decided and pinned with one hand-written
+  CLI-level test rested on that one test alone -- the sweep itself was
+  blind to it. Added `DRY_RUN_PAUSE`, deliberately kept OUT of
+  `_PERMUTATION_MOVES` (folding it in would make the main sweep's blanket
+  LIVE == REPLAY assertion permanently red, since the asymmetry is
+  intentional, not a bug) and swept separately with the actual expected
+  asymmetry spelled out: `from_log` skipping a dry-run record is tested as
+  "replaying a log equals replaying that same log with its dry-run
+  record(s) deleted afterward" -- not "re-run the sequence with the move
+  skipped," which changes what LATER moves in the sequence themselves
+  decide to do, since a dry-run move does mutate the live in-process store
+  (that's the point of it) -- over 100 surrounding-move combinations, plus
+  one explicit worked example pinning the live side actually accumulating.
+  Also written into the test file, per the audit's own closing
+  instruction, rather than closed: five specific places this sweep still
+  cannot see (cross-mailbox leakage, a non-monotonic `current_daily_limit`
+  across repeated throttles, `compliance_gate_tripped`, the floor- and
+  streak-escalation paths to PAUSE as their own move, and any defect
+  needing a 4th-or-later-order move interaction) -- named so a future
+  session doesn't have to rediscover them by finding the bug first.
+
 - **`engine/breaker.py`, `engine/changepoint.py`: a bounce-only day crashed
   `check` with an uncaught `ValueError`** (external audit finding CLOSE7-2).
   `evaluate()` required `0 <= complaints <= sends` and raised otherwise --

@@ -1624,6 +1624,55 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
+# --- What the sweep below still cannot see (CLOSE7-4) ---------------------
+#
+# Written down deliberately, not fixed here -- per the round-7 audit's own
+# closing instruction: the highest-value thing a session like this one can
+# do is name what the sweep is still blind to, even where nothing gets
+# closed. Four rounds running, this sweep has found exactly what it was
+# pointed at and missed everything it wasn't -- these are the places it
+# isn't pointed yet:
+#
+# 1. Every move here is against ONE mailbox (`_MAILBOX`). Cross-mailbox
+#    state leakage -- one mailbox's record somehow perturbing another's
+#    replayed status -- is entirely untested by this sweep. `from_log`
+#    keys its dicts by `MailboxRef`, so this is probably fine, but
+#    "probably fine" is exactly the kind of claim this project's other
+#    audit findings have repeatedly shown needs an executable check, not
+#    an assumption.
+# 2. `THROTTLE_PERFORMED` always uses a fixed `current_daily_limit=100`.
+#    The sweep never exercises a limit that GROWS between throttles (an
+#    operator manually raising it back up outside the breaker), nor
+#    fluctuates non-monotonically across repeated THROTTLE moves in the
+#    same sequence -- only ever "still 100, or whatever `_act` computed
+#    last." CLOSE4-1's `is_idempotent_replay` logic is keyed on exactly
+#    this comparison, and its edge cases beyond "never changes" or "grows
+#    once" are unswept.
+# 3. `compliance_gate_tripped` (the hard PAUSE gate from
+#    `signals.postmaster.forces_hard_gate`) has no move at all.
+#    `DecisionRecord` doesn't persist whether a PAUSE was compliance-forced
+#    or ladder-derived, so a compliance-forced PAUSE record replays
+#    identically to an ordinary one today -- believed harmless, since
+#    `from_log` only ever reads `verdict`/`action_outcome`, but "believed"
+#    is doing the same load-bearing work item 1 above flags.
+# 4. The floor-escalation (CLOSE-3d, a throttle whose halved result would
+#    be <= the floor) and unsupported-streak-escalation (CLOSE3-2) paths
+#    to PAUSE are never swept as their OWN move -- only a fresh ladder
+#    PAUSE from bad complaint evidence (`PAUSE_PERFORMED`'s
+#    `sends=5000, complaints=40`) is. Both escalation paths produce a
+#    verdict=PAUSE record exactly like the ladder's own PAUSE does, so this
+#    is likely another "same shape, untested independently" gap rather
+#    than a known divergence.
+# 5. No sequence longer than 3 moves is ever swept (`repeat=3`), and no
+#    move appears more than 3 times total across a sequence. A defect
+#    requiring a 4th- or 5th-order interaction -- CLOSE5-2 needed 3 moves
+#    with a repeat that `permutations` alone couldn't produce; nothing
+#    guarantees the next one needs only 3 either -- would be invisible
+#    here by construction, not by oversight.
+#
+# None of these are closed by this round. They're named so the next
+# session doesn't have to rediscover them by finding the bug first.
+
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",
     "PAUSE_UNSUPPORTED",
@@ -1636,6 +1685,25 @@ _PERMUTATION_MOVES = (
     "ZERO_SENDS",
     "RESUME",
 )
+
+# CLOSE7-4: `DRY_RUN_PAUSE` is deliberately NOT part of `_PERMUTATION_MOVES`
+# above. The main sweep asserts LIVE == REPLAY for every ordering -- but a
+# dry-run move breaks that equality ON PURPOSE (CLOSE6-4's own decision):
+# the live in-process `state_store` keeps accumulating a dry-run mutation
+# across ticks (so a second dry-run evaluation of an already-dry-run-paused
+# mailbox correctly reports "already paused," matching what a LIVE daemon
+# would decide -- AGENTS.md's "dry-run decisions must be identical to the
+# live path"), while `from_log` deliberately skips every dry-run record
+# entirely when rebuilding across a restart (CLOSE-4: a dry-run action
+# never touched the real provider, so it must never be read back as
+# durable history). Folding `DRY_RUN_PAUSE` into `_PERMUTATION_MOVES` would
+# make every sequence containing it register as a "mismatch" the main
+# sweep has no way to distinguish from a real regression -- it would
+# either have to special-case dry-run moves inline (defeating the point of
+# one shared, blind comparison) or go permanently red. Tested separately
+# below instead, with the actual expected asymmetry spelled out, so this
+# is a known, pinned gap rather than one the sweep is silently blind to.
+_DRY_RUN_MOVES = ("DRY_RUN_PAUSE",)
 
 
 def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> None:
@@ -1692,7 +1760,13 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         # forces the early return regardless of `driver_kwargs`, so there's
         # nothing to configure on the driver at all.
         eval_kwargs = {"sends": 0, "complaints": 0}
-    else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES
+    elif move == "DRY_RUN_PAUSE":
+        # CLOSE7-4: same PAUSE-worthy evidence as PAUSE_PERFORMED, but
+        # evaluated with `dry_run=True` below -- see `_DRY_RUN_MOVES`'s own
+        # comment for why this move is excluded from `_PERMUTATION_MOVES`.
+        driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 5000, "complaints": 40}
+    else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES + _DRY_RUN_MOVES
         raise AssertionError(f"unhandled move {move!r}")
 
     driver = FakeDriver(**driver_kwargs)  # type: ignore[arg-type]
@@ -1702,7 +1776,7 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         prior=DEFAULT_PRIOR,
         thresholds=DEFAULT_LADDER,
         state_store=state_store,
-        dry_run=False,
+        dry_run=move in _DRY_RUN_MOVES,
         now=_NOW,
         **eval_kwargs,  # type: ignore[arg-type]
     )
@@ -1745,6 +1819,80 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE7-4: the dry-run asymmetry, pinned rather than left as a gap ----
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    [(a, "DRY_RUN_PAUSE", b) for a in _PERMUTATION_MOVES for b in _PERMUTATION_MOVES],
+)
+def test_from_log_replay_is_unaffected_by_a_dry_run_move_anywhere_in_the_sequence(
+    sequence: tuple[str, str, str], tmp_path: Path
+) -> None:
+    """The half of the asymmetry that IS a universal invariant, regardless
+    of where the dry-run move sits or what surrounds it: `from_log` skips
+    every dry-run record entirely (CLOSE-4), so replaying a log must equal
+    replaying that SAME log with its dry-run record(s) deleted afterward.
+    This is what "the replayed store does not accumulate" actually means,
+    made explicit and swept over every surrounding pair rather than
+    asserted for one hand-picked example.
+
+    Deliberately NOT "re-run the sequence with the dry-run move skipped":
+    `_apply_move`'s later calls consult `state_store.status_of` (e.g.
+    `PAUSE_UNSUPPORTED`'s outcome depends on whether the mailbox is
+    already PAUSED), and a dry-run move DOES mutate the live in-process
+    store (CLOSE6-4's own decision) -- so skipping it changes what the
+    LATER moves in the sequence themselves decide to do, which is a
+    different question from what THIS RECORD contributes to replay. Only
+    comparing against the same already-generated log with the dry-run
+    record removed isolates that."""
+    from deliverability_guard.audit.log import read_events
+
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    for move in sequence:
+        _apply_move(move, live_store, log_path)
+    replayed_with_dry_run = BreakerStateStore.from_log(log_path)
+
+    log_path_without = tmp_path / "decisions_without_dry_run.jsonl"
+    for event in read_events(log_path):
+        if isinstance(event, DecisionRecord) and event.dry_run:
+            continue
+        if isinstance(event, DecisionRecord):
+            append_record(log_path_without, event)
+        else:
+            append_resume_record(log_path_without, event)
+    replayed_without_dry_run = (
+        BreakerStateStore.from_log(log_path_without)
+        if log_path_without.exists()
+        else BreakerStateStore()
+    )
+
+    assert _snapshot(replayed_with_dry_run) == _snapshot(replayed_without_dry_run), sequence
+
+
+def test_dry_run_pause_accumulates_live_but_not_in_replay(tmp_path: Path) -> None:
+    """The other half: a single explicit worked example of the live side
+    actually accumulating, which the sweep above deliberately does not
+    (and structurally cannot, without asserting "must differ" -- not
+    always true, e.g. when the mailbox is already PAUSED for an unrelated
+    reason and the dry-run pause is itself an idempotent no-op) claim as a
+    universal property. From ACTIVE: a `DRY_RUN_PAUSE` moves the LIVE
+    in-process store to PAUSED (matching what a live daemon's second tick
+    would report -- "already paused" -- on a THIRD dry-run evaluation),
+    while replaying the very same record leaves the mailbox ACTIVE,
+    because `from_log` never touched it at all."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+
+    _apply_move("DRY_RUN_PAUSE", live_store, log_path)
+
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+    replayed = BreakerStateStore.from_log(log_path)
+    assert replayed.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
 
 
 # --- CLOSE7-1: a zero-send day is silence, never a recovery --------------
