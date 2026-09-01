@@ -466,7 +466,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   | Driver | Read-path exception source | Where it lands |
   |---|---|---|
-  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and the `StreamError` family (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, a `RuntimeError`) [CORRECTED, CLOSE9-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and `httpx.StreamError` itself plus its four subclasses (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, all a `RuntimeError`) [CORRECTED, CLOSE9-4/CLOSE10-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
   | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
   | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers, same three-family gap) | same handlers |
   | `lemlist.py` | same shape | same handlers |
@@ -494,6 +494,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately, not fixed: the fallthrough behavior is already correct
   and safe, and this is a documentation-accuracy fix, not a functional
   gap, per AGENTS.md's "no new features beyond what closes the finding."
+
+  **Correction (CLOSE10-4):** the table above enumerated the `StreamError`
+  family by its four concrete subclasses only. `httpx.StreamError` is
+  itself a public, directly importable and raisable exception (the base
+  class of that family, not just an abstract grouping) -- named now for
+  completeness. Same handler, same exit code as its subclasses (CLOSE8-2's
+  catch-all); this is a naming gap in the enumeration, not a behavioral one.
 
   Also, per this round's own opening instruction, `cli.main` gained a
   final, broad `except Exception` around both `check`'s and `run`'s

@@ -578,6 +578,41 @@ def test_resume_accepts_a_pause_failed_mailbox(tmp_path: Path) -> None:
     assert event.mailbox_id == "a@example.com"
 
 
+def test_resume_writes_the_record_before_mutating_the_in_process_store(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE10-4: `state_store` is meant to be a projection of the decision
+    log (`BreakerStateStore.from_log` rebuilds it from exactly this file),
+    so `cmd_resume` must write the `ResumeRecord` BEFORE mutating the
+    in-memory store, not after -- if `append_resume_record` raises (the
+    write failure CLOSE9-2 gave its own exit code), the in-process store
+    must not already have moved to ACTIVE while the log still says
+    PAUSED. Confirmed by making the write raise and checking the store
+    was never touched, not just that the exception propagated."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_paused(mailbox)
+
+    def _raising_append_resume_record(path: Path, record: object) -> None:
+        raise OSError(errno.EACCES, "Permission denied")
+
+    monkeypatch.setattr(cli_module, "append_resume_record", _raising_append_resume_record)
+
+    with pytest.raises(OSError):
+        cmd_resume(
+            mailbox=mailbox,
+            state_store=state_store,
+            decision_log_path=tmp_path / "decisions.jsonl",
+            resumed_by="kate",
+            now=_NOW,
+            out=io.StringIO(),
+        )
+
+    # The write failed -- the in-process store must still say PAUSED, not
+    # have already moved on to ACTIVE ahead of a log that never recorded it.
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+
+
 def test_resume_refusal_message_names_what_can_be_resumed(tmp_path: Path) -> None:
     """CLOSE9-1: the refusal message used to only say what the mailbox
     WASN'T ("is not paused or throttled"), a dead end. It now names the
@@ -985,8 +1020,9 @@ def test_main_check_reports_an_httpx_transport_error_with_its_own_exit_code(
         lambda: httpx.InvalidURL("bad url"),
         lambda: httpx.CookieConflict("dup"),
         lambda: httpx.StreamConsumed(),
+        lambda: httpx.StreamError("generic stream error"),  # CLOSE10-4: the base itself
     ],
-    ids=["InvalidURL", "CookieConflict", "StreamConsumed"],
+    ids=["InvalidURL", "CookieConflict", "StreamConsumed", "StreamError"],
 )
 def test_main_check_survives_httpx_exceptions_outside_httpxerror(
     make_exc: Callable[[], Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch

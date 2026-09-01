@@ -371,7 +371,19 @@ def cmd_resume(
             file=out,
         )
         return _EXIT_BREACH_OR_REFUSED
-    state_store.resume_after_human_review(mailbox)
+    # CLOSE10-4: write the log record BEFORE mutating the in-process store,
+    # not after. `state_store` is meant to be a projection of the log
+    # (`BreakerStateStore.from_log` rebuilds it from exactly this file), so
+    # if `append_resume_record` raises (the write failure CLOSE9-2's own
+    # exception handler exists for), the in-memory store must not already
+    # have moved to ACTIVE while the log still says PAUSED -- that's a
+    # projection that has silently diverged from its own source. Harmless
+    # today (this process exits immediately either way, and the next
+    # process rebuilds fresh from the log, which is what actually happened
+    # -- nothing), but the ordering was backwards for what `state_store` is
+    # supposed to be, and "harmless today" is exactly the kind of claim
+    # this project's own audits keep finding doesn't survive a future
+    # change to how `cmd_resume` or its caller is used.
     append_resume_record(
         decision_log_path,
         ResumeRecord(
@@ -381,6 +393,7 @@ def cmd_resume(
             resumed_by=resumed_by,
         ),
     )
+    state_store.resume_after_human_review(mailbox)
     print(f"{mailbox.mailbox_id} resumed after human review (by {resumed_by})", file=out)
     return _EXIT_OK
 
