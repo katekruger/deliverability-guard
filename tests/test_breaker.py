@@ -1755,35 +1755,30 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
-# --- What the sweep below still cannot see (CLOSE7-4, updated CLOSE8-4) ---
+# --- What the sweep below still cannot see (CLOSE7-4, updated CLOSE8-4, CLOSE9-5)
 #
 # Written down deliberately -- per the round-7 audit's own closing
 # instruction: the highest-value thing a session like this one can do is
 # name what the sweep is still blind to, even where nothing gets closed.
-# Kept updated rather than deleted once an item DOES close, the way
-# `campaign-preflight`'s own report marks a finding resolved instead of
-# erasing it -- a list that shows what it caught is worth more than one
-# that only shows what's left. Five rounds running, this sweep has found
-# exactly what it was pointed at and missed everything it wasn't:
+# Kept updated rather than deleted once an item DOES close, or gets
+# measured clean, the way `campaign-preflight`'s own report marks a
+# finding resolved instead of erasing it -- a list that shows what it
+# caught (and what it checked) is worth more than one that only shows
+# what's left. Six rounds running, this sweep has found exactly what it
+# was pointed at and missed everything it wasn't:
 #
-# 1. Every move here is against ONE mailbox (`_MAILBOX`). Cross-mailbox
-#    state leakage -- one mailbox's record somehow perturbing another's
-#    replayed status -- is entirely untested by this sweep. `from_log`
-#    keys its dicts by `MailboxRef`, so this is probably fine, but
-#    "probably fine" is exactly the kind of claim this project's other
-#    audit findings have repeatedly shown needs an executable check, not
-#    an assumption. Re-read for CLOSE8-4 and still open -- the
-#    single-mailbox scope of every move here is structural to how
-#    `_apply_move`/`_snapshot` are built, not a small addition; this is
-#    the item worth picking up next.
-# 2. `THROTTLE_PERFORMED` always uses a fixed `current_daily_limit=100`.
-#    The sweep never exercises a limit that GROWS between throttles (an
-#    operator manually raising it back up outside the breaker), nor
-#    fluctuates non-monotonically across repeated THROTTLE moves in the
-#    same sequence -- only ever "still 100, or whatever `_act` computed
-#    last." CLOSE4-1's `is_idempotent_replay` logic is keyed on exactly
-#    this comparison, and its edge cases beyond "never changes" or "grows
-#    once" are unswept. Re-read for CLOSE8-4 and still open.
+# 1. MEASURED CLEAN (external audit, CLOSE9-5): interleaved two-mailbox
+#    sequences -- 0/4,096 mismatches. `from_log` keying its dicts by
+#    `MailboxRef` does appear to be genuinely fine, now checked rather than
+#    assumed. Clean at this depth is not clean forever: the sweep is
+#    reproducible and should be re-run whenever `from_log`'s own keying
+#    logic changes, not treated as permanently settled.
+# 2. MEASURED CLEAN (external audit, CLOSE9-5): a `current_daily_limit`
+#    that grows and shrinks non-monotonically across repeated THROTTLE
+#    moves in the same sequence -- 0/6,859 mismatches at length 3.
+#    CLOSE4-1's `is_idempotent_replay` comparison holds outside the
+#    "never changes" / "grows once" cases this project had actually
+#    tested before. Same caveat as item 1: reproducible, not permanent.
 # 3. CLOSED (CLOSE8-1). `compliance_gate_tripped` (the hard PAUSE gate from
 #    `signals.postmaster.forces_hard_gate`) had no move, and this item's
 #    own "believed harmless... but 'believed' is doing the same
@@ -1794,47 +1789,77 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    path made. `COMPLIANCE_PAUSE` is now in `_PERMUTATION_MOVES` below.
 #    This is the list doing exactly what it was written to do -- naming a
 #    gap precisely enough that finding what was in it was mechanical, not
-#    exploratory.
-# 4. The floor-escalation (CLOSE-3d, a throttle whose halved result would
-#    be <= the floor) and unsupported-streak-escalation (CLOSE3-2) paths
-#    to PAUSE are never swept as their OWN move -- only a fresh ladder
-#    PAUSE from bad complaint evidence (`PAUSE_PERFORMED`'s
-#    `sends=5000, complaints=40`) is. Both escalation paths produce a
-#    verdict=PAUSE record exactly like the ladder's own PAUSE does, so this
-#    is likely another "same shape, untested independently" gap rather
-#    than a known divergence. Re-read for CLOSE8-4 and still open --
-#    unlike item 3, nothing this round touched makes this one more or
-#    less likely to be live.
-# 5. No sequence longer than 3 moves is ever swept (`repeat=3`), and no
-#    move appears more than 3 times total across a sequence. A defect
-#    requiring a 4th- or 5th-order interaction -- CLOSE5-2 needed 3 moves
-#    with a repeat that `permutations` alone couldn't produce; nothing
-#    guarantees the next one needs only 3 either -- would be invisible
-#    here by construction, not by oversight. Re-read for CLOSE8-4 and
-#    still open.
+#    exploratory. CAVEAT (CLOSE9-5): `COMPLIANCE_PAUSE` in the sweep is
+#    pinned to `pause_outcome=PERFORMED` only -- the FAILED and UNSUPPORTED
+#    compliance-gated outcomes are covered by three hand-written tests
+#    (`test_throttle_unsupported_then_compliance_pause_failed_agrees_on_
+#    all_three_fields` and neighbours), NOT by the sweep itself. Item 3 is
+#    closed for the outcome the sweep actually covers; the other two
+#    outcomes are closed by different, narrower evidence.
+# 4. MEASURED CLEAN (external audit, CLOSE9-5): the floor-escalation
+#    (CLOSE-3d) and unsupported-streak-escalation (CLOSE3-2) paths to
+#    PAUSE, swept as their OWN moves rather than only via a fresh ladder
+#    PAUSE -- 0/130,321 mismatches at length 4. Same caveat as items 1-2.
+# 5. MEASURED CLEAN (external audit, CLOSE9-5): randomized sequences of
+#    length 5 to 9 (beyond the main sweep's fixed `repeat=3`) -- 0/200,000
+#    sequences. Same caveat: randomized sampling at this volume is strong
+#    evidence, not a proof, and worth re-running whenever the state
+#    machine's shape changes.
 # 6. NEW (CLOSE8-4, from CLOSE8-2). No driver's read-path exception types
 #    were ever enumerated against what `cli.main` actually catches, until
 #    CLOSE8-2 did it once, by hand, after `SesDriver._daily_sums` already
-#    tracebacked in production. The four `httpx`-based drivers turned out
-#    fine (`httpx.HTTPError` covers all of them, `MalformedResponseError`
-#    covers the rest), but that was verified this round, not before it --
-#    the next driver added to this project (a tenth surveyed platform, a
-#    new client library) needs the same enumeration done for it BEFORE it
-#    ships, not after a live account produces the exception nobody
-#    thought to catch. See CHANGELOG.md's CLOSE8-2 entry for the table.
+#    tracebacked in production. CORRECTION (CLOSE9-4): the "the four
+#    `httpx`-based drivers turned out fine, `httpx.HTTPError` covers all of
+#    them" claim this item originally repeated was ITSELF wrong -- three
+#    `httpx` exception families (`InvalidURL`, `CookieConflict`,
+#    `StreamError`) are not `httpx.HTTPError` at all. They still land
+#    safely in CLOSE8-2's catch-all (exit 3, no traceback), so this was a
+#    documentation gap, not a live one -- but it means even THIS item's own
+#    correction needed a correction, which is exactly the "verify by
+#    execution, not by re-stating the previous claim" discipline this
+#    whole list exists to enforce. The next driver added to this project
+#    (a tenth surveyed platform, a new client library) needs the same
+#    enumeration done for it BEFORE it ships, not after a live account
+#    produces the exception nobody thought to catch. See CHANGELOG.md's
+#    CLOSE8-2/CLOSE9-4 entries for the table.
 # 7. NEW (CLOSE8-4, from CLOSE8-3). The `in`-over-`inspect.getsource`
 #    failure shape (a docstring or comment mention alone making an `in`
 #    assertion pass, without the code it claims to check actually being
 #    there) has now appeared twice, in two different rounds, in two
 #    different functions. It is now checked structurally
-#    (`tests/test_source_inspect.py`), but that only guards THIS specific
-#    pattern in THIS suite -- whenever a future round adds any new
-#    source-level guard, of any shape, the standing question is "does this
-#    assertion pass only because the CODE has the property being checked,
-#    or could a comment/docstring/unrelated string alone make it pass?"
-#    `not in` is safe by construction; `in` needs `source_body` or an
-#    equivalent structural check (an `ast` walk, an explicit line-order
-#    comparison on already-stripped source, ...).
+#    (`tests/test_source_inspect.py`), but CLOSE9-3 found the checker
+#    ITSELF didn't catch the exact shape it was built for (a two-statement
+#    `source = inspect.getsource(f)` / `source.index(...)` split, and
+#    unscanned subdirectories) -- the checker is now `ast`-based and
+#    `rglob`-recursive, but the standing question for whenever a future
+#    round adds any new source-level guard, of any shape, is still: "does
+#    this assertion pass only because the CODE has the property being
+#    checked, or could a comment/docstring/unrelated string alone make it
+#    pass?" `not in` is safe by construction; `in` needs `source_body` or
+#    an equivalent structural check.
+# 8. NEW (CLOSE9-5, from CLOSE9-1) -- the headline lesson of this round,
+#    and the reason CLOSE9-1 is the most serious defect found across nine
+#    rounds. Every sweep in this file, without exception, compares LIVE
+#    against REPLAY -- an equivalence question. CLOSE9-1 (one FAILED pause
+#    attempt permanently disabling throttling for that mailbox) was
+#    invisible to every one of them: the live path and `from_log` agreed
+#    with each other at EVERY step, and the daemon and cron call shapes
+#    were IDENTICAL. They were simply both stuck in a state neither should
+#    have reached. No amount of sweeping wider, deeper, or longer closes
+#    this gap, because the gap isn't in coverage -- it's in the QUESTION
+#    the sweep asks. An equivalence test can only ever catch two
+#    implementations disagreeing; it is structurally incapable of catching
+#    a wrong answer both of them give the SAME way. This is the second
+#    time that exact limit has produced a real defect (the first was
+#    subtler and self-corrected before shipping); CLOSE9-1's own
+#    `test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_
+#    unactionable` is this project's first LIVE-vs-SHOULD test -- a
+#    property checked against what's actually correct, not against a
+#    second implementation -- and probably shouldn't be its last. Before
+#    adding the next sweep dimension, ask: is the thing I'm worried about
+#    "these two paths might disagree," or "both paths might quietly agree
+#    on something wrong"? Only a live-vs-should test answers the second
+#    question.
 
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",

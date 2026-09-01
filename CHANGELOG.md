@@ -157,6 +157,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_breaker.py`: the blind-spot list kept alive again**
+  (CLOSE9-5). Items 1, 2, 4, and 5 -- re-read with fresh eyes every round
+  since CLOSE7-4 and left open each time -- were specific enough to be
+  cheap to sweep, and all four came back MEASURED CLEAN: interleaved
+  two-mailbox sequences (item 1, 0/4,096), a `current_daily_limit` that
+  grows and shrinks non-monotonically across repeated throttles (item 2,
+  0/6,859 at length 3), the floor- and streak-escalation paths to PAUSE
+  swept as their own moves (item 4, 0/130,321 at length 4), and randomized
+  sequences of length 5-9 beyond the main sweep's fixed `repeat=3` (item
+  5, 0/200,000). Marked measured-clean with those counts rather than
+  deleted -- a list that shows what it checked is worth more than one
+  showing only what's left -- with the same caveat attached to each: clean
+  at this depth is not clean forever, and every sweep is reproducible and
+  should be re-run when the code it's checking changes shape. Item 3
+  gained a caveat of its own: `COMPLIANCE_PAUSE` in the sweep is pinned to
+  `pause_outcome=PERFORMED` only, and the FAILED/UNSUPPORTED
+  compliance-gated outcomes CLOSE9-1's own tests cover are NOT covered by
+  the sweep itself. Item 6 gained CLOSE9-4's correction in place.
+
+  New item 8, the headline lesson of this round: every sweep in this file
+  compares LIVE against REPLAY -- an equivalence question -- and CLOSE9-1
+  was invisible to all of them, because the live path and `from_log`
+  agreed at every step and were simply both wrong. An equivalence test can
+  only ever catch two implementations disagreeing; it cannot catch a wrong
+  answer both give the SAME way. CLOSE9-1's own live-vs-should property
+  test is this project's first test of that different kind, and the list
+  now asks, explicitly, for the question to be asked of every future
+  sweep addition: "might these disagree," or "might they quietly agree on
+  something wrong."
+
+  Also, while in the per-branch state table (`engine/breaker.py`'s
+  `from_log` docstring and this file's own CLOSE8-1 entry): the "Ladder
+  THROTTLE, PERFORMED" row said `throttled_at_limit` is "set to
+  `current_daily_limit`" -- true for a genuinely new throttle, not true
+  for `_act`'s limit-idempotent sub-case, where the limit is left alone
+  and no provider call happens. The already-PAUSED sub-case two rows down
+  got its own row for exactly this reason; this one hadn't. Split into
+  two rows, matching.
+
 - **`tests/test_source_inspect.py`: the checker built for CLOSE8-3 did not
   catch CLOSE8-3's own vacuous-guard shape** (external audit finding
   CLOSE9-3). The original checker was a single-line regex,
@@ -462,7 +501,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   | `sends==0` or `complaints>sends`, not compliance-gated | untouched | untouched | untouched | dedicated `OK`+`INSUFFICIENT_DATA` elif -- untouched (agrees) |
   | `compliance_gate_tripped`, any `data_state` | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared (CLOSE8-1) | PAUSE branch -- status/limit via `action_outcome`, streak popped unconditionally (agrees, post-fix) |
   | Ladder PAUSE (raw breach, floor- or streak-escalated) | via `_act`'s PAUSE branch | via `_act`'s PAUSE branch | cleared before `_act` runs | PAUSE branch (agrees) |
-  | Ladder THROTTLE, PERFORMED | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, PERFORMED -- a genuinely NEW throttle | via `_act`'s THROTTLE branch | set to `current_daily_limit` | cleared | THROTTLE/PERFORMED branch (agrees) |
+  | Ladder THROTTLE, PERFORMED -- `_act`'s limit-idempotent sub-case (CLOSE9-5 correction: this row didn't exist before, though the already-PAUSED sub-case two rows down got its own) | untouched -- `driver.throttle()` is never called | untouched, NOT "set to `current_daily_limit`" -- that's only true for a genuinely new throttle | cleared | THROTTLE/PERFORMED branch, `is_idempotent_replay` case (agrees) |
   | Ladder THROTTLE, UNSUPPORTED | untouched | untouched | incremented | THROTTLE/UNSUPPORTED branch (agrees) |
   | Ladder THROTTLE, FAILED | untouched | untouched | cleared | THROTTLE/FAILED branch (agrees) |
   | Ladder OK (sustained recovery from THROTTLED) | `mark_active` | cleared | cleared | OK-recovery elif (agrees) |

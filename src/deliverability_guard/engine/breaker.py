@@ -353,9 +353,24 @@ class BreakerStateStore:
           `action_outcome` and always pops the streak.
         - Ladder PAUSE (raw breach, floor- or streak-escalated): same as
           compliance-gated, streak cleared before `_act` runs -- agrees.
-        - Ladder THROTTLE/PERFORMED: status/limit via `_act`'s THROTTLE
-          branch (limit set to `current_daily_limit`), streak cleared --
-          agrees with the THROTTLE/PERFORMED branch below.
+        - Ladder THROTTLE/PERFORMED, a genuinely NEW throttle (no limit
+          recorded yet, or the recorded one has grown past what's on
+          file): status/limit via `_act`'s THROTTLE branch (limit set to
+          `current_daily_limit`), streak cleared -- agrees with the
+          THROTTLE/PERFORMED branch below.
+        - Ladder THROTTLE/PERFORMED, `_act`'s limit-idempotent sub-case
+          (CLOSE9-5: this row didn't exist before -- the already-PAUSED
+          sub-case two rows down got its own, this one didn't, even though
+          the SAME distinction applies): `current_daily_limit` hasn't grown
+          past the recorded `throttled_at_limit`, so `_act` returns
+          PERFORMED without ever calling `driver.throttle()` -- status and
+          limit are BOTH left exactly as they were (not "set to
+          `current_daily_limit`," which is only true for a genuinely new
+          throttle), streak cleared. Still agrees with the THROTTLE/
+          PERFORMED branch below (CLOSE4-1's own `is_idempotent_replay`
+          check exists specifically to mirror this), but the two live-path
+          sub-cases have different EFFECTS on `throttled_at_limit`, so they
+          earn separate rows here.
         - Ladder THROTTLE/UNSUPPORTED: status/limit untouched, streak
           incremented -- agrees with THROTTLE/UNSUPPORTED below.
         - Ladder THROTTLE/FAILED: status/limit untouched, streak cleared --
