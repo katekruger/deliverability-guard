@@ -46,6 +46,15 @@ This repo has conventions. Violating them wastes a review cycle.
    statistically valid complaint-rate breaker. Say so in the README and never
    soften it.
 4. **No live API calls in tests.** Recorded fixtures only.
+5. **A checkable fact restated in prose in more than one place will drift.**
+   (CLOSE10-1: the exit-code map was correct in `cli.py`'s module
+   docstring and `--help`'s epilog, and stale in `README.md`, because a
+   fix to the first two didn't touch the third.) When a fact like this
+   needs to live in more than one document, pick ONE as the source of
+   truth and have the others point at it ("see `--help`", "see `cli.py`'s
+   module docstring") rather than re-deriving their own copy. If you
+   change a canonical fact, grep for its old wording before you consider
+   the change done.
 
 ## Before opening a PR
 

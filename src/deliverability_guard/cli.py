@@ -16,12 +16,17 @@ so the one-shot and continuous forms cannot drift apart from each other.
 Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
 was refused), 2 a config/setup error (bad YAML, unknown provider, missing
 credential), 3 a provider transport failure (network error, rate limit
-exhausted, malformed response) OR a decision-log write failure (CLOSE9-2:
-`resume`'s own `append_resume_record` call can fail -- a read-only mount, a
-full disk, a directory owned by a different user -- and that failure must
-never collide with exit 1, which already means "refused") -- distinct from
-1 so a cron wrapper can tell "the fleet is healthy" apart from "we
-couldn't even ask the provider" or "we couldn't record what we did."
+exhausted, malformed response) OR a decision-log write failure -- both
+`resume`'s `append_resume_record` call (CLOSE9-2) and `check`/`run`'s own
+per-mailbox `append_record` calls (CLOSE10-2) write to the same decision
+log and can fail the same ways (a read-only mount, a full disk, a
+directory owned by a different user); each gets its own message naming
+the write failure specifically, distinct from a real provider failure, so
+the catch-all's generic wording stays reserved for something genuinely
+unanticipated -- and exit 3 must never collide with exit 1, which already
+means "refused." Distinct from 1 so a cron wrapper can tell "the fleet is
+healthy" apart from "we couldn't even ask the provider" or "we couldn't
+record what we did."
 """
 
 import argparse
@@ -328,7 +333,7 @@ def cmd_resume(
     own. Also the way an operator clears a persisted THROTTLED mailbox
     (CLOSE3-3) or a mailbox stuck `PAUSE_FAILED` (CLOSE9-1): `from_log` and
     `evaluate()` both now clear THROTTLED and PAUSE_FAILED on their own once
-    a recovered mailbox's sustained OK evidence makes it into the log (ADR
+    a recovered mailbox's single-OK recovery evidence makes it into the log (ADR
     0003's addendum), but a mailbox whose own evidence never recovers had
     no path back to ACTIVE at all before CLOSE3-3 (for THROTTLED) and
     CLOSE9-1 (for PAUSE_FAILED) -- the refusal message just said what the
@@ -338,7 +343,7 @@ def cmd_resume(
     FAILED from the provider never actually stopped the mailbox, so it is
     not behind ADR 0003's human-review gate the way a confirmed PAUSED is
     -- but before CLOSE9-1, nothing at all could move it off `PAUSE_FAILED`
-    (`cmd_resume` refused it; CLOSE-3b's sustained recovery only checked
+    (`cmd_resume` refused it; CLOSE-3b's single-OK recovery only checked
     `THROTTLED`), so `throttled_at_limit`'s idempotency memo latched
     forever and the mailbox's THROTTLE rung went permanently inert.
 
@@ -366,7 +371,19 @@ def cmd_resume(
             file=out,
         )
         return _EXIT_BREACH_OR_REFUSED
-    state_store.resume_after_human_review(mailbox)
+    # CLOSE10-4: write the log record BEFORE mutating the in-process store,
+    # not after. `state_store` is meant to be a projection of the log
+    # (`BreakerStateStore.from_log` rebuilds it from exactly this file), so
+    # if `append_resume_record` raises (the write failure CLOSE9-2's own
+    # exception handler exists for), the in-memory store must not already
+    # have moved to ACTIVE while the log still says PAUSED -- that's a
+    # projection that has silently diverged from its own source. Harmless
+    # today (this process exits immediately either way, and the next
+    # process rebuilds fresh from the log, which is what actually happened
+    # -- nothing), but the ordering was backwards for what `state_store` is
+    # supposed to be, and "harmless today" is exactly the kind of claim
+    # this project's own audits keep finding doesn't survive a future
+    # change to how `cmd_resume` or its caller is used.
     append_resume_record(
         decision_log_path,
         ResumeRecord(
@@ -376,6 +393,7 @@ def cmd_resume(
             resumed_by=resumed_by,
         ),
     )
+    state_store.resume_after_human_review(mailbox)
     print(f"{mailbox.mailbox_id} resumed after human review (by {resumed_by})", file=out)
     return _EXIT_OK
 
@@ -479,6 +497,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # undocumented traceback.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except OSError as exc:
+            # CLOSE10-2: `on_evaluation`'s own `append_record` call (a LOCAL
+            # decision-log write, not a provider request) used to fall
+            # through to the catch-all below and get the exact same
+            # "unexpected failure evaluating provider data" message a real
+            # provider failure gets -- true exit code, wrong story: a
+            # read-only decision-log directory has nothing to do with the
+            # provider. Caught here, specifically, with the same wording
+            # CLOSE9-2 already gave `resume`'s identical write path, so the
+            # catch-all below keeps its generic wording for things that are
+            # genuinely unexpected, not for a local disk CLOSE9-2 already
+            # named once.
+            print(f"error: could not record a decision: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2, see this except's own comment below
             # CLOSE8-2: the CHANGELOG's CLOSE7-2 entry claimed "no future
             # driver bug or malformed response can traceback either
@@ -538,6 +570,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         except ValueError as exc:
             # CLOSE7-2: see the identical `check` handler just above.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
+        except OSError as exc:
+            # CLOSE10-2: see the identical `check` handler just above.
+            print(f"error: could not record a decision: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2/CLOSE9-2, see the identical `check` handler above
             print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)

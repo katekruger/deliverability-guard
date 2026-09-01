@@ -157,6 +157,90 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **"Sustained recovery" renamed to "single-OK recovery"** (external audit
+  finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
+  automatic recovery path (and CLOSE9-1's extension of it to
+  `PAUSE_FAILED`) was described everywhere as "sustained recovery" or "a
+  sustained OK verdict." Measured: it fires on a SINGLE `Verdict.OK`
+  evaluation with `sends >= 1`, not a run of them --
+  `ONE OK eval with sends=1, complaints=0 -> status=ACTIVE`, then the next
+  THROTTLE re-halves. Not a CLOSE9 regression (`THROTTLED` behaved
+  identically at `f9077ff`, well before CLOSE9-1 touched this code), and
+  not a bug on its own -- CLOSE7-1's `INSUFFICIENT_DATA` guard already
+  stops silence from triggering it, so the mechanism that exists is doing
+  real work. The word was simply inaccurate: "sustained" implies evidence
+  over time; what fires is `n=1`.
+
+  Two honest options, argued in [ADR 0003's new
+  addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-09-01-sustained-recovery-was-renamed-to-single-ok-recovery----the-behavior-did-not-change):
+  rename it, or require `k` evaluations / a minimum volume before clearing
+  (a real behavior change needing its own data-grounded threshold and its
+  own tests -- picking an arbitrary `k` under this finding's own time
+  pressure would trade one overclaim for a fabricated-precision one).
+  Chosen: **rename it**. `n=1` recovery is correct once real evidence
+  exists (`DataState.OK`, not `INSUFFICIENT_DATA`); only the word claimed
+  more than that. Renamed everywhere the mechanism is described
+  (`engine/breaker.py`, `cli.py`, `docs/decisions/0008`,
+  `tests/test_breaker.py`) -- deliberately NOT touching
+  `engine/changepoint.py`'s or `loops/fast.py`'s own "sustained shift" /
+  "sustained elevated rate," which correctly describe CUSUM's different,
+  genuinely multi-period detection target. Pure rename: no test's
+  assertions changed, only their docstrings' wording.
+
+- **`cli.py`: `check`/`run`'s own decision-log write failure blamed the
+  provider** (external audit finding CLOSE10-2). A read-only decision-log
+  directory makes `on_evaluation`'s own `append_record` call raise
+  `OSError` -- nothing about provider data failed, the mailbox was read
+  and evaluated correctly. Before this fix, that `OSError` fell through to
+  CLOSE8-2's generic catch-all and printed "unexpected failure evaluating
+  provider data," blaming the provider for a local disk problem. The exit
+  code (3) was already right; only the message was wrong. `check` and
+  `run` now catch `OSError` specifically, between `ValueError` and the
+  catch-all, with the same "could not record a decision" wording CLOSE9-2
+  already gave `resume`'s identical write path -- so the catch-all's
+  generic message stays reserved for something genuinely unanticipated,
+  not a local disk failure this project already has a name for.
+
+- **`README.md`: the exit-code map had drifted stale** (external audit
+  finding CLOSE10-1). CLOSE9-2 updated `cli.py`'s module docstring and the
+  `--help` epilog to document exit 3 as also covering a decision-log
+  write failure, not just a provider transport failure -- `README.md:60`
+  was never touched, so a cron author reading only the README got `resume`
+  exiting 3 with no documented meaning for it. Brought back in sync.
+  `AGENTS.md` gained a new non-negotiable (project-specific #5): a
+  checkable fact restated in prose in more than one place will drift: pick
+  one source of truth and have the others point at it, the same lesson
+  `campaign-preflight` already encoded in its own `AGENTS.md`.
+
+- **`tests/test_source_inspect.py`: the CLOSE9-3 guard's own docstring
+  overclaimed its reach** (external audit finding CLOSE10-5 -- a
+  documentation overclaim, explicitly framed by the finding as a judgment
+  call rather than a defect). The guard is a literal-shape matcher pinned
+  to four things at once: the attribute chain `inspect.getsource`
+  specifically, a direct `Name = Call` binding, the operators
+  `in`/`.index`/`.find`, and a `test_`-prefixed enclosing function. Its own
+  docstrings said it catches the vacuous-guard pattern "regardless of how
+  many statements separate the two" -- true only along that one axis
+  (statement distance); nine other shapes were verified to pass it
+  vacuously: `from inspect import getsource`, `import inspect as insp`,
+  an intermediate re-binding (`raw = getsource(f); src = raw`), a walrus
+  (`assert "x" in (src := inspect.getsource(f))`), `Path(mod.__file__)
+  .read_text()`, `.count("x") > 0`, and the check tucked inside a
+  non-`test_`-prefixed helper function. Not fixed by widening the guard:
+  closing all nine would mean re-implementing real taint tracking (which
+  names alias `inspect`, which helper functions are themselves unsafe)
+  inside a test file, a cost this round's own time pressure is the wrong
+  moment to spend against no evidence any of the nine has occurred as a
+  real mutation -- manufacturing that scope now would be the same
+  fabricated-thoroughness mistake CLOSE10-3 chose not to make about a
+  threshold. Chosen instead: narrow the claim. Both docstrings (the module
+  docstring and `test_no_test_function_uses_raw_inspect_getsource_
+  unsafely`'s own) now name what the guard actually pins on, and list all
+  nine known-vacuous shapes by name, so a future audit finds them recorded
+  rather than rediscovering them as news. Pure documentation change: no
+  assertion logic touched, no new test needed beyond the existing suite
+  passing on the (unmodified) checker.
+
 - **`tests/test_breaker.py`: the blind-spot list kept alive again**
   (CLOSE9-5). Items 1, 2, 4, and 5 -- re-read with fresh eyes every round
   since CLOSE7-4 and left open each time -- were specific enough to be
@@ -411,7 +495,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   | Driver | Read-path exception source | Where it lands |
   |---|---|---|
-  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and the `StreamError` family (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, a `RuntimeError`) [CORRECTED, CLOSE9-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and `httpx.StreamError` itself plus its four subclasses (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, all a `RuntimeError`) [CORRECTED, CLOSE9-4/CLOSE10-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
   | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
   | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers, same three-family gap) | same handlers |
   | `lemlist.py` | same shape | same handlers |
@@ -439,6 +523,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliberately, not fixed: the fallthrough behavior is already correct
   and safe, and this is a documentation-accuracy fix, not a functional
   gap, per AGENTS.md's "no new features beyond what closes the finding."
+
+  **Correction (CLOSE10-4):** the table above enumerated the `StreamError`
+  family by its four concrete subclasses only. `httpx.StreamError` is
+  itself a public, directly importable and raisable exception (the base
+  class of that family, not just an abstract grouping) -- named now for
+  completeness. Same handler, same exit code as its subclasses (CLOSE8-2's
+  catch-all); this is a naming gap in the enumeration, not a behavioral one.
 
   Also, per this round's own opening instruction, `cli.main` gained a
   final, broad `except Exception` around both `check`'s and `run`'s

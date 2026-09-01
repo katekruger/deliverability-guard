@@ -280,7 +280,9 @@ class BreakerStateStore:
 
         An OK verdict recorded after a THROTTLE is also honoured here as a
         recovery (CLOSE3-3), mirroring `evaluate()`'s own
-        `state_store.mark_active` call on sustained recovery: a mailbox
+        `state_store.mark_active` call on single-OK recovery (CLOSE10-3:
+        renamed from "sustained recovery" -- it fires on ONE `Verdict.OK`
+        evaluation, not a run of them; see ADR 0003's addendum): a mailbox
         rebuilt from a log ending in a healthy evaluation comes back ACTIVE,
         with `throttled_at_limit` cleared, instead of reading THROTTLED
         forever just because the process restarted before `evaluate()`
@@ -290,7 +292,7 @@ class BreakerStateStore:
         never `record.data_state` -- so a zero-send day (`evaluate()`'s
         `sends == 0` early return, always `Verdict.OK` +
         `DataState.INSUFFICIENT_DATA`, never an action of any kind) replayed
-        as CLOSE3-3's sustained recovery: absence of evidence collapsed into
+        as CLOSE3-3's single-OK recovery: absence of evidence collapsed into
         "the mailbox got better." `engine/state.py`'s own module docstring
         is why `DataState` exists at all -- a throttled mailbox sending less
         BECAUSE it was throttled can drop out of a provider's reporting
@@ -375,7 +377,7 @@ class BreakerStateStore:
           incremented -- agrees with THROTTLE/UNSUPPORTED below.
         - Ladder THROTTLE/FAILED: status/limit untouched, streak cleared --
           agrees with THROTTLE/FAILED below.
-        - Ladder OK, sustained recovery from THROTTLED: `mark_active`
+        - Ladder OK, single-OK recovery from THROTTLED: `mark_active`
           (status ACTIVE, limit and streak cleared) -- agrees with the
           OK-recovery elif below.
         - Ladder OK (not a recovery), or WARN: all three untouched except
@@ -598,7 +600,7 @@ class BreakerStateStore:
                 MailboxBreakerStatus.THROTTLED,
                 MailboxBreakerStatus.PAUSE_FAILED,
             ):
-                # CLOSE3-3: mirrors `evaluate()`'s own sustained-recovery
+                # CLOSE3-3: mirrors `evaluate()`'s own single-OK recovery
                 # check (`state_store.mark_active` on a THROTTLED mailbox
                 # seeing an OK verdict) -- an OK verdict recorded after a
                 # THROTTLE means the mailbox recovered. Without this, a
@@ -686,7 +688,7 @@ class BreakerStateStore:
         This is NOT a permanent latch (CLOSE9-1): `PAUSE_FAILED` has two
         ways back to `ACTIVE`, both clearing `throttled_at_limit` when they
         fire -- `resume_after_human_review` (a human decides), and
-        `evaluate()`'s/`from_log`'s own sustained-OK recovery check, which
+        `evaluate()`'s/`from_log`'s own single-OK recovery check, which
         now treats `PAUSE_FAILED` the same as `THROTTLED` (see ADR 0003's
         addendum). Before this, nothing ever moved a mailbox off
         `PAUSE_FAILED` at all: `cmd_resume` refused it, and CLOSE-3b's
@@ -698,7 +700,7 @@ class BreakerStateStore:
     def mark_active(self, mailbox: MailboxRef) -> None:
         """For a pause attempt that's definitively UNSUPPORTED (the provider
         structurally can't pause this target), for a genuine recovery (a
-        sustained OK verdict clearing a THROTTLED mailbox -- CLOSE-3b), and
+        single OK verdict clearing a THROTTLED mailbox -- CLOSE-3b), and
         for `resume_after_human_review` below. Not for "response lost"
         (which must stay PAUSE_IN_FLIGHT so the next tick reconciles) or a
         FAILED pause (see `mark_pause_failed`), and never for un-pausing a
@@ -975,9 +977,14 @@ def evaluate(
         MailboxBreakerStatus.THROTTLED,
         MailboxBreakerStatus.PAUSE_FAILED,
     ):
-        # CLOSE-3b: a sustained OK verdict is the ladder's own recovery path
+        # CLOSE-3b: a single OK verdict is the ladder's own recovery path
         # for THROTTLE (unlike PAUSE, which never auto-recovers -- ADR
-        # 0003). Without this, a mailbox that gets throttled once stays
+        # 0003; CLOSE10-3: this recovery used to be called "sustained" in
+        # this codebase's own prose -- it doesn't require more than one OK
+        # evaluation to fire, so that word overclaimed what the evidence
+        # actually is; see ADR 0003's addendum for why the rename, not a
+        # threshold change, is the honest fix). Without this, a mailbox
+        # that gets throttled once stays
         # THROTTLED forever even after it's genuinely healthy again, and a
         # later re-degradation reads as an idempotent no-op instead of a
         # fresh throttle.
@@ -987,7 +994,7 @@ def evaluate(
         # 0003's addendum for the policy decision. A pause that FAILED
         # never actually stopped anything, so treating it like THROTTLED
         # (a real action attempted, mailbox still live, eligible for
-        # sustained-recovery) rather than like PAUSED (a real action that
+        # single-OK recovery) rather than like PAUSED (a real action that
         # landed, human-gated on purpose) is the consistent reading of
         # what `PAUSE_FAILED` actually means.
         state_store.mark_active(mailbox)
@@ -1078,7 +1085,7 @@ def _act(
             # mailbox whose evidence happened to land in the THROTTLE band
             # got a REAL `driver.throttle()` call and `mark_throttled` moved
             # it to THROTTLED -- from which a single later OK evaluation
-            # reaches ACTIVE via CLOSE-3b's sustained-recovery path, with no
+            # reaches ACTIVE via CLOSE-3b's single-OK recovery path, with no
             # human-review action of any kind ever recorded. Returned as
             # PERFORMED/idempotent, not UNSUPPORTED: this isn't the provider
             # refusing anything, it's this breaker refusing to ask -- the

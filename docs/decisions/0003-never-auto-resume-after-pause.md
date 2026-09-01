@@ -344,7 +344,7 @@ had a latch bug this ADR's own CLOSE-3b addendum already fixed for
 ("don't re-halve an already-throttled limit just because the pause on top
 of it failed" -- CLOSE-3c), but nothing ever moved a mailbox OFF
 `PAUSE_FAILED` at all. `cmd_resume` refused it (only `PAUSED` and
-`THROTTLED` were accepted). CLOSE-3b's sustained-OK recovery checked only
+`THROTTLED` were accepted). CLOSE-3b's single-OK recovery checked only
 `THROTTLED`. So a mailbox whose pause attempt failed once stayed
 `PAUSE_FAILED` -- and its stale `throttled_at_limit` memo stayed live --
 through any number of subsequent healthy evaluations, forever. Reproduced:
@@ -364,7 +364,7 @@ failure mode this ADR exists to prevent (see "Decision Drivers" above).
 `PAUSE_FAILED` is the opposite case: the provider explicitly said no, so
 the mailbox never stopped sending at all. It is closer in shape to
 `THROTTLED` (a real action was attempted, the mailbox is still live
-either way, and CLOSE-3b already lets sustained healthy evidence clear
+either way, and CLOSE-3b already lets a single healthy evaluation clear
 `THROTTLED` automatically) than to `PAUSED` (a real action landed,
 sending genuinely stopped, and only a human may restart it). Treating
 `PAUSE_FAILED` as automatically-recoverable is therefore consistent with
@@ -379,7 +379,7 @@ this ADR's existing THROTTLED precedent, not an exception carved into it.
    CLOSE3-3 let a human clear a stuck `THROTTLED` mailbox. The refusal
    message for every other status now names what CAN be resumed, instead
    of only naming what the mailbox isn't.
-2. `evaluate()`'s and `from_log`'s sustained-recovery check (CLOSE-3b) now
+2. `evaluate()`'s and `from_log`'s single-OK recovery check (CLOSE-3b) now
    fires for `PAUSE_FAILED` the same as it already does for `THROTTLED`: a
    `Verdict.OK` evaluation (real evidence, not `INSUFFICIENT_DATA` --
    CLOSE7-1's own guard already ensures that) moves the mailbox to
@@ -405,6 +405,80 @@ property this addendum does not touch. A live-versus-should property test
 (not a live-versus-replay one -- see `tests/test_breaker.py`'s blind-spot
 list, item 8) asserts that no bounded run of healthy evaluations can leave
 a mailbox in a state from which no provider action is ever possible again.
+
+## Addendum (2026-09-01): "sustained recovery" was renamed to "single-OK recovery" -- the behavior did not change
+
+An external audit (CLOSE10-3) measured what CLOSE-3b's recovery path (and
+its CLOSE9-1 extension to `PAUSE_FAILED`, above) actually requires, rather
+than trusting the word this project's own docstrings and this ADR had used
+for it since CLOSE-3b shipped:
+
+```
+ONE OK eval with sends=1, complaints=0 -> verdict=OK data_state=OK status=ACTIVE memo=None
+   then THROTTLE @25 -> new calls=[('throttle', 'ops@acme.example', 12)]
+```
+
+One evaluation, with a SINGLE send, clears `THROTTLED` (or, since CLOSE9-1,
+`PAUSE_FAILED`) back to `ACTIVE` and lets the very next THROTTLE re-halve.
+Every docstring and comment describing this called it "sustained
+recovery" or "a sustained OK verdict" -- language this project's own
+`docs/statistics.md`, `engine/state.py`'s `DataState`, and AGENTS.md's
+"never claim a statistical property the data cannot support" all argue
+against using loosely. "Sustained" implies a run of evidence over time;
+what actually fires is `n=1`.
+
+This is NOT a CLOSE9 regression, and not a bug on its own: `THROTTLED`
+behaved identically at `f9077ff`, well before CLOSE9-1 touched this code
+at all, and CLOSE7-1's own `INSUFFICIENT_DATA` guard (an evaluation with
+`sends == 0` is `Verdict.OK` but `DataState.INSUFFICIENT_DATA`, and never
+reaches this recovery check at all) is precisely what stops SILENCE from
+triggering it -- the guard that exists is doing real work; it just isn't
+the word "sustained" implies. The genuine choice this finding forces is
+between two honest options, not a defect to patch:
+
+- **Rename it.** Call it what it measurably is -- single-OK recovery, not
+  sustained recovery -- everywhere the word appears, with no change to
+  when it fires.
+- **Make it true.** Require `k` consecutive `OK` evaluations, or a minimum
+  send volume, before clearing. A real behavior change, needing its own
+  threshold (arbitrarily picking a `k` or a volume with no data behind it
+  would be a NEW overclaim, of a different kind, dressed up as a fix) and
+  its own tests for the new boundary.
+
+### Decision Outcome
+
+Chosen: **rename it.** `n=1` recovery is not wrong -- CLOSE-3b's whole
+point was that `THROTTLE`, unlike `PAUSE`, has an automatic way back once
+there's real evidence again, and one clean day IS real evidence (`sends >=
+1`, `DataState.OK` -- the `INSUFFICIENT_DATA` guard already rules out
+silence masquerading as it). What was wrong was calling one data point
+"sustained." Manufacturing a `k`-evaluation or minimum-volume threshold
+under this finding's own time pressure, with no statistical grounding for
+whatever number got picked, would trade one overclaim (the word) for
+another (a fabricated-precision threshold) -- exactly the failure mode
+`docs/statistics.md` and AGENTS.md's non-negotiable #3 exist to rule out.
+If a real, data-grounded case for requiring more evidence before recovery
+emerges later, that is a genuine behavior change and deserves its own ADR
+addendum, argued on its own evidence -- not a number chosen to make this
+finding go away.
+
+Every docstring, comment, and test description using "sustained recovery"
+/ "sustained OK verdict" / "sustained healthy evaluations" for this
+specific mechanism was renamed to "single-OK recovery" (`engine/breaker.py`,
+`cli.py`, `docs/decisions/0008`, `tests/test_breaker.py`). Deliberately
+NOT renamed: `engine/changepoint.py`'s and `loops/fast.py`'s own uses of
+"sustained shift" / "sustained elevated rate" describing CUSUM's actual
+detection target (a genuinely multi-period accumulation, a different
+mechanism entirely) -- those uses were already accurate and renaming them
+would have been the same mistake in the other direction.
+
+### Confirmation
+
+No test changed behavior; this is a pure rename. The existing recovery
+tests (`test_throttle_then_ok_then_throttle_re_throttles`,
+`test_state_store_from_log_recovers_a_throttled_mailbox_after_five_healthy_restarts`,
+CLOSE9-1's `test_pause_failed_recovers_after_thirty_healthy_days`) still
+pass unmodified in substance -- only their docstrings' wording changed.
 
 ## More Information
 
