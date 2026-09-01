@@ -157,6 +157,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`README.md`: the capability matrix's "campaign only" pause marks
+  described driver-API surface the breaker itself never reaches** (external
+  audit finding CLOSE4-3, a documentation decision rather than a bug).
+  `engine.breaker.evaluate`'s ladder only ever constructs a `MailboxRef`,
+  never a `CampaignRef` — so through the CLI, PAUSE actually executes
+  against exactly one provider (`instantly`) and THROTTLE against exactly
+  one (`smartlead`); no single provider can do both, and Lemlist/Apollo/
+  SES's campaign-level pause methods, while real and tested, are
+  unreachable from the breaker's own evaluation loop. Added a paragraph to
+  the README explaining this explicitly, rather than teaching the ladder to
+  pause a `CampaignRef` (real, undecided v0.2 scope — pausing an entire
+  campaign to handle one mailbox's bad evidence is a disproportionate
+  action this project has not decided the breaker should take
+  automatically).
+
 - **`engine/breaker.py`: `from_log` silently un-paused a PAUSED mailbox**
   (external audit finding CLOSE4-1, and the cause of CLOSE4-2's
   never-terminating escalation cycle). Three of `_act`'s branches never
