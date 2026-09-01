@@ -56,11 +56,20 @@ def cusum_step(
     the statistic unchanged: an outage or reporting gap should not itself
     look like either an improvement or a degradation. (Whether that gap is
     itself alert-worthy is engine/state.py's job, not this module's.)
+
+    A period with `complaints > sends` is the same "no real evidence" case,
+    not a distinct error (CLOSE7-2): bounce/complaint feedback lags sends by
+    24h-3 days, so a real provider's aggregation window can legitimately
+    report a complaint against a period whose matching sends haven't landed
+    yet. `engine.breaker.evaluate` treats this identically -- see that
+    function's own docstring -- and this is the same shared chokepoint
+    (`loops.fast.evaluate_all_mailboxes`) both run against, so the two must
+    agree on what counts as insufficient data.
     """
     if sends < 0:
         raise ValueError(f"sends must be >= 0, got {sends}")
-    if not 0 <= complaints <= sends:
-        raise ValueError(f"complaints must be between 0 and sends ({sends}), got {complaints}")
+    if complaints < 0:
+        raise ValueError(f"complaints must be >= 0, got {complaints}")
     if not 0 <= target_rate <= 1:
         raise ValueError(f"target_rate must be in [0, 1], got {target_rate}")
     if slack < 0:
@@ -68,7 +77,7 @@ def cusum_step(
     if threshold <= 0:
         raise ValueError(f"threshold must be > 0, got {threshold}")
 
-    if sends == 0:
+    if sends == 0 or complaints > sends:
         return CusumResult(state=state, alarmed=False)
 
     expected = (target_rate + slack) * sends

@@ -60,7 +60,6 @@ def test_cumulative_never_goes_negative() -> None:
     [
         (-1, 0, 0.001, 0.0005, 5.0),
         (5, -1, 0.001, 0.0005, 5.0),
-        (5, 6, 0.001, 0.0005, 5.0),
         (5, 0, -0.1, 0.0005, 5.0),
         (5, 0, 1.1, 0.0005, 5.0),
         (5, 0, 0.001, -0.1, 5.0),
@@ -80,6 +79,22 @@ def test_invalid_arguments_raise(
             slack=slack,
             threshold=threshold,
         )
+
+
+def test_complaints_greater_than_sends_is_a_no_op_not_a_valueerror() -> None:
+    """CLOSE7-2: `complaints > sends` used to raise -- a programmer-error
+    framing for data a real provider can legitimately produce (bounce
+    feedback lagging sends by 24h-3 days). Treated the same as `sends ==
+    0`: no evidence either way, statistic unchanged, never alarms --
+    matching `engine.breaker.evaluate`'s identical treatment of the same
+    condition, since both run against the same aggregated per-day totals
+    from `loops.fast.evaluate_all_mailboxes`."""
+    state = CusumState(cumulative=3.0)
+    result = cusum_step(
+        state, sends=5, complaints=6, target_rate=0.001, slack=0.0005, threshold=5.0
+    )
+    assert result.state == state
+    assert result.alarmed is False
 
 
 @given(

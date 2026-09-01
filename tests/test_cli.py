@@ -9,6 +9,7 @@ definition of done for this item.
 """
 
 import io
+import sys
 from collections.abc import Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
@@ -43,6 +44,7 @@ from deliverability_guard.engine.breaker import (
     evaluate,
 )
 from deliverability_guard.engine.posterior import DEFAULT_PRIOR
+from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
     ActionResult,
@@ -806,6 +808,62 @@ def test_main_run_reports_a_transport_error_with_its_own_exit_code(
     assert exit_code == 3
 
 
+class _NegativeSendsDriver:
+    """Reports a structurally invalid day -- negative sends -- something no
+    real provider driver in this codebase can produce (every driver sums
+    non-negative CloudWatch/API counts), but `evaluate()` still validates
+    it and raises. Defense in depth (CLOSE7-2): `main` must turn even THIS
+    into a clean exit 3, not a traceback, for whatever future driver bug
+    or malformed response manages to get a negative count past its own
+    driver's parsing."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE})
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [_stats(mailbox, date(2025, 12, 31), -5, 0)]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        raise AssertionError("not reached")
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        raise AssertionError("not reached")
+
+
+def test_main_check_reports_a_valueerror_from_evaluation_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE7-2: `cli.main` catches `ValueError` from the evaluation loop
+    around both `check` and `run`, same as it already does for
+    `httpx.HTTPError`/`ProviderError` -- so no provider's output, however
+    malformed, can traceback `check` outside the documented exit-code map."""
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return _NegativeSendsDriver()
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+
+
+def test_main_run_reports_a_valueerror_from_evaluation_with_its_own_exit_code(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return _NegativeSendsDriver()
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+
+
 # --- CLOSE-5a: the noop driver end to end -----------------------------------
 
 
@@ -839,6 +897,117 @@ def test_main_check_with_the_noop_driver_genuinely_exercises_the_pipeline(
     records = read_records(log_path)
     assert len(records) > 0
     assert records[0].verdict is Verdict.OK
+
+
+# --- CLOSE7-2: a bounce-only day is data, not a ValueError -----------------
+
+
+def test_main_check_survives_an_ses_bounce_only_day(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE7-2's reproduction: bounce/complaint feedback lags sends by
+    24h-3 days (this project's own README), so a CloudWatch `Bounce`
+    datapoint can land on a day with no matching `Send` datapoint at all --
+    `SesConfigurationSetDriver.read_mailbox_stats` reports that day
+    faithfully as `MailboxDayStats(sends=0, bounces=N)`, and `evaluate()`
+    used to raise `ValueError` for it, tracebacking `check` outside the
+    documented exit-code map entirely. Now it's `DataState.INSUFFICIENT_
+    DATA`/`Verdict.OK`, so `check` exits cleanly."""
+    from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
+
+    class _FakeSesV2Client:
+        def put_configuration_set_sending_options(
+            self, *, ConfigurationSetName: str, SendingEnabled: bool
+        ) -> Mapping[str, object]:
+            raise AssertionError("not reached -- bounce-only day never warrants a pause")
+
+        def put_account_sending_attributes(self, *, SendingEnabled: bool) -> Mapping[str, object]:
+            raise AssertionError("not reached")
+
+    class _FakeCloudWatchClient:
+        def get_metric_statistics(
+            self, *, MetricName: str, **_kwargs: object
+        ) -> Mapping[str, object]:
+            if MetricName == "Bounce":
+                datapoints = [{"Timestamp": datetime(2025, 12, 31, tzinfo=UTC), "Sum": 4.0}]
+            else:
+                datapoints = []
+            return {"Datapoints": datapoints, "Label": MetricName}
+
+    driver = SesConfigurationSetDriver(
+        inner=SesDriver(
+            sesv2_client=_FakeSesV2Client(),
+            cloudwatch_client=_FakeCloudWatchClient(),
+        ),
+        configuration_set_name="cfg-1",
+    )
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    log_path = tmp_path / "decisions.jsonl"
+    text = _VALID_YAML.replace("provider: fake", "provider: ses")
+    config_path = _config(tmp_path, text=text, decision_log=str(log_path))
+    out_capture = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out_capture)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 0  # documented: all clear -- INSUFFICIENT_DATA is not a breach
+    records = read_records(log_path)
+    assert len(records) == 1
+    assert records[0].data_state is DataState.INSUFFICIENT_DATA
+    assert records[0].verdict is Verdict.OK
+    printed = out_capture.getvalue()
+    assert len(printed.strip().splitlines()) == 1  # one clean line, no traceback
+
+
+class _BounceOnlyDayDriver:
+    """Reports one day with bounces but zero sends, under an arbitrary
+    provider name -- CLOSE7-2's general property is provider-agnostic
+    (the fix lives in `engine.breaker.evaluate`, the shared chokepoint
+    every provider's aggregated stats flow through), so this stands in for
+    each CLI-selectable provider without needing a live-shaped fixture
+    per driver."""
+
+    def __init__(self, name: str) -> None:
+        self.name = name
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider=self.name, mailbox_id="a@example.com")
+        return [_stats(mailbox, date(2025, 12, 31), 0, 4)]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        raise AssertionError("not reached -- a bounce-only day never warrants an action")
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        raise AssertionError("not reached")
+
+
+@pytest.mark.parametrize(
+    "provider_name", ["instantly", "smartlead", "lemlist", "apollo", "ses", "noop"]
+)
+def test_check_never_raises_on_a_bounce_only_day_from_any_provider(
+    provider_name: str, tmp_path: Path
+) -> None:
+    """The DoD's general property: no CLI-selectable provider's output can
+    make `cmd_check` raise an uncaught exception. Parametrized over every
+    provider name this project's `build_driver` registry knows about."""
+    driver = _BounceOnlyDayDriver(provider_name)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    config = load_config(config_path)
+    out = io.StringIO()
+
+    exit_code = cmd_check(
+        driver=driver, config=config, state_store=BreakerStateStore(), now=_NOW, out=out
+    )
+
+    assert exit_code == 0
+    assert "OK" in out.getvalue()
 
 
 def test_main_reports_an_unreadable_decision_log_cleanly(tmp_path: Path) -> None:
@@ -1682,10 +1851,53 @@ def test_check_and_run_share_the_same_evaluation_chokepoint() -> None:
     `cmd_check` and `loops.controller.run` must reference
     `evaluate_all_mailboxes` by name -- if either one stopped calling it
     (e.g. reimplementing its own aggregation-and-evaluation loop), this
-    fails without needing to notice the behavioral drift first."""
+    fails without needing to notice the behavioral drift first.
+
+    CLOSE7-3: this guard was PROVED VACUOUS -- both docstrings already
+    name `evaluate_all_mailboxes` in prose (`cmd_check`'s at line 15 of
+    this repo's own module docstring shape;`controller.run`'s at several
+    lines), and `inspect.getsource` includes a function's docstring. A
+    hand-duplicated aggregation-and-evaluation loop that never touched the
+    real chokepoint at all -- no pooling, no CUSUM, no `current_daily_
+    limit` -- still passed this test, because the docstring's own mention
+    of the name was enough. `source_body` (`tests/fixtures/
+    source_inspect.py`) strips the docstring out first, so the assertion
+    can only pass because the CODE calls `evaluate_all_mailboxes`, not
+    because the docstring talks about it. The two sibling tests this one
+    was modelled on (`resume_after_human_review`/`CampaignRef`, both
+    `not in`) were never vulnerable to this in the first place -- only
+    copying the idiom while flipping `not in` to `in` was."""
+    from deliverability_guard.loops import controller as controller_module
+    from fixtures.source_inspect import source_body
+
+    assert "evaluate_all_mailboxes" in source_body(cli_module.cmd_check)
+    assert "evaluate_all_mailboxes" in source_body(controller_module.run)
+
+
+def test_check_and_run_drift_guard_catches_a_hand_duplicated_loop_the_vacuous_one_missed() -> None:
+    """CLOSE7-3's own reproduction, kept as a regression test: a stand-in
+    function shaped exactly like the mutation the audit found -- reimplements
+    the aggregation-and-evaluation loop directly (never calling
+    `evaluate_all_mailboxes`) -- but whose DOCSTRING still names
+    `evaluate_all_mailboxes`, the same way the real `cmd_check`'s always has.
+
+    The vacuous (pre-CLOSE7-3) guard -- a bare `in` over
+    `inspect.getsource` -- passes against this, because the docstring
+    mention is enough. The fixed guard (`source_body`-based, used by
+    `test_check_and_run_share_the_same_evaluation_chokepoint` above) must
+    not."""
     import inspect
 
-    from deliverability_guard.loops import controller as controller_module
+    from fixtures.source_inspect import source_body
 
-    assert "evaluate_all_mailboxes" in inspect.getsource(cli_module.cmd_check)
-    assert "evaluate_all_mailboxes" in inspect.getsource(controller_module.run)
+    def mutated_cmd_check(*, driver: object, config: object, state_store: object) -> int:
+        """A hand-duplicated aggregation-and-evaluation loop that never
+        touches loops.fast.evaluate_all_mailboxes at all -- no pooling, no
+        CUSUM, no current_daily_limit."""
+        return 0
+
+    # The vacuous guard this test file used to have: passes purely because
+    # the docstring mentions the name, proving it never checked the code.
+    assert "evaluate_all_mailboxes" in inspect.getsource(mutated_cmd_check)
+    # The fixed guard: correctly fails, since the CODE never calls it.
+    assert "evaluate_all_mailboxes" not in source_body(mutated_cmd_check)

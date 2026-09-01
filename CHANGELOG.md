@@ -157,6 +157,129 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_cli.py`: the `check`/`run` drift guard was vacuous**
+  (external audit finding CLOSE7-3).
+  `test_check_and_run_share_the_same_evaluation_chokepoint` asserted
+  `"evaluate_all_mailboxes" in inspect.getsource(...)` -- but
+  `inspect.getsource` includes a function's docstring, and both `cmd_check`
+  and `controller.run`'s docstrings already name `evaluate_all_mailboxes`
+  in prose. Proved vacuous: a hand-duplicated aggregation-and-evaluation
+  loop that never touched the real chokepoint at all (no pooling, no
+  CUSUM, no `current_daily_limit`) still passed this test, because the
+  docstring's own mention was enough -- the drift was caught, but by three
+  unrelated behavioural tests, never by the test written for the claim.
+  The two sibling tests this one was modelled on
+  (`test_evaluate_never_calls_resume_after_human_review`,
+  `test_engine_breaker_module_never_constructs_a_campaign_ref`) were never
+  vulnerable to this, because both assert `not in`: a docstring mention of
+  a FORBIDDEN name can only ever make a `not in` assertion correctly fail,
+  never incorrectly pass. Copying the idiom while flipping the polarity to
+  `in` is exactly what broke this one. Fixed with a new shared helper,
+  `tests/fixtures/source_inspect.py`'s `source_body`, which strips a
+  function's docstring out (AST-based, not `source.replace(func.__doc__,
+  "")` -- Python 3.13 dedents a multi-line `__doc__` at compile time, so
+  the stored string is no longer a verbatim substring of `inspect.
+  getsource` there) before the `in` assertion runs. A new regression test
+  reapplies the exact mutation shape against a stand-in function and
+  confirms the vacuous guard passes it while the fixed one doesn't.
+
+- **`tests/test_breaker.py`: the dry-run daemon/cron asymmetry the
+  permutation sweep couldn't see** (CLOSE7-4, a known-gap closure rather
+  than a bug fix). `_apply_move` never passed `dry_run=True`, so the whole
+  class of divergence CLOSE6-4 decided and pinned with one hand-written
+  CLI-level test rested on that one test alone -- the sweep itself was
+  blind to it. Added `DRY_RUN_PAUSE`, deliberately kept OUT of
+  `_PERMUTATION_MOVES` (folding it in would make the main sweep's blanket
+  LIVE == REPLAY assertion permanently red, since the asymmetry is
+  intentional, not a bug) and swept separately with the actual expected
+  asymmetry spelled out: `from_log` skipping a dry-run record is tested as
+  "replaying a log equals replaying that same log with its dry-run
+  record(s) deleted afterward" -- not "re-run the sequence with the move
+  skipped," which changes what LATER moves in the sequence themselves
+  decide to do, since a dry-run move does mutate the live in-process store
+  (that's the point of it) -- over 100 surrounding-move combinations, plus
+  one explicit worked example pinning the live side actually accumulating.
+  Also written into the test file, per the audit's own closing
+  instruction, rather than closed: five specific places this sweep still
+  cannot see (cross-mailbox leakage, a non-monotonic `current_daily_limit`
+  across repeated throttles, `compliance_gate_tripped`, the floor- and
+  streak-escalation paths to PAUSE as their own move, and any defect
+  needing a 4th-or-later-order move interaction) -- named so a future
+  session doesn't have to rediscover them by finding the bug first.
+
+- **`engine/breaker.py`, `engine/changepoint.py`: a bounce-only day crashed
+  `check` with an uncaught `ValueError`** (external audit finding CLOSE7-2).
+  `evaluate()` required `0 <= complaints <= sends` and raised otherwise --
+  but bounce/complaint feedback lags sends by 24h-3 days (this project's
+  own README), so a real provider's aggregation window can legitimately
+  report a complaint/bounce against a day whose matching sends haven't
+  landed yet or already rolled out of the window. `providers/ses.py`
+  demonstrates it plainly: a CloudWatch `Bounce` datapoint on a day with no
+  `Send` datapoint reports `MailboxDayStats(sends=0, bounces=N)`, faithfully
+  and correctly -- the driver does nothing wrong. `cli.main` only caught
+  `httpx.HTTPError`/`ProviderError`, so this tracebacked `check` entirely
+  outside the documented exit-code map, contradicting `CliError`'s own
+  docstring promise. `engine.changepoint.cusum_step`, which
+  `evaluate_all_mailboxes` runs alongside `evaluate()` against the same
+  aggregated totals, had the identical validation and the identical bug.
+
+  Fixed at the root, in both functions (CLOSE7-1's own reasoning applies
+  again): `complaints > sends` is now treated exactly like `sends == 0`
+  already was -- `DataState.INSUFFICIENT_DATA`/`Verdict.OK`/no action in
+  `evaluate()`, an unchanged, non-alarming statistic in `cusum_step()` --
+  rather than a `ValueError`. `sends < 0` and `complaints < 0` remain
+  `ValueError`: those genuinely cannot happen from any real count.
+  `cli.main` also now catches `ValueError` around both `check` and `run`'s
+  evaluation loops, mapping to the existing exit code 3 (provider transport
+  failure) as defense in depth -- so no future driver bug or malformed
+  response can traceback either command, even one this fix doesn't
+  anticipate. Tests: an SES fixture with a bounce-only day exercised end to
+  end through `check` (exit 0, one clean line, `DataState.
+  INSUFFICIENT_DATA` in the decision record); a driver reporting negative
+  sends exercises the new `ValueError` catch directly; a bounce-only-day
+  property test parametrized over every CLI-selectable provider name.
+
+- **`engine/breaker.py`: a zero-send day replayed as a recovery, and cron
+  compounded where the daemon did not** (external audit finding CLOSE7-1
+  -- CLOSE3-1's compounding failure, resurfaced through a door the
+  permutation sweep couldn't reach). `evaluate()`'s `sends == 0` early
+  return is always `Verdict.OK` + `DataState.INSUFFICIENT_DATA` and takes
+  no action of any kind -- but `from_log`'s CLOSE3-3 recovery branch
+  trusted `Verdict.OK` alone, never `record.data_state`, so a day with no
+  evidence at all replayed as "the mailbox recovered": it cleared a
+  THROTTLED status back to ACTIVE and erased the remembered
+  `throttled_at_limit`, and (a second divergence the isolated reproduction
+  also found) unconditionally reset the unsupported-throttle streak the
+  final `else` branch shares. Reachable in production wherever a throttle
+  itself causes the silence: `engine/state.py`'s own module docstring is
+  the reason `DataState` exists at all -- a domain that gets throttled
+  sends less, can drop below a provider's reporting threshold as a DIRECT
+  RESULT, and disappear from stats entirely, so that silence must never be
+  read back as "OK." Reproduction: twenty alternating bad-day/zero-send-day
+  evaluations against a driver reporting its real shrinking daily limit,
+  run once as an uninterrupted daemon and once as twenty separate
+  `check`-shaped processes. Before this fix, the daemon throttled once
+  (`[50]`) and stayed THROTTLED; cron, reading each zero-send day as a
+  fresh recovery, re-throttled from scratch every time evidence
+  reappeared (`[50, 25, 12, 6, 3]`) and escalated to a real, unearned
+  `pause()` call on evidence the daemon never once called for. Fixed with
+  a dedicated `elif` branch that intercepts every `Verdict.OK` +
+  `DataState.INSUFFICIENT_DATA` record before the recovery check ever
+  sees it, leaving status, `throttled_at_limit`, and the unsupported-
+  throttle streak untouched -- mirroring `evaluate()`'s own no-op exactly.
+  Every other `from_log` branch was checked against the same question
+  (can `evaluate()` ever pair this verdict/action_outcome with
+  `INSUFFICIENT_DATA`, and if so is it already handled correctly?) and the
+  answer is written into `from_log`'s own docstring: yes for all of them,
+  already correct, because `INSUFFICIENT_DATA` can only ever arise from
+  the `sends == 0` early return just described or from a
+  compliance-forced `PAUSE` (which already carries a real `action` the
+  PAUSE branch already keys off, unaffected by `data_state`) -- THROTTLE
+  can never pair with `INSUFFICIENT_DATA` at all. `ZERO_SENDS` joined
+  `tests/test_breaker.py`'s permutation sweep's move set (9 -> 10 moves,
+  729 -> 1,000 sequences); the sweep found 26 live/replay mismatches with
+  no code change, and 0 after.
+
 - **`cli.py`: a paused mailbox's stdout line said `THROTTLE` with no
   indication anything was refused** (external audit finding CLOSE6-4,
   first half). The honest "mailbox is paused; throttle refused pending

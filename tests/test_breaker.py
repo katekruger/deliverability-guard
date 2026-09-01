@@ -2,7 +2,7 @@
 
 import dataclasses
 import itertools
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from deliverability_guard.audit.log import (
 )
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
+    BreakerEvaluation,
     BreakerStateStore,
     BreakerStateStoreLoadError,
     MailboxBreakerStatus,
@@ -29,7 +30,10 @@ from deliverability_guard.engine.posterior import DEFAULT_PRIOR, GroupObservatio
 from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
+    ActionResult,
+    CampaignRef,
     Capability,
+    MailboxDayStats,
     MailboxRef,
     RateLimitExceededError,
 )
@@ -111,19 +115,73 @@ def test_rejects_negative_sends() -> None:
         )
 
 
-def test_rejects_complaints_greater_than_sends() -> None:
+def test_rejects_negative_complaints() -> None:
     with pytest.raises(ValueError, match="complaints"):
         evaluate(
             driver=FakeDriver(),
             mailbox=_MAILBOX,
             sends=5,
-            complaints=6,
+            complaints=-1,
             prior=DEFAULT_PRIOR,
             thresholds=DEFAULT_LADDER,
             state_store=BreakerStateStore(),
             dry_run=True,
             now=_NOW,
         )
+
+
+def test_complaints_greater_than_sends_is_insufficient_data_not_a_valueerror() -> None:
+    """CLOSE7-2: `complaints > sends` used to raise `ValueError` -- a
+    programmer-error framing for something a real provider can
+    legitimately produce (bounce/complaint feedback lags sends by 24h-3
+    days; a query window can catch a bounce for a day whose sends haven't
+    landed, or already rolled out). Treated the same as `sends == 0` --
+    `DataState.INSUFFICIENT_DATA`, `Verdict.OK`, no action -- rather than
+    a traceback that would propagate out of a real evaluation loop."""
+    driver = FakeDriver()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5,
+        complaints=6,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=BreakerStateStore(),
+        dry_run=True,
+        now=_NOW,
+    )
+    assert result.data_state is DataState.INSUFFICIENT_DATA
+    assert result.verdict is Verdict.OK
+    assert result.action is None
+    assert result.posterior is None
+    assert result.lower_bound is None
+    assert driver.pause_calls == []
+    assert driver.throttle_calls == []
+
+
+def test_complaints_greater_than_sends_under_compliance_gate_still_pauses(tmp_path: Path) -> None:
+    """The compliance-forced-PAUSE analogue: incoherent counts under a
+    hard compliance gate must not crash either, and the gate still wins --
+    Google's own account-level verdict is independent of today's send
+    volume or its internal consistency."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5,
+        complaints=6,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        compliance_gate_tripped=True,
+    )
+    assert result.verdict is Verdict.PAUSE
+    assert result.data_state is DataState.INSUFFICIENT_DATA
+    assert result.posterior is None
+    assert driver.pause_calls == [_MAILBOX]
 
 
 # --- evaluate(): the ladder itself ----------------------------------------
@@ -1566,6 +1624,55 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
+# --- What the sweep below still cannot see (CLOSE7-4) ---------------------
+#
+# Written down deliberately, not fixed here -- per the round-7 audit's own
+# closing instruction: the highest-value thing a session like this one can
+# do is name what the sweep is still blind to, even where nothing gets
+# closed. Four rounds running, this sweep has found exactly what it was
+# pointed at and missed everything it wasn't -- these are the places it
+# isn't pointed yet:
+#
+# 1. Every move here is against ONE mailbox (`_MAILBOX`). Cross-mailbox
+#    state leakage -- one mailbox's record somehow perturbing another's
+#    replayed status -- is entirely untested by this sweep. `from_log`
+#    keys its dicts by `MailboxRef`, so this is probably fine, but
+#    "probably fine" is exactly the kind of claim this project's other
+#    audit findings have repeatedly shown needs an executable check, not
+#    an assumption.
+# 2. `THROTTLE_PERFORMED` always uses a fixed `current_daily_limit=100`.
+#    The sweep never exercises a limit that GROWS between throttles (an
+#    operator manually raising it back up outside the breaker), nor
+#    fluctuates non-monotonically across repeated THROTTLE moves in the
+#    same sequence -- only ever "still 100, or whatever `_act` computed
+#    last." CLOSE4-1's `is_idempotent_replay` logic is keyed on exactly
+#    this comparison, and its edge cases beyond "never changes" or "grows
+#    once" are unswept.
+# 3. `compliance_gate_tripped` (the hard PAUSE gate from
+#    `signals.postmaster.forces_hard_gate`) has no move at all.
+#    `DecisionRecord` doesn't persist whether a PAUSE was compliance-forced
+#    or ladder-derived, so a compliance-forced PAUSE record replays
+#    identically to an ordinary one today -- believed harmless, since
+#    `from_log` only ever reads `verdict`/`action_outcome`, but "believed"
+#    is doing the same load-bearing work item 1 above flags.
+# 4. The floor-escalation (CLOSE-3d, a throttle whose halved result would
+#    be <= the floor) and unsupported-streak-escalation (CLOSE3-2) paths
+#    to PAUSE are never swept as their OWN move -- only a fresh ladder
+#    PAUSE from bad complaint evidence (`PAUSE_PERFORMED`'s
+#    `sends=5000, complaints=40`) is. Both escalation paths produce a
+#    verdict=PAUSE record exactly like the ladder's own PAUSE does, so this
+#    is likely another "same shape, untested independently" gap rather
+#    than a known divergence.
+# 5. No sequence longer than 3 moves is ever swept (`repeat=3`), and no
+#    move appears more than 3 times total across a sequence. A defect
+#    requiring a 4th- or 5th-order interaction -- CLOSE5-2 needed 3 moves
+#    with a repeat that `permutations` alone couldn't produce; nothing
+#    guarantees the next one needs only 3 either -- would be invisible
+#    here by construction, not by oversight.
+#
+# None of these are closed by this round. They're named so the next
+# session doesn't have to rediscover them by finding the bug first.
+
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",
     "PAUSE_UNSUPPORTED",
@@ -1575,8 +1682,28 @@ _PERMUTATION_MOVES = (
     "THROTTLE_FAILED",
     "OK",
     "WARN",
+    "ZERO_SENDS",
     "RESUME",
 )
+
+# CLOSE7-4: `DRY_RUN_PAUSE` is deliberately NOT part of `_PERMUTATION_MOVES`
+# above. The main sweep asserts LIVE == REPLAY for every ordering -- but a
+# dry-run move breaks that equality ON PURPOSE (CLOSE6-4's own decision):
+# the live in-process `state_store` keeps accumulating a dry-run mutation
+# across ticks (so a second dry-run evaluation of an already-dry-run-paused
+# mailbox correctly reports "already paused," matching what a LIVE daemon
+# would decide -- AGENTS.md's "dry-run decisions must be identical to the
+# live path"), while `from_log` deliberately skips every dry-run record
+# entirely when rebuilding across a restart (CLOSE-4: a dry-run action
+# never touched the real provider, so it must never be read back as
+# durable history). Folding `DRY_RUN_PAUSE` into `_PERMUTATION_MOVES` would
+# make every sequence containing it register as a "mismatch" the main
+# sweep has no way to distinguish from a real regression -- it would
+# either have to special-case dry-run moves inline (defeating the point of
+# one shared, blind comparison) or go permanently red. Tested separately
+# below instead, with the actual expected asymmetry spelled out, so this
+# is a known, pinned gap rather than one the sweep is silently blind to.
+_DRY_RUN_MOVES = ("DRY_RUN_PAUSE",)
 
 
 def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> None:
@@ -1626,7 +1753,20 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         # `_act`, so it must leave an already-PAUSED (or any other) status
         # untouched on the live path.
         eval_kwargs = {"sends": 20_000, "complaints": 20}
-    else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES
+    elif move == "ZERO_SENDS":
+        # CLOSE7-1: `evaluate()`'s `sends == 0` early return -- always
+        # Verdict.OK, DataState.INSUFFICIENT_DATA, action=None. This is the
+        # move `_apply_move` structurally cannot make ambiguous: `sends=0`
+        # forces the early return regardless of `driver_kwargs`, so there's
+        # nothing to configure on the driver at all.
+        eval_kwargs = {"sends": 0, "complaints": 0}
+    elif move == "DRY_RUN_PAUSE":
+        # CLOSE7-4: same PAUSE-worthy evidence as PAUSE_PERFORMED, but
+        # evaluated with `dry_run=True` below -- see `_DRY_RUN_MOVES`'s own
+        # comment for why this move is excluded from `_PERMUTATION_MOVES`.
+        driver_kwargs = {"pause_outcome": ActionOutcome.PERFORMED}
+        eval_kwargs = {"sends": 5000, "complaints": 40}
+    else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES + _DRY_RUN_MOVES
         raise AssertionError(f"unhandled move {move!r}")
 
     driver = FakeDriver(**driver_kwargs)  # type: ignore[arg-type]
@@ -1636,7 +1776,7 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         prior=DEFAULT_PRIOR,
         thresholds=DEFAULT_LADDER,
         state_store=state_store,
-        dry_run=False,
+        dry_run=move in _DRY_RUN_MOVES,
         now=_NOW,
         **eval_kwargs,  # type: ignore[arg-type]
     )
@@ -1668,9 +1808,10 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     `itertools.product(moves, repeat=3)` rather than `permutations` --
     CLOSE5-2 was found only once repeated moves were covered (`permutations`
-    never repeats an element), and 3 moves at a time keeps the sweep at 729
-    sequences (9 moves, CLOSE6-2 added `PAUSE_FAILED` and `WARN`) rather than
-    needing all 9 in every sequence."""
+    never repeats an element), and 3 moves at a time keeps the sweep at
+    1,000 sequences (10 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
+    CLOSE7-1 added `ZERO_SENDS`) rather than needing all 10 in every
+    sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
@@ -1678,6 +1819,250 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE7-4: the dry-run asymmetry, pinned rather than left as a gap ----
+
+
+@pytest.mark.parametrize(
+    "sequence",
+    [(a, "DRY_RUN_PAUSE", b) for a in _PERMUTATION_MOVES for b in _PERMUTATION_MOVES],
+)
+def test_from_log_replay_is_unaffected_by_a_dry_run_move_anywhere_in_the_sequence(
+    sequence: tuple[str, str, str], tmp_path: Path
+) -> None:
+    """The half of the asymmetry that IS a universal invariant, regardless
+    of where the dry-run move sits or what surrounds it: `from_log` skips
+    every dry-run record entirely (CLOSE-4), so replaying a log must equal
+    replaying that SAME log with its dry-run record(s) deleted afterward.
+    This is what "the replayed store does not accumulate" actually means,
+    made explicit and swept over every surrounding pair rather than
+    asserted for one hand-picked example.
+
+    Deliberately NOT "re-run the sequence with the dry-run move skipped":
+    `_apply_move`'s later calls consult `state_store.status_of` (e.g.
+    `PAUSE_UNSUPPORTED`'s outcome depends on whether the mailbox is
+    already PAUSED), and a dry-run move DOES mutate the live in-process
+    store (CLOSE6-4's own decision) -- so skipping it changes what the
+    LATER moves in the sequence themselves decide to do, which is a
+    different question from what THIS RECORD contributes to replay. Only
+    comparing against the same already-generated log with the dry-run
+    record removed isolates that."""
+    from deliverability_guard.audit.log import read_events
+
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    for move in sequence:
+        _apply_move(move, live_store, log_path)
+    replayed_with_dry_run = BreakerStateStore.from_log(log_path)
+
+    log_path_without = tmp_path / "decisions_without_dry_run.jsonl"
+    for event in read_events(log_path):
+        if isinstance(event, DecisionRecord) and event.dry_run:
+            continue
+        if isinstance(event, DecisionRecord):
+            append_record(log_path_without, event)
+        else:
+            append_resume_record(log_path_without, event)
+    replayed_without_dry_run = (
+        BreakerStateStore.from_log(log_path_without)
+        if log_path_without.exists()
+        else BreakerStateStore()
+    )
+
+    assert _snapshot(replayed_with_dry_run) == _snapshot(replayed_without_dry_run), sequence
+
+
+def test_dry_run_pause_accumulates_live_but_not_in_replay(tmp_path: Path) -> None:
+    """The other half: a single explicit worked example of the live side
+    actually accumulating, which the sweep above deliberately does not
+    (and structurally cannot, without asserting "must differ" -- not
+    always true, e.g. when the mailbox is already PAUSED for an unrelated
+    reason and the dry-run pause is itself an idempotent no-op) claim as a
+    universal property. From ACTIVE: a `DRY_RUN_PAUSE` moves the LIVE
+    in-process store to PAUSED (matching what a live daemon's second tick
+    would report -- "already paused" -- on a THIRD dry-run evaluation),
+    while replaying the very same record leaves the mailbox ACTIVE,
+    because `from_log` never touched it at all."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+
+    _apply_move("DRY_RUN_PAUSE", live_store, log_path)
+
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+    replayed = BreakerStateStore.from_log(log_path)
+    assert replayed.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+
+
+# --- CLOSE7-1: a zero-send day is silence, never a recovery --------------
+
+
+def test_from_log_a_zero_send_day_after_throttle_does_not_clear_the_status_or_limit(
+    tmp_path: Path,
+) -> None:
+    """The isolated two-move reproduction: THROTTLE/PERFORMED, then a
+    zero-send day. `evaluate()`'s own `sends == 0` early return is
+    `Verdict.OK` + `DataState.INSUFFICIENT_DATA` -- CLOSE3-3's recovery
+    branch used to fire on `Verdict.OK` alone, reading the silence as
+    "the mailbox recovered" and clearing both the THROTTLED status and the
+    remembered limit."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_PERFORMED", live_store, log_path)
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert live_store.throttled_at_limit(_MAILBOX) == 100
+
+    _apply_move("ZERO_SENDS", live_store, log_path)
+
+    # The live path itself takes no action on a zero-send day -- nothing
+    # about the mailbox's state changes.
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert live_store.throttled_at_limit(_MAILBOX) == 100
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert restored.throttled_at_limit(_MAILBOX) == 100
+
+
+def test_from_log_insufficient_data_never_clears_throttled_at_limit(tmp_path: Path) -> None:
+    """The DoD's explicit assertion, isolated from status: even if some
+    future change made status-tracking more permissive, `throttled_at_
+    limit` -- the CLOSE3-1 idempotency key that's the entire point of this
+    finding -- must never be cleared by a record carrying no evidence."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_PERFORMED", live_store, log_path)
+    _apply_move("ZERO_SENDS", live_store, log_path)
+    _apply_move("ZERO_SENDS", live_store, log_path)
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.throttled_at_limit(_MAILBOX) is not None
+    assert restored.throttled_at_limit(_MAILBOX) == 100
+
+
+def test_from_log_zero_sends_after_unsupported_throttle_does_not_reset_the_streak(
+    tmp_path: Path,
+) -> None:
+    """The second divergence the isolated reproduction actually found
+    (LIVE ('ACTIVE', None, 1) vs REPLAY ('ACTIVE', None, 0)): `evaluate()`'s
+    `sends == 0` early return returns before reaching the "verdict is not
+    THROTTLE -> clear the unsupported-throttle streak" line every other
+    non-THROTTLE verdict hits, so the streak must survive a zero-send day
+    too, not just status/limit."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_move("ZERO_SENDS", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.unsupported_throttle_streak(_MAILBOX) == 1
+
+
+class _AlternatingZeroSendDriver:
+    """Reports a real, shrinking `current_daily_limit` and alternates one
+    zero-send day between bad days -- the CLOSE7-1 end-to-end
+    reproduction. `phase` is advanced externally, one call per evaluation,
+    matching the shape `_SmartleadShapedDriver` in `tests/test_cli.py`
+    already established for CLOSE5-2's daemon-vs-cron comparison."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE})
+
+    def __init__(self) -> None:
+        self.current_daily_limit = 100
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.phase = 0  # 0 = bad day, 1 = zero-send day; alternates
+
+    def read_mailbox_stats(
+        self, since: date
+    ) -> list[MailboxDayStats]:  # pragma: no cover -- unused
+        raise AssertionError("stats are read directly by the test, not through this method")
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        self.current_daily_limit = daily_limit
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def _alternating_zero_send_evaluation(
+    driver: _AlternatingZeroSendDriver, state_store: BreakerStateStore
+) -> BreakerEvaluation:
+    """One evaluation of the CLOSE7-1 end-to-end scenario: a bad day
+    (same evidence as `_apply_move`'s `THROTTLE_PERFORMED` -- enough to
+    land in the THROTTLE band, not straight to PAUSE) on even calls, a
+    zero-send day on odd calls -- against whatever `current_daily_limit`
+    the driver currently remembers, exactly like a real provider report
+    would."""
+    if driver.phase % 2 == 0:
+        sends, complaints = 20_000, 30
+    else:
+        sends, complaints = 0, 0
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=sends,
+        complaints=complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=driver.current_daily_limit,
+    )
+    driver.phase += 1
+    return result
+
+
+def test_cron_and_daemon_diverge_on_alternating_zero_send_days_before_the_fix_agree_after(
+    tmp_path: Path,
+) -> None:
+    """CLOSE7-1's end-to-end reproduction: identical evidence -- a bad day,
+    a zero-send day, a bad day, a zero-send day, ... -- against a driver
+    reporting its REAL shrinking daily limit, run once as an uninterrupted
+    daemon (one `state_store`, twenty ticks, no restarts) and once as
+    twenty separate `check`-shaped processes (`from_log` rebuilt fresh
+    every time). Both must make the SAME real provider calls and reach the
+    SAME final state. Before this fix, cron's zero-send days each read as
+    a fresh recovery, so cron kept re-throttling from a mailbox `from_log`
+    incorrectly believed was ACTIVE (100 -> 50 -> 25 -> 12 -> 6 -> 3 -> an
+    unearned PAUSE), while a daemon covering the identical history throttles
+    once and stops, because its second bad day is genuinely still THROTTLED
+    at 50 -- exactly CLOSE3-1's compounding failure, resurfaced through a
+    door the permutation sweep couldn't reach until `ZERO_SENDS` existed."""
+    daemon_driver = _AlternatingZeroSendDriver()
+    daemon_store = BreakerStateStore()
+    for _ in range(20):
+        _alternating_zero_send_evaluation(daemon_driver, daemon_store)
+
+    cron_driver = _AlternatingZeroSendDriver()
+    cron_log = tmp_path / "decisions.jsonl"
+    cron_store = BreakerStateStore()
+    for _ in range(20):
+        evaluation = _alternating_zero_send_evaluation(cron_driver, cron_store)
+        append_record(cron_log, DecisionRecord.from_evaluation(evaluation))
+        # Restart: rebuild state from the log alone, exactly like a fresh
+        # `check` process would, discarding the in-process `cron_store`.
+        cron_store = BreakerStateStore.from_log(cron_log)
+
+    assert cron_driver.throttle_calls == daemon_driver.throttle_calls
+    assert cron_driver.pause_calls == daemon_driver.pause_calls
+    assert cron_store.status_of(_MAILBOX) == daemon_store.status_of(_MAILBOX)
+    assert cron_store.throttled_at_limit(_MAILBOX) == daemon_store.throttled_at_limit(_MAILBOX)
 
 
 # --- CLOSE6-2: a hand-edited/merged/restored log must not un-pause -------
