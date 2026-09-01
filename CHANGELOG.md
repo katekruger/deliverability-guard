@@ -157,6 +157,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: `resume` had no exception handler at all, and its uncaught
+  failure exit code collided with a documented one** (external audit
+  finding CLOSE9-2 -- production-reachable, and CLOSE8-2's class in the
+  one command CLOSE8-2 didn't touch). `main` wrapped `check`/`run` in
+  multiple handlers, including CLOSE8-2's own catch-all, and wrapped
+  `load_config`/`BreakerStateStore.from_log`/`build_driver` -- but
+  `cmd_resume` was called bare, despite writing to disk via
+  `append_resume_record`. Reproduced with a real unprivileged user against
+  a real read-only decision-log file (`chmod 0o400`, no monkeypatching):
+  `PermissionError` tracebacked straight out of `cli.main`. Two things
+  were wrong, not one: a bare traceback contradicts `CliError`'s own
+  docstring ("never a traceback a cron job's error email has to
+  explain"), and Python's default exit code for an uncaught exception is
+  1 -- which this project's OWN exit-code map already assigns to "`check`
+  found a breach (or `resume` was refused)." An operator wrapper reading
+  exit 1 here would conclude the resume was refused when the write
+  actually failed entirely differently, confirmed with an injected
+  `OSError(ENOSPC)` too.
+
+  Fixed by wrapping `resume`'s `cmd_resume` call in the same broad
+  `except Exception` pattern `check`/`run` already have, mapping to exit
+  3 (documented as "a provider transport failure ... or a decision-log
+  write failure") -- never 1, so it can never be confused with a genuine
+  refusal. Then the class was re-run, per the round's own opening
+  instruction, over every `cli.main` command path, not just `resume`:
+  `build_driver(...)`'s own call sites for `check`/`run` were ALSO only
+  wrapped in `except CliError`, resting on a docstring-only contract that
+  it never raises anything else -- merged into the same shared try/except
+  as `cmd_check`/`cmd_run` (with `CliError` still checked first, exit
+  code unaffected) so a future driver constructor bug gets the same
+  safety net rather than a second, separate gap.
+
+  | Command | Shared pre-dispatch | Command-specific exception surface | Handling |
+  |---|---|---|---|
+  | `check` | `load_config` (`ConfigError`, exit 2); `BreakerStateStore.from_log` (`BreakerStateStoreLoadError`, exit 2) | `build_driver` (`CliError`, exit 2) and `cmd_check`/`evaluate_all_mailboxes` (`httpx.HTTPError`/`ProviderError`/`ValueError`/anything else, exit 3) -- one shared try/except (CLOSE9-2) | All mapped |
+  | `run` | same as `check` | same as `check`, plus `KeyboardInterrupt` (clean stop, exit 0) | All mapped |
+  | `status` | same as `check` | none -- `cmd_status` only reads `state_store` (already loaded) and prints; no external I/O of its own | Nothing to catch -- confirmed by test, not assumed |
+  | `resume` | same as `check` | `cmd_resume` -- `append_resume_record` writes to disk (`OSError` and subclasses: `PermissionError`, `ENOSPC`, ...) -- now wrapped (CLOSE9-2), exit 3 | All mapped |
+
+  Tests: the real read-only-file reproduction; an injected
+  `OSError(ENOSPC)`; and one property test per command (`check`, `run`,
+  `status`, `resume`) asserting no uncaught exception of any kind escapes
+  `cli.main`.
+
 - **`engine/breaker.py`, `cli.py`: one FAILED pause attempt permanently
   disabled throttling for that mailbox** (external audit finding CLOSE9-1
   -- a safety defect, not a consistency one; no permutation sweep could

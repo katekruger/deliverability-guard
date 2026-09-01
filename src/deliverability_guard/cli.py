@@ -16,8 +16,12 @@ so the one-shot and continuous forms cannot drift apart from each other.
 Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
 was refused), 2 a config/setup error (bad YAML, unknown provider, missing
 credential), 3 a provider transport failure (network error, rate limit
-exhausted, malformed response) -- distinct from 1 so a cron wrapper can tell
-"the fleet is healthy" apart from "we couldn't even ask the provider."
+exhausted, malformed response) OR a decision-log write failure (CLOSE9-2:
+`resume`'s own `append_resume_record` call can fail -- a read-only mount, a
+full disk, a directory owned by a different user -- and that failure must
+never collide with exit 1, which already means "refused") -- distinct from
+1 so a cron wrapper can tell "the fleet is healthy" apart from "we
+couldn't even ask the provider" or "we couldn't record what we did."
 """
 
 import argparse
@@ -382,7 +386,7 @@ exit codes:
   1  check found a breach (or resume was refused)
   2  a config/setup error (bad YAML, unknown provider, missing credential)
   3  a provider transport failure (network error, rate limit exhausted,
-     malformed response)
+     malformed response) or a decision-log write failure
 """
 
 
@@ -453,10 +457,6 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "check":
         try:
             driver = build_driver(config.provider, env=os.environ)
-        except CliError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return _EXIT_CONFIG_OR_SETUP_ERROR
-        try:
             return cmd_check(
                 driver=driver,
                 config=config,
@@ -464,6 +464,9 @@ def main(argv: Sequence[str] | None = None) -> int:
                 now=datetime.now(UTC),
                 out=sys.stdout,
             )
+        except CliError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_CONFIG_OR_SETUP_ERROR
         except (httpx.HTTPError, ProviderError) as exc:
             print(f"error: provider request failed: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
@@ -494,16 +497,25 @@ def main(argv: Sequence[str] | None = None) -> int:
             # must never turn into a bare traceback for, because there is
             # no way to enumerate every exception type every current and
             # future driver's client library might ever raise.
+            #
+            # CLOSE9-2: this try block now wraps `build_driver(...)` too,
+            # not just `cmd_check(...)` -- the two used to be separate try
+            # blocks, with only `CliError` caught around `build_driver`.
+            # `build_driver`'s own documented contract is "only ever raises
+            # `CliError`," but that contract living entirely in a docstring,
+            # unchecked, is exactly the kind of claim this project's audits
+            # have repeatedly found doesn't hold once a new driver is added
+            # (blind-spot item 6). One shared try/except, with `CliError`
+            # still checked FIRST so its own exit code (2) is unaffected,
+            # means a future driver constructor that raises something
+            # unanticipated gets the same safety net `cmd_check` itself
+            # already has, instead of a second, separate gap to close later.
             print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     if args.command == "run":
         try:
             driver = build_driver(config.provider, env=os.environ)
-        except CliError as exc:
-            print(f"error: {exc}", file=sys.stderr)
-            return _EXIT_CONFIG_OR_SETUP_ERROR
-        try:
             return cmd_run(
                 driver=driver,
                 config=config,
@@ -517,6 +529,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         except KeyboardInterrupt:
             print("stopped", file=sys.stdout)
             return _EXIT_OK
+        except CliError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return _EXIT_CONFIG_OR_SETUP_ERROR
         except (httpx.HTTPError, ProviderError) as exc:
             print(f"error: provider request failed: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
@@ -524,7 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # CLOSE7-2: see the identical `check` handler just above.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
-        except Exception as exc:  # CLOSE8-2, see the identical `check` handler above
+        except Exception as exc:  # CLOSE8-2/CLOSE9-2, see the identical `check` handler above
             print(f"error: unexpected failure evaluating provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
@@ -535,14 +550,40 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.command == "resume":
         mailbox = MailboxRef(provider=config.provider, mailbox_id=args.mailbox_id)
         resumed_by = args.by or os.environ.get("USER") or os.environ.get("USERNAME") or "unknown"
-        return cmd_resume(
-            mailbox=mailbox,
-            state_store=state_store,
-            decision_log_path=config.decision_log_path,
-            resumed_by=resumed_by,
-            now=datetime.now(UTC),
-            out=sys.stdout,
-        )
+        try:
+            return cmd_resume(
+                mailbox=mailbox,
+                state_store=state_store,
+                decision_log_path=config.decision_log_path,
+                resumed_by=resumed_by,
+                now=datetime.now(UTC),
+                out=sys.stdout,
+            )
+        except Exception as exc:
+            # CLOSE9-2: `cmd_resume` was called bare -- no handler at all,
+            # despite writing to disk via `append_resume_record` (a
+            # read-only mount, a full disk, a decision-log directory owned
+            # by a different user than the one running `resume` are all
+            # realistic ways for that write to fail). Two things were wrong
+            # with the resulting bare traceback: it contradicted `CliError`'s
+            # own docstring promise, and Python's default exit code for an
+            # uncaught exception is 1 -- which this project's OWN exit-code
+            # map already assigns to "resume was refused." An operator
+            # wrapper reading exit 1 here would conclude the resume was
+            # refused (nothing to resume) when the write actually failed
+            # entirely differently, and never even reached the refusal
+            # check. This one broad `except Exception`, not a list of
+            # specific exception types, for the same reason `check`/`run`'s
+            # own catch-all (CLOSE8-2) is broad: `cmd_resume`'s own
+            # docstring already enumerates what `state_store`/`from_log`
+            # replaying can raise (`BreakerStateStoreLoadError`, caught
+            # separately above, before `cmd_resume` is ever reached), so
+            # what's left here is specifically the write path, and a write
+            # can fail for reasons (`OSError` and its many subclasses --
+            # `PermissionError`, and platform-specific errors this module
+            # has no business enumerating) too varied to name exhaustively.
+            print(f"error: could not record the resume decision: {exc}", file=sys.stderr)
+            return _EXIT_PROVIDER_TRANSPORT_FAILURE
 
     raise AssertionError(  # pragma: no cover
         f"unreachable: argparse required a valid command, got {args.command!r}"
