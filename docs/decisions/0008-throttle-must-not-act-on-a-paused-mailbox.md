@@ -15,7 +15,7 @@ PAUSE branch always has: "a previous trip already got this mailbox paused
 0003's human-review gate -- whose evidence on a later tick happened to land
 in the THROTTLE band rather than the PAUSE band got a REAL `driver.
 throttle()` call, and `mark_throttled` moved its persisted status to
-THROTTLED. One later OK evaluation then hit CLOSE-3b's sustained-recovery
+THROTTLED. One later OK evaluation then hit CLOSE-3b's single-OK recovery
 path (a genuine, wanted transition for a THROTTLED mailbox) and moved it
 all the way to ACTIVE -- with `resume_after_human_review` never called and
 no `ResumeRecord` ever written to the log (CLOSE5-1, external audit, round
@@ -45,7 +45,7 @@ un-pausing a confirmed-paused mailbox on its own").
   mailbox, not just the one (PAUSE) that happens to already check status.
   A guarantee that holds for one verb and not another is not the guarantee
   it claims to be.
-- The fix must not disturb CLOSE-3b's sustained-recovery path (OK after
+- The fix must not disturb CLOSE-3b's single-OK recovery path (OK after
   THROTTLED -> ACTIVE), which is a genuine, wanted, already-correct
   transition -- only the NEW, wrong path (PAUSED -> THROTTLED -> ACTIVE)
   that this decision closes.

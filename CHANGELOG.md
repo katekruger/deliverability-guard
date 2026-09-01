@@ -157,6 +157,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **"Sustained recovery" renamed to "single-OK recovery"** (external audit
+  finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
+  automatic recovery path (and CLOSE9-1's extension of it to
+  `PAUSE_FAILED`) was described everywhere as "sustained recovery" or "a
+  sustained OK verdict." Measured: it fires on a SINGLE `Verdict.OK`
+  evaluation with `sends >= 1`, not a run of them --
+  `ONE OK eval with sends=1, complaints=0 -> status=ACTIVE`, then the next
+  THROTTLE re-halves. Not a CLOSE9 regression (`THROTTLED` behaved
+  identically at `f9077ff`, well before CLOSE9-1 touched this code), and
+  not a bug on its own -- CLOSE7-1's `INSUFFICIENT_DATA` guard already
+  stops silence from triggering it, so the mechanism that exists is doing
+  real work. The word was simply inaccurate: "sustained" implies evidence
+  over time; what fires is `n=1`.
+
+  Two honest options, argued in [ADR 0003's new
+  addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-09-01-sustained-recovery-was-renamed-to-single-ok-recovery----the-behavior-did-not-change):
+  rename it, or require `k` evaluations / a minimum volume before clearing
+  (a real behavior change needing its own data-grounded threshold and its
+  own tests -- picking an arbitrary `k` under this finding's own time
+  pressure would trade one overclaim for a fabricated-precision one).
+  Chosen: **rename it**. `n=1` recovery is correct once real evidence
+  exists (`DataState.OK`, not `INSUFFICIENT_DATA`); only the word claimed
+  more than that. Renamed everywhere the mechanism is described
+  (`engine/breaker.py`, `cli.py`, `docs/decisions/0008`,
+  `tests/test_breaker.py`) -- deliberately NOT touching
+  `engine/changepoint.py`'s or `loops/fast.py`'s own "sustained shift" /
+  "sustained elevated rate," which correctly describe CUSUM's different,
+  genuinely multi-period detection target. Pure rename: no test's
+  assertions changed, only their docstrings' wording.
+
 - **`cli.py`: `check`/`run`'s own decision-log write failure blamed the
   provider** (external audit finding CLOSE10-2). A read-only decision-log
   directory makes `on_evaluation`'s own `append_record` call raise

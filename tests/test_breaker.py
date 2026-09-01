@@ -328,7 +328,7 @@ def test_a_paused_mailbox_that_evaluates_to_throttle_is_not_throttled() -> None:
 
 
 def test_a_paused_mailbox_with_an_ok_verdict_stays_paused() -> None:
-    """CLOSE-3b's sustained-recovery path only ever fires for THROTTLED, not
+    """CLOSE-3b's single-OK recovery path only ever fires for THROTTLED, not
     PAUSED -- confirming that stays true after CLOSE5-1's fix, since the
     reproduction reaches ACTIVE via THROTTLED, never directly from PAUSED."""
     driver = FakeDriver()
@@ -653,7 +653,7 @@ def test_throttle_idempotency_does_not_block_a_first_time_pause() -> None:
 
 
 def test_throttle_then_ok_then_throttle_re_throttles() -> None:
-    """CLOSE-3b: a sustained OK verdict clears THROTTLED back to ACTIVE --
+    """CLOSE-3b: a single OK verdict clears THROTTLED back to ACTIVE --
     the ladder's own recovery path for THROTTLE, unlike PAUSE. A later
     re-degradation must reach the provider again, not be swallowed as an
     idempotent no-op against a status that never recovered."""
@@ -2223,11 +2223,11 @@ def test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_unactionable(
     """After ANY starting move, followed by a bounded run of genuinely
     healthy (`Verdict.OK`, real evidence) evaluations, the mailbox must
     end up somewhere a provider action is still reachable: `ACTIVE`
-    (sustained recovery fired, or nothing ever happened), or `PAUSED`
+    (single-OK recovery fired, or nothing ever happened), or `PAUSED`
     (ADR 0003's OWN intentional permanent state -- a human can always
     `resume` it, so this is not "stuck," it's the policy). Anything else
     -- `THROTTLED` or `PAUSE_FAILED` surviving thirty straight healthy
-    days -- means sustained recovery silently failed to fire for a real
+    days -- means single-OK recovery silently failed to fire for a real
     reason to recover, which is exactly CLOSE9-1's shape. `PAUSE_IN_FLIGHT`
     is not reachable here: `_apply_move`'s FakeDriver-backed moves always
     resolve within the same `evaluate()` call, the same as every real
@@ -2243,7 +2243,7 @@ def test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_unactionable(
     assert status in (MailboxBreakerStatus.ACTIVE, MailboxBreakerStatus.PAUSED), (
         f"after {starting_move!r} then 30 healthy evaluations, mailbox is stuck "
         f"in {status.name} -- a provider action should still be reachable, either "
-        f"through sustained recovery or (for PAUSED specifically) a human resume"
+        f"through single-OK recovery or (for PAUSED specifically) a human resume"
     )
 
 
@@ -2625,7 +2625,7 @@ def test_state_store_rebuild_reverts_to_active_on_an_unsupported_pause_attempt(
 def test_state_store_from_log_recovers_a_throttled_mailbox_after_five_healthy_restarts(
     tmp_path: Path,
 ) -> None:
-    """CLOSE3-3: a THROTTLE followed by sustained healthy evaluations must
+    """CLOSE3-3: a THROTTLE followed by a single healthy evaluation must
     clear the persisted THROTTLED status, not just the in-process one --
     `from_log` leaving OK verdicts alone (as it did before this fix) meant a
     fully recovered mailbox that happened to restart mid-recovery read

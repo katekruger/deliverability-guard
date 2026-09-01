@@ -333,7 +333,7 @@ def cmd_resume(
     own. Also the way an operator clears a persisted THROTTLED mailbox
     (CLOSE3-3) or a mailbox stuck `PAUSE_FAILED` (CLOSE9-1): `from_log` and
     `evaluate()` both now clear THROTTLED and PAUSE_FAILED on their own once
-    a recovered mailbox's sustained OK evidence makes it into the log (ADR
+    a recovered mailbox's single-OK recovery evidence makes it into the log (ADR
     0003's addendum), but a mailbox whose own evidence never recovers had
     no path back to ACTIVE at all before CLOSE3-3 (for THROTTLED) and
     CLOSE9-1 (for PAUSE_FAILED) -- the refusal message just said what the
@@ -343,7 +343,7 @@ def cmd_resume(
     FAILED from the provider never actually stopped the mailbox, so it is
     not behind ADR 0003's human-review gate the way a confirmed PAUSED is
     -- but before CLOSE9-1, nothing at all could move it off `PAUSE_FAILED`
-    (`cmd_resume` refused it; CLOSE-3b's sustained recovery only checked
+    (`cmd_resume` refused it; CLOSE-3b's single-OK recovery only checked
     `THROTTLED`), so `throttled_at_limit`'s idempotency memo latched
     forever and the mailbox's THROTTLE rung went permanently inert.
 
