@@ -157,6 +157,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`, `cli.py`: one FAILED pause attempt permanently
+  disabled throttling for that mailbox** (external audit finding CLOSE9-1
+  -- a safety defect, not a consistency one; no permutation sweep could
+  ever see it, because the live path and `from_log` agreed at every step
+  and were simply both wrong). `mark_pause_failed` deliberately keeps
+  `throttled_at_limit` alive so the VERY NEXT evaluation stays idempotent
+  instead of re-halving (CLOSE-3c) -- correct advice for that one
+  evaluation. But nothing ever moved a mailbox OFF `PAUSE_FAILED` at all:
+  `cmd_resume` refused it (only `PAUSED`/`THROTTLED` were accepted), and
+  CLOSE-3b's sustained-OK recovery checked only `THROTTLED`. So the
+  "next evaluation" memo latched forever, and `_act`'s idempotency check
+  kept comparing every future breach against a limit from an episode that
+  could be arbitrarily far in the past.
+
+  Reproduction: throttle to 200, a pause attempt FAILS, thirty consecutive
+  healthy evaluations, then a fresh breach against a real, changed
+  operator daily limit (100, down from the stale 400 on file). Before the
+  fix: `_act` read this as "mailbox already throttled at this limit; no
+  action taken (idempotent)" and made ZERO real provider calls -- for a
+  mailbox that had been healthy for a month. After: a genuine
+  `throttle()` call.
+
+  Fixed two ways. (1) `cmd_resume` now accepts `PAUSE_FAILED` alongside
+  `PAUSED` and `THROTTLED` -- a human can unstick it immediately, the
+  refusal message now names what CAN be resumed instead of only what a
+  mailbox isn't. (2) `PAUSE_FAILED` now recovers automatically too:
+  `evaluate()`'s and `from_log`'s sustained-OK recovery check (CLOSE-3b)
+  now fires for `PAUSE_FAILED` the same as it already does for
+  `THROTTLED`, clearing both status and `throttled_at_limit`. This needed
+  a real policy decision, not just a bug fix -- `PAUSE_FAILED` means the
+  provider never actually stopped the mailbox, which is the same shape as
+  `THROTTLED` (a real action attempted, mailbox still live, eligible for
+  sustained recovery), not the same shape as `PAUSED` (a real action that
+  LANDED, human-gated on purpose by ADR 0003). See [ADR 0003's
+  2026-09-01 addendum](docs/decisions/0003-never-auto-resume-after-pause.md#addendum-2026-09-01-a-failed-pause-attempt-was-a-permanent-latch-and-pause_failed-now-recovers-like-throttled-does)
+  for the full reasoning. CLOSE-3c's own property -- a failed pause must
+  not let the IMMEDIATELY NEXT throttle re-halve -- is untouched by
+  either change and still holds (confirmed by its own existing,
+  unmodified test).
+
+  New test class, not just new tests: a live-versus-SHOULD property
+  (`test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_
+  unactionable`), swept over every starting move in the permutation
+  sweep's own move set, asserting that thirty healthy evaluations after
+  ANY starting state leave the mailbox somewhere a provider action is
+  still reachable (`ACTIVE`, or `PAUSED` -- ADR 0003's own intentional
+  permanent state, always resumable by a human). This is a genuinely
+  different kind of test from every sweep in this project so far: it
+  doesn't compare two implementations against each other, it checks one
+  against what's actually correct -- see `tests/test_breaker.py`'s
+  blind-spot list, item 8, for why that distinction is the headline
+  lesson of this round.
+
 - **`tests/test_breaker.py`: the blind-spot list kept alive, item 3 marked
   closed rather than deleted** (CLOSE8-4). The list at
   `tests/test_breaker.py:1627` (round 7's own artifact) found CLOSE8-1

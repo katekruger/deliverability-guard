@@ -322,14 +322,26 @@ def cmd_resume(
     """The only path out of PAUSED (ADR 0003) -- a typed, explicit human
     action, never something `check` or any other command reaches on its
     own. Also the way an operator clears a persisted THROTTLED mailbox
-    (CLOSE3-3): `from_log` now clears THROTTLED on its own once a recovered
-    mailbox's OK verdict actually makes it into the log, but a mailbox that
-    is genuinely stuck THROTTLED -- its own evidence never recovers -- had
-    no path back to ACTIVE at all before this; the refusal message just said
-    what the mailbox wasn't, with nowhere to go from there. Refuses (exit 1,
-    not an error) for a mailbox that is neither PAUSED nor THROTTLED, so a
-    mistyped mailbox id or an already-resumed mailbox doesn't look like
-    success.
+    (CLOSE3-3) or a mailbox stuck `PAUSE_FAILED` (CLOSE9-1): `from_log` and
+    `evaluate()` both now clear THROTTLED and PAUSE_FAILED on their own once
+    a recovered mailbox's sustained OK evidence makes it into the log (ADR
+    0003's addendum), but a mailbox whose own evidence never recovers had
+    no path back to ACTIVE at all before CLOSE3-3 (for THROTTLED) and
+    CLOSE9-1 (for PAUSE_FAILED) -- the refusal message just said what the
+    mailbox wasn't, with nowhere to go from there.
+
+    `PAUSE_FAILED` specifically: a pause attempt that got a definitive
+    FAILED from the provider never actually stopped the mailbox, so it is
+    not behind ADR 0003's human-review gate the way a confirmed PAUSED is
+    -- but before CLOSE9-1, nothing at all could move it off `PAUSE_FAILED`
+    (`cmd_resume` refused it; CLOSE-3b's sustained recovery only checked
+    `THROTTLED`), so `throttled_at_limit`'s idempotency memo latched
+    forever and the mailbox's THROTTLE rung went permanently inert.
+
+    Refuses (exit 1, not an error) for a mailbox that is none of PAUSED,
+    THROTTLED, or PAUSE_FAILED, so a mistyped mailbox id or an
+    already-resumed mailbox doesn't look like success -- the refusal
+    message names what CAN be resumed, not just what this mailbox isn't.
 
     Appends a `ResumeRecord` to the decision log so this survives a process
     restart -- see `engine.breaker.BreakerStateStore.from_log`. `resumed_by`
@@ -337,10 +349,16 @@ def cmd_resume(
     0003's whole point is that a human is on the hook for this decision.
     """
     status = state_store.status_of(mailbox)
-    if status not in (MailboxBreakerStatus.PAUSED, MailboxBreakerStatus.THROTTLED):
+    _RESUMABLE_STATUSES = (
+        MailboxBreakerStatus.PAUSED,
+        MailboxBreakerStatus.THROTTLED,
+        MailboxBreakerStatus.PAUSE_FAILED,
+    )
+    if status not in _RESUMABLE_STATUSES:
         print(
-            f"{mailbox.mailbox_id} is not paused or throttled (status: {status.name}); "
-            "nothing to resume",
+            f"{mailbox.mailbox_id} is not paused, throttled, or pause-failed "
+            f"(status: {status.name}); nothing to resume -- `resume` only acts on "
+            f"{', '.join(s.name for s in _RESUMABLE_STATUSES)}",
             file=out,
         )
         return _EXIT_BREACH_OR_REFUSED

@@ -940,6 +940,88 @@ def test_pause_failure_marks_pause_failed_not_active() -> None:
     assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSE_FAILED
 
 
+def test_pause_failed_recovers_after_thirty_healthy_days() -> None:
+    """CLOSE9-1's reproduction, run to completion: `mark_pause_failed`
+    deliberately keeps `throttled_at_limit` alive for the NEXT evaluation
+    (CLOSE-3c) -- correct advice for that one evaluation, but before this
+    fix nothing ever moved the mailbox OFF `PAUSE_FAILED` at all, so that
+    memory latched forever. Thirty healthy evaluations, then a fresh
+    breach against a real, changed operator limit -- must produce a REAL
+    provider call, not the "already throttled at this limit" idempotent
+    no-op a permanently stale memory would keep producing."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+
+    # 1. A real throttle at limit 400 -> halved to 200.
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=400,
+    )
+    assert driver.throttle_calls == [("a@example.com", 200)]
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+
+    # 2. A pause attempt FAILS.
+    driver.pause_outcome = ActionOutcome.FAILED
+    evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=40,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=200,
+    )
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSE_FAILED
+
+    # 3. Thirty consecutive healthy evaluations.
+    for _ in range(30):
+        evaluate(
+            driver=driver,
+            mailbox=_MAILBOX,
+            sends=5000,
+            complaints=0,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=state_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=200,
+        )
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.ACTIVE
+    assert state_store.throttled_at_limit(_MAILBOX) is None
+
+    # 4. A fresh breach. The operator has since restored the real daily
+    # limit to 100 (down from the stale 400 on file) -- a genuinely new
+    # THROTTLE, not a repeat of the old one.
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+    assert result.verdict is Verdict.THROTTLE
+    assert result.action is not None
+    assert result.action.outcome is ActionOutcome.PERFORMED
+    assert driver.throttle_calls == [("a@example.com", 200), ("a@example.com", 50)]
+
+
 def test_pause_unsupported_reverts_status_to_active() -> None:
     driver = FakeDriver(capabilities=frozenset({Capability.READ_STATS}))
     state_store = BreakerStateStore()
@@ -2095,6 +2177,49 @@ def test_compliance_pause_daemon_and_cron_escalate_the_same_way(tmp_path: Path) 
     final_daemon = BreakerStateStore.from_log(tmp_path / "daemon.jsonl")
     final_cron = BreakerStateStore.from_log(tmp_path / "cron.jsonl")
     assert final_daemon.status_of(_MAILBOX) == final_cron.status_of(_MAILBOX)
+
+
+# --- CLOSE9-1: a live-vs-SHOULD property, not a live-vs-replay one --------
+#
+# Every sweep above (and CLOSE9-1's own reproduction) compares the LIVE
+# path against REPLAY, or one calling shape against another -- an
+# equivalence question. CLOSE9-1 itself was invisible to all of them: the
+# live path and `from_log` agreed with each other at every step, and the
+# daemon and cron forms made identical calls. They were just both stuck.
+# No equivalence test can find a wrong answer both sides give the same
+# way -- only a test that asks "is this actually right," independent of
+# any second implementation to compare against, can. This is that test.
+
+
+@pytest.mark.parametrize("starting_move", [m for m in _PERMUTATION_MOVES if m != "RESUME"])
+def test_no_bounded_run_of_healthy_evaluations_leaves_a_mailbox_unactionable(
+    starting_move: str, tmp_path: Path
+) -> None:
+    """After ANY starting move, followed by a bounded run of genuinely
+    healthy (`Verdict.OK`, real evidence) evaluations, the mailbox must
+    end up somewhere a provider action is still reachable: `ACTIVE`
+    (sustained recovery fired, or nothing ever happened), or `PAUSED`
+    (ADR 0003's OWN intentional permanent state -- a human can always
+    `resume` it, so this is not "stuck," it's the policy). Anything else
+    -- `THROTTLED` or `PAUSE_FAILED` surviving thirty straight healthy
+    days -- means sustained recovery silently failed to fire for a real
+    reason to recover, which is exactly CLOSE9-1's shape. `PAUSE_IN_FLIGHT`
+    is not reachable here: `_apply_move`'s FakeDriver-backed moves always
+    resolve within the same `evaluate()` call, the same as every real
+    driver's `pause()` either returning or raising, never hanging."""
+    log_path = tmp_path / "decisions.jsonl"
+    state_store = BreakerStateStore()
+    _apply_move(starting_move, state_store, log_path)
+
+    for _ in range(30):
+        _apply_move("OK", state_store, log_path)
+
+    status = state_store.status_of(_MAILBOX)
+    assert status in (MailboxBreakerStatus.ACTIVE, MailboxBreakerStatus.PAUSED), (
+        f"after {starting_move!r} then 30 healthy evaluations, mailbox is stuck "
+        f"in {status.name} -- a provider action should still be reachable, either "
+        f"through sustained recovery or (for PAUSED specifically) a human resume"
+    )
 
 
 # --- CLOSE7-4: the dry-run asymmetry, pinned rather than left as a gap ----

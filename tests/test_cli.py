@@ -545,6 +545,61 @@ def test_resume_clears_a_throttled_mailbox(tmp_path: Path) -> None:
     assert event.mailbox_id == "a@example.com"
 
 
+def test_resume_accepts_a_pause_failed_mailbox(tmp_path: Path) -> None:
+    """CLOSE9-1: before this, `resume` refused `PAUSE_FAILED` outright, and
+    nothing else could move a mailbox off it either -- a permanent latch.
+    `resume` now accepts it the same way it already accepts THROTTLED
+    (CLOSE3-3): a human, explicitly named, clearing a stuck mailbox back
+    to ACTIVE, with `throttled_at_limit` cleared alongside it so the next
+    genuine breach isn't read as an idempotent repeat of a stale one."""
+    log_path = tmp_path / "decisions.jsonl"
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+    state_store.mark_throttled(mailbox, current_daily_limit=200)
+    state_store.mark_pause_failed(mailbox)
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=log_path,
+        resumed_by="kate",
+        now=_NOW,
+        out=io.StringIO(),
+    )
+
+    assert exit_code == 0
+    assert state_store.status_of(mailbox) == MailboxBreakerStatus.ACTIVE
+    assert state_store.throttled_at_limit(mailbox) is None
+    (event,) = read_events(log_path)
+    assert isinstance(event, ResumeRecord)
+    assert event.mailbox_id == "a@example.com"
+
+
+def test_resume_refusal_message_names_what_can_be_resumed(tmp_path: Path) -> None:
+    """CLOSE9-1: the refusal message used to only say what the mailbox
+    WASN'T ("is not paused or throttled"), a dead end. It now names the
+    statuses `resume` actually acts on, so an operator reading it knows
+    what to look for instead of just what didn't match."""
+    out = io.StringIO()
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+    state_store = BreakerStateStore()
+
+    exit_code = cmd_resume(
+        mailbox=mailbox,
+        state_store=state_store,
+        decision_log_path=tmp_path / "decisions.jsonl",
+        resumed_by="kate",
+        now=_NOW,
+        out=out,
+    )
+
+    assert exit_code == 1
+    printed = out.getvalue()
+    assert "PAUSED" in printed
+    assert "THROTTLED" in printed
+    assert "PAUSE_FAILED" in printed
+
+
 def test_resume_refuses_a_mailbox_that_is_not_paused(tmp_path: Path) -> None:
     out = io.StringIO()
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
