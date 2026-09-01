@@ -157,6 +157,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_cli.py`: the `check`/`run` drift guard was vacuous**
+  (external audit finding CLOSE7-3).
+  `test_check_and_run_share_the_same_evaluation_chokepoint` asserted
+  `"evaluate_all_mailboxes" in inspect.getsource(...)` -- but
+  `inspect.getsource` includes a function's docstring, and both `cmd_check`
+  and `controller.run`'s docstrings already name `evaluate_all_mailboxes`
+  in prose. Proved vacuous: a hand-duplicated aggregation-and-evaluation
+  loop that never touched the real chokepoint at all (no pooling, no
+  CUSUM, no `current_daily_limit`) still passed this test, because the
+  docstring's own mention was enough -- the drift was caught, but by three
+  unrelated behavioural tests, never by the test written for the claim.
+  The two sibling tests this one was modelled on
+  (`test_evaluate_never_calls_resume_after_human_review`,
+  `test_engine_breaker_module_never_constructs_a_campaign_ref`) were never
+  vulnerable to this, because both assert `not in`: a docstring mention of
+  a FORBIDDEN name can only ever make a `not in` assertion correctly fail,
+  never incorrectly pass. Copying the idiom while flipping the polarity to
+  `in` is exactly what broke this one. Fixed with a new shared helper,
+  `tests/fixtures/source_inspect.py`'s `source_body`, which strips a
+  function's docstring out (AST-based, not `source.replace(func.__doc__,
+  "")` -- Python 3.13 dedents a multi-line `__doc__` at compile time, so
+  the stored string is no longer a verbatim substring of `inspect.
+  getsource` there) before the `in` assertion runs. A new regression test
+  reapplies the exact mutation shape against a stand-in function and
+  confirms the vacuous guard passes it while the fixed one doesn't.
+
 - **`engine/breaker.py`, `engine/changepoint.py`: a bounce-only day crashed
   `check` with an uncaught `ValueError`** (external audit finding CLOSE7-2).
   `evaluate()` required `0 <= complaints <= sends` and raised otherwise --

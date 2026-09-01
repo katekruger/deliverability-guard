@@ -1851,10 +1851,53 @@ def test_check_and_run_share_the_same_evaluation_chokepoint() -> None:
     `cmd_check` and `loops.controller.run` must reference
     `evaluate_all_mailboxes` by name -- if either one stopped calling it
     (e.g. reimplementing its own aggregation-and-evaluation loop), this
-    fails without needing to notice the behavioral drift first."""
+    fails without needing to notice the behavioral drift first.
+
+    CLOSE7-3: this guard was PROVED VACUOUS -- both docstrings already
+    name `evaluate_all_mailboxes` in prose (`cmd_check`'s at line 15 of
+    this repo's own module docstring shape;`controller.run`'s at several
+    lines), and `inspect.getsource` includes a function's docstring. A
+    hand-duplicated aggregation-and-evaluation loop that never touched the
+    real chokepoint at all -- no pooling, no CUSUM, no `current_daily_
+    limit` -- still passed this test, because the docstring's own mention
+    of the name was enough. `source_body` (`tests/fixtures/
+    source_inspect.py`) strips the docstring out first, so the assertion
+    can only pass because the CODE calls `evaluate_all_mailboxes`, not
+    because the docstring talks about it. The two sibling tests this one
+    was modelled on (`resume_after_human_review`/`CampaignRef`, both
+    `not in`) were never vulnerable to this in the first place -- only
+    copying the idiom while flipping `not in` to `in` was."""
+    from deliverability_guard.loops import controller as controller_module
+    from fixtures.source_inspect import source_body
+
+    assert "evaluate_all_mailboxes" in source_body(cli_module.cmd_check)
+    assert "evaluate_all_mailboxes" in source_body(controller_module.run)
+
+
+def test_check_and_run_drift_guard_catches_a_hand_duplicated_loop_the_vacuous_one_missed() -> None:
+    """CLOSE7-3's own reproduction, kept as a regression test: a stand-in
+    function shaped exactly like the mutation the audit found -- reimplements
+    the aggregation-and-evaluation loop directly (never calling
+    `evaluate_all_mailboxes`) -- but whose DOCSTRING still names
+    `evaluate_all_mailboxes`, the same way the real `cmd_check`'s always has.
+
+    The vacuous (pre-CLOSE7-3) guard -- a bare `in` over
+    `inspect.getsource` -- passes against this, because the docstring
+    mention is enough. The fixed guard (`source_body`-based, used by
+    `test_check_and_run_share_the_same_evaluation_chokepoint` above) must
+    not."""
     import inspect
 
-    from deliverability_guard.loops import controller as controller_module
+    from fixtures.source_inspect import source_body
 
-    assert "evaluate_all_mailboxes" in inspect.getsource(cli_module.cmd_check)
-    assert "evaluate_all_mailboxes" in inspect.getsource(controller_module.run)
+    def mutated_cmd_check(*, driver: object, config: object, state_store: object) -> int:
+        """A hand-duplicated aggregation-and-evaluation loop that never
+        touches loops.fast.evaluate_all_mailboxes at all -- no pooling, no
+        CUSUM, no current_daily_limit."""
+        return 0
+
+    # The vacuous guard this test file used to have: passes purely because
+    # the docstring mentions the name, proving it never checked the code.
+    assert "evaluate_all_mailboxes" in inspect.getsource(mutated_cmd_check)
+    # The fixed guard: correctly fails, since the CODE never calls it.
+    assert "evaluate_all_mailboxes" not in source_body(mutated_cmd_check)
