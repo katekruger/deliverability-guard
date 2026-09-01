@@ -285,6 +285,42 @@ class BreakerStateStore:
         with `throttled_at_limit` cleared, instead of reading THROTTLED
         forever just because the process restarted before `evaluate()`
         itself ever saw the recovery.
+
+        CLOSE7-1: that recovery check used to trust `Verdict.OK` alone,
+        never `record.data_state` -- so a zero-send day (`evaluate()`'s
+        `sends == 0` early return, always `Verdict.OK` +
+        `DataState.INSUFFICIENT_DATA`, never an action of any kind) replayed
+        as CLOSE3-3's sustained recovery: absence of evidence collapsed into
+        "the mailbox got better." `engine/state.py`'s own module docstring
+        is why `DataState` exists at all -- a throttled mailbox sending less
+        BECAUSE it was throttled can drop out of a provider's reporting
+        entirely, and that silence must never read as OK. A dedicated
+        elif branch now intercepts every `Verdict.OK` + `DataState.
+        INSUFFICIENT_DATA` record before the recovery check ever sees it,
+        leaving status, `throttled_at_limit`, and the unsupported-throttle
+        streak all untouched -- exactly the no-op `evaluate()`'s own early
+        return is.
+
+        Every OTHER branch was checked against this same question --
+        "does `evaluate()` ever pair this verdict/action_outcome with
+        `INSUFFICIENT_DATA`, and if so does this branch already do the
+        right thing?" -- while fixing this. The answer for all of them is
+        yes, already correct, and for the same reason: `evaluate()` can
+        only ever produce `INSUFFICIENT_DATA` two ways -- the `sends == 0`
+        early return just described (always `Verdict.OK`, always
+        `action=None`), or `compliance_gate_tripped` with `sends == 0`
+        (always `Verdict.PAUSE`, with a REAL `action` -- the compliance gate
+        overrides volume, not the other way around). The PAUSE branch above
+        already keys entirely off `action_outcome`, never `data_state`, so a
+        compliance-forced PAUSE on zero sends replays correctly with no
+        change needed -- `data_state` never distinguishes a real action from
+        a fake one there, because `INSUFFICIENT_DATA` paired with PAUSE
+        always means a real `_act` call happened. THROTTLE can never pair
+        with `INSUFFICIENT_DATA` at all (THROTTLE requires `sends > 0` to
+        even compute a verdict past the ladder). The only place
+        `INSUFFICIENT_DATA` could ever masquerade as evidence was the
+        OK-verdict recovery check, which is why that is the only branch
+        that needed to change.
         """
         # Imported here, not at module level, to avoid a circular import:
         # audit.log imports BreakerEvaluation/ThresholdLadder/Verdict/rung
@@ -451,6 +487,40 @@ class BreakerStateStore:
                     # `clear_unsupported_throttle_streak` call for a FAILED
                     # throttle outcome.
                     unsupported_streak.pop(mailbox, None)
+            elif record.verdict is Verdict.OK and record.data_state is DataState.INSUFFICIENT_DATA:
+                # CLOSE7-1: a zero-send day. `evaluate()`'s own `sends == 0`
+                # early return takes NO action of any kind -- it returns
+                # BEFORE reaching any `state_store` mutation, including the
+                # "verdict is not THROTTLE -> clear the unsupported-throttle
+                # streak" line every other non-THROTTLE verdict hits. Replay
+                # must leave status, `throttled_at_limit`, AND the streak
+                # untouched here too -- not just status, which is all the
+                # neighbouring recovery branch below used to guard against.
+                #
+                # This verdict/data_state combination is unambiguous: the
+                # ONLY way `evaluate()` ever returns `Verdict.OK` paired with
+                # `DataState.INSUFFICIENT_DATA` is the `sends == 0` early
+                # return itself (the OTHER path that can produce
+                # `INSUFFICIENT_DATA`, `compliance_gate_tripped`, always
+                # forces `Verdict.PAUSE`, never `OK` -- see `evaluate`'s own
+                # branch above -- so it's already handled correctly by the
+                # PAUSE branch above, unaffected by `data_state`).
+                #
+                # `engine/state.py`'s own module docstring is the reason
+                # this matters: a throttled mailbox sends less as a DIRECT
+                # RESULT of being throttled, can drop below a provider's
+                # reporting threshold, and disappear from stats entirely --
+                # `DataState.INSUFFICIENT_DATA` exists precisely so that
+                # silence is never read back as "it got better." Before this
+                # branch existed, the recovery branch below fired on verdict
+                # alone: a zero-send day cleared THROTTLED to ACTIVE and
+                # erased `throttled_at_limit`, so the very next bad day
+                # re-throttled from the mailbox's ORIGINAL limit instead of
+                # halving further -- CLOSE3-1's exact compounding failure
+                # ("50 -> 25 -> 12 -> 6 -> 3 -> an unearned PAUSE"),
+                # resurfacing through a door the permutation sweep couldn't
+                # see until `ZERO_SENDS` was added to its move set.
+                pass
             elif (
                 record.verdict is Verdict.OK
                 and status.get(mailbox) is MailboxBreakerStatus.THROTTLED
@@ -462,7 +532,10 @@ class BreakerStateStore:
                 # rebuild from the log left a fully recovered mailbox
                 # reading THROTTLED forever, purely because the process
                 # happened to restart before `evaluate()` itself ever saw
-                # the OK verdicts in sequence.
+                # the OK verdicts in sequence. Reaching this branch at all
+                # means `data_state is DataState.OK` (the elif just above
+                # already caught the only other possibility for a `Verdict.
+                # OK` record), so this really is evidence, not silence.
                 status[mailbox] = MailboxBreakerStatus.ACTIVE
                 throttled_at_limit.pop(mailbox, None)
                 unsupported_streak.pop(mailbox, None)

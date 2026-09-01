@@ -157,6 +157,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: a zero-send day replayed as a recovery, and cron
+  compounded where the daemon did not** (external audit finding CLOSE7-1
+  -- CLOSE3-1's compounding failure, resurfaced through a door the
+  permutation sweep couldn't reach). `evaluate()`'s `sends == 0` early
+  return is always `Verdict.OK` + `DataState.INSUFFICIENT_DATA` and takes
+  no action of any kind -- but `from_log`'s CLOSE3-3 recovery branch
+  trusted `Verdict.OK` alone, never `record.data_state`, so a day with no
+  evidence at all replayed as "the mailbox recovered": it cleared a
+  THROTTLED status back to ACTIVE and erased the remembered
+  `throttled_at_limit`, and (a second divergence the isolated reproduction
+  also found) unconditionally reset the unsupported-throttle streak the
+  final `else` branch shares. Reachable in production wherever a throttle
+  itself causes the silence: `engine/state.py`'s own module docstring is
+  the reason `DataState` exists at all -- a domain that gets throttled
+  sends less, can drop below a provider's reporting threshold as a DIRECT
+  RESULT, and disappear from stats entirely, so that silence must never be
+  read back as "OK." Reproduction: twenty alternating bad-day/zero-send-day
+  evaluations against a driver reporting its real shrinking daily limit,
+  run once as an uninterrupted daemon and once as twenty separate
+  `check`-shaped processes. Before this fix, the daemon throttled once
+  (`[50]`) and stayed THROTTLED; cron, reading each zero-send day as a
+  fresh recovery, re-throttled from scratch every time evidence
+  reappeared (`[50, 25, 12, 6, 3]`) and escalated to a real, unearned
+  `pause()` call on evidence the daemon never once called for. Fixed with
+  a dedicated `elif` branch that intercepts every `Verdict.OK` +
+  `DataState.INSUFFICIENT_DATA` record before the recovery check ever
+  sees it, leaving status, `throttled_at_limit`, and the unsupported-
+  throttle streak untouched -- mirroring `evaluate()`'s own no-op exactly.
+  Every other `from_log` branch was checked against the same question
+  (can `evaluate()` ever pair this verdict/action_outcome with
+  `INSUFFICIENT_DATA`, and if so is it already handled correctly?) and the
+  answer is written into `from_log`'s own docstring: yes for all of them,
+  already correct, because `INSUFFICIENT_DATA` can only ever arise from
+  the `sends == 0` early return just described or from a
+  compliance-forced `PAUSE` (which already carries a real `action` the
+  PAUSE branch already keys off, unaffected by `data_state`) -- THROTTLE
+  can never pair with `INSUFFICIENT_DATA` at all. `ZERO_SENDS` joined
+  `tests/test_breaker.py`'s permutation sweep's move set (9 -> 10 moves,
+  729 -> 1,000 sequences); the sweep found 26 live/replay mismatches with
+  no code change, and 0 after.
+
 - **`cli.py`: a paused mailbox's stdout line said `THROTTLE` with no
   indication anything was refused** (external audit finding CLOSE6-4,
   first half). The honest "mailbox is paused; throttle refused pending

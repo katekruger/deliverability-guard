@@ -2,7 +2,7 @@
 
 import dataclasses
 import itertools
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 import pytest
@@ -16,6 +16,7 @@ from deliverability_guard.audit.log import (
 )
 from deliverability_guard.engine.breaker import (
     DEFAULT_LADDER,
+    BreakerEvaluation,
     BreakerStateStore,
     BreakerStateStoreLoadError,
     MailboxBreakerStatus,
@@ -29,7 +30,10 @@ from deliverability_guard.engine.posterior import DEFAULT_PRIOR, GroupObservatio
 from deliverability_guard.engine.state import DataState
 from deliverability_guard.providers.base import (
     ActionOutcome,
+    ActionResult,
+    CampaignRef,
     Capability,
+    MailboxDayStats,
     MailboxRef,
     RateLimitExceededError,
 )
@@ -1575,6 +1579,7 @@ _PERMUTATION_MOVES = (
     "THROTTLE_FAILED",
     "OK",
     "WARN",
+    "ZERO_SENDS",
     "RESUME",
 )
 
@@ -1626,6 +1631,13 @@ def _apply_move(move: str, state_store: BreakerStateStore, log_path: Path) -> No
         # `_act`, so it must leave an already-PAUSED (or any other) status
         # untouched on the live path.
         eval_kwargs = {"sends": 20_000, "complaints": 20}
+    elif move == "ZERO_SENDS":
+        # CLOSE7-1: `evaluate()`'s `sends == 0` early return -- always
+        # Verdict.OK, DataState.INSUFFICIENT_DATA, action=None. This is the
+        # move `_apply_move` structurally cannot make ambiguous: `sends=0`
+        # forces the early return regardless of `driver_kwargs`, so there's
+        # nothing to configure on the driver at all.
+        eval_kwargs = {"sends": 0, "complaints": 0}
     else:  # pragma: no cover -- exhaustive over _PERMUTATION_MOVES
         raise AssertionError(f"unhandled move {move!r}")
 
@@ -1668,9 +1680,10 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     `itertools.product(moves, repeat=3)` rather than `permutations` --
     CLOSE5-2 was found only once repeated moves were covered (`permutations`
-    never repeats an element), and 3 moves at a time keeps the sweep at 729
-    sequences (9 moves, CLOSE6-2 added `PAUSE_FAILED` and `WARN`) rather than
-    needing all 9 in every sequence."""
+    never repeats an element), and 3 moves at a time keeps the sweep at
+    1,000 sequences (10 moves -- CLOSE6-2 added `PAUSE_FAILED` and `WARN`,
+    CLOSE7-1 added `ZERO_SENDS`) rather than needing all 10 in every
+    sequence."""
     log_path = tmp_path / "decisions.jsonl"
     live_store = BreakerStateStore()
     for move in sequence:
@@ -1678,6 +1691,176 @@ def test_from_log_replay_matches_the_live_path_over_every_move_ordering(
 
     replayed_store = BreakerStateStore.from_log(log_path)
     assert _snapshot(replayed_store) == _snapshot(live_store), sequence
+
+
+# --- CLOSE7-1: a zero-send day is silence, never a recovery --------------
+
+
+def test_from_log_a_zero_send_day_after_throttle_does_not_clear_the_status_or_limit(
+    tmp_path: Path,
+) -> None:
+    """The isolated two-move reproduction: THROTTLE/PERFORMED, then a
+    zero-send day. `evaluate()`'s own `sends == 0` early return is
+    `Verdict.OK` + `DataState.INSUFFICIENT_DATA` -- CLOSE3-3's recovery
+    branch used to fire on `Verdict.OK` alone, reading the silence as
+    "the mailbox recovered" and clearing both the THROTTLED status and the
+    remembered limit."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_PERFORMED", live_store, log_path)
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert live_store.throttled_at_limit(_MAILBOX) == 100
+
+    _apply_move("ZERO_SENDS", live_store, log_path)
+
+    # The live path itself takes no action on a zero-send day -- nothing
+    # about the mailbox's state changes.
+    assert live_store.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert live_store.throttled_at_limit(_MAILBOX) == 100
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.THROTTLED
+    assert restored.throttled_at_limit(_MAILBOX) == 100
+
+
+def test_from_log_insufficient_data_never_clears_throttled_at_limit(tmp_path: Path) -> None:
+    """The DoD's explicit assertion, isolated from status: even if some
+    future change made status-tracking more permissive, `throttled_at_
+    limit` -- the CLOSE3-1 idempotency key that's the entire point of this
+    finding -- must never be cleared by a record carrying no evidence."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_PERFORMED", live_store, log_path)
+    _apply_move("ZERO_SENDS", live_store, log_path)
+    _apply_move("ZERO_SENDS", live_store, log_path)
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.throttled_at_limit(_MAILBOX) is not None
+    assert restored.throttled_at_limit(_MAILBOX) == 100
+
+
+def test_from_log_zero_sends_after_unsupported_throttle_does_not_reset_the_streak(
+    tmp_path: Path,
+) -> None:
+    """The second divergence the isolated reproduction actually found
+    (LIVE ('ACTIVE', None, 1) vs REPLAY ('ACTIVE', None, 0)): `evaluate()`'s
+    `sends == 0` early return returns before reaching the "verdict is not
+    THROTTLE -> clear the unsupported-throttle streak" line every other
+    non-THROTTLE verdict hits, so the streak must survive a zero-send day
+    too, not just status/limit."""
+    log_path = tmp_path / "decisions.jsonl"
+    live_store = BreakerStateStore()
+    _apply_move("THROTTLE_UNSUPPORTED", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    _apply_move("ZERO_SENDS", live_store, log_path)
+    assert live_store.unsupported_throttle_streak(_MAILBOX) == 1
+
+    restored = BreakerStateStore.from_log(log_path)
+    assert restored.unsupported_throttle_streak(_MAILBOX) == 1
+
+
+class _AlternatingZeroSendDriver:
+    """Reports a real, shrinking `current_daily_limit` and alternates one
+    zero-send day between bad days -- the CLOSE7-1 end-to-end
+    reproduction. `phase` is advanced externally, one call per evaluation,
+    matching the shape `_SmartleadShapedDriver` in `tests/test_cli.py`
+    already established for CLOSE5-2's daemon-vs-cron comparison."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE})
+
+    def __init__(self) -> None:
+        self.current_daily_limit = 100
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.phase = 0  # 0 = bad day, 1 = zero-send day; alternates
+
+    def read_mailbox_stats(
+        self, since: date
+    ) -> list[MailboxDayStats]:  # pragma: no cover -- unused
+        raise AssertionError("stats are read directly by the test, not through this method")
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        self.current_daily_limit = daily_limit
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def _alternating_zero_send_evaluation(
+    driver: _AlternatingZeroSendDriver, state_store: BreakerStateStore
+) -> BreakerEvaluation:
+    """One evaluation of the CLOSE7-1 end-to-end scenario: a bad day
+    (same evidence as `_apply_move`'s `THROTTLE_PERFORMED` -- enough to
+    land in the THROTTLE band, not straight to PAUSE) on even calls, a
+    zero-send day on odd calls -- against whatever `current_daily_limit`
+    the driver currently remembers, exactly like a real provider report
+    would."""
+    if driver.phase % 2 == 0:
+        sends, complaints = 20_000, 30
+    else:
+        sends, complaints = 0, 0
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=sends,
+        complaints=complaints,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=driver.current_daily_limit,
+    )
+    driver.phase += 1
+    return result
+
+
+def test_cron_and_daemon_diverge_on_alternating_zero_send_days_before_the_fix_agree_after(
+    tmp_path: Path,
+) -> None:
+    """CLOSE7-1's end-to-end reproduction: identical evidence -- a bad day,
+    a zero-send day, a bad day, a zero-send day, ... -- against a driver
+    reporting its REAL shrinking daily limit, run once as an uninterrupted
+    daemon (one `state_store`, twenty ticks, no restarts) and once as
+    twenty separate `check`-shaped processes (`from_log` rebuilt fresh
+    every time). Both must make the SAME real provider calls and reach the
+    SAME final state. Before this fix, cron's zero-send days each read as
+    a fresh recovery, so cron kept re-throttling from a mailbox `from_log`
+    incorrectly believed was ACTIVE (100 -> 50 -> 25 -> 12 -> 6 -> 3 -> an
+    unearned PAUSE), while a daemon covering the identical history throttles
+    once and stops, because its second bad day is genuinely still THROTTLED
+    at 50 -- exactly CLOSE3-1's compounding failure, resurfaced through a
+    door the permutation sweep couldn't reach until `ZERO_SENDS` existed."""
+    daemon_driver = _AlternatingZeroSendDriver()
+    daemon_store = BreakerStateStore()
+    for _ in range(20):
+        _alternating_zero_send_evaluation(daemon_driver, daemon_store)
+
+    cron_driver = _AlternatingZeroSendDriver()
+    cron_log = tmp_path / "decisions.jsonl"
+    cron_store = BreakerStateStore()
+    for _ in range(20):
+        evaluation = _alternating_zero_send_evaluation(cron_driver, cron_store)
+        append_record(cron_log, DecisionRecord.from_evaluation(evaluation))
+        # Restart: rebuild state from the log alone, exactly like a fresh
+        # `check` process would, discarding the in-process `cron_store`.
+        cron_store = BreakerStateStore.from_log(cron_log)
+
+    assert cron_driver.throttle_calls == daemon_driver.throttle_calls
+    assert cron_driver.pause_calls == daemon_driver.pause_calls
+    assert cron_store.status_of(_MAILBOX) == daemon_store.status_of(_MAILBOX)
+    assert cron_store.throttled_at_limit(_MAILBOX) == daemon_store.throttled_at_limit(_MAILBOX)
 
 
 # --- CLOSE6-2: a hand-edited/merged/restored log must not un-pause -------
