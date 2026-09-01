@@ -56,8 +56,19 @@ from deliverability_guard.providers.base import (
     MailboxDayStats,
     MailboxRef,
     MalformedResponseError,
+    ProviderError,
+    RateLimitExceededError,
     unsupported,
 )
+
+# CLOSE8-2: the "Code" values botocore's ClientError carries for a genuine
+# rate-limit/throttling response, across the AWS services this driver talks
+# to. Distinct from every other ClientError (AccessDenied, ValidationError,
+# ...), which is a real failure this driver cannot make progress past on its
+# own -- only a throttling response is something a caller should read as
+# "back off and re-evaluate later," the same framing
+# `RateLimitExceededError`'s own docstring gives every other driver's 429.
+_THROTTLING_ERROR_CODES = frozenset({"Throttling", "ThrottlingException", "RequestLimitExceeded"})
 
 _PROVIDER = "ses"
 _NAMESPACE = "AWS/SES"
@@ -190,15 +201,49 @@ class SesDriver:
         since: date,
         until: datetime,
     ) -> dict[date, int]:
-        response = self._cloudwatch.get_metric_statistics(
-            Namespace=_NAMESPACE,
-            MetricName=metric_name,
-            Dimensions=dimensions,
-            StartTime=datetime.combine(since, datetime.min.time()),
-            EndTime=until,
-            Period=86400,
-            Statistics=["Sum"],
-        )
+        # CLOSE8-2: this read path had no exception handling at all, unlike
+        # every write path below (`_set_configuration_set_sending`,
+        # `pause_account`, `resume_account`), which already wrap their own
+        # `botocore` call in `except Exception`. An expired token, an IAM
+        # permission gap, a CloudWatch rate limit, or any other AWS-side
+        # failure raised straight out of `get_metric_statistics` -- neither
+        # `httpx.HTTPError` (this isn't httpx) nor `ProviderError` nor
+        # `ValueError`, so `cli.main` didn't catch it and it tracebacked
+        # `check` with no exit code at all, entirely outside the documented
+        # 0/1/2/3 map. Translated into this project's own exception
+        # vocabulary here, at the boundary, the same way every OTHER
+        # driver's own client-library exceptions already are (`httpx.
+        # HTTPError` from `httpx.Client`, wrapped by `_request_with_retry`
+        # for a 429 specifically) -- callers of this driver, and `cli.main`,
+        # need to reason about ONE exception vocabulary, not one per
+        # provider's own client library.
+        import botocore.exceptions
+
+        try:
+            response = self._cloudwatch.get_metric_statistics(
+                Namespace=_NAMESPACE,
+                MetricName=metric_name,
+                Dimensions=dimensions,
+                StartTime=datetime.combine(since, datetime.min.time()),
+                EndTime=until,
+                Period=86400,
+                Statistics=["Sum"],
+            )
+        except botocore.exceptions.ClientError as exc:
+            error_response = cast("Mapping[str, object]", exc.response)
+            error_details = cast("Mapping[str, object]", error_response.get("Error", {}))
+            error_code = error_details.get("Code")
+            if error_code in _THROTTLING_ERROR_CODES:
+                raise RateLimitExceededError(
+                    f"{_PROVIDER}: CloudWatch {metric_name} query rate-limited (code={error_code})"
+                ) from exc
+            raise ProviderError(
+                f"{_PROVIDER}: CloudWatch {metric_name} query failed: {exc}"
+            ) from exc
+        except botocore.exceptions.BotoCoreError as exc:
+            raise ProviderError(
+                f"{_PROVIDER}: CloudWatch {metric_name} query failed: {exc}"
+            ) from exc
         datapoints = require_list(response.get("Datapoints"), _PROVIDER, "'Datapoints'")
         totals: dict[date, int] = {}
         for raw_point in datapoints:

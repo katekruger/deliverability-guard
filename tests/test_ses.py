@@ -12,6 +12,8 @@ from deliverability_guard.providers.base import (
     Capability,
     MailboxRef,
     MalformedResponseError,
+    ProviderError,
+    RateLimitExceededError,
 )
 from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
 
@@ -158,6 +160,69 @@ def test_read_mailbox_stats_raises_when_a_datapoint_is_not_a_mapping() -> None:
     cloudwatch = _FakeCloudWatchClient({"Send": ["not-a-dict"], "Bounce": []})  # type: ignore[dict-item]
     driver = _driver(_FakeSesV2Client(), cloudwatch)
     with pytest.raises(MalformedResponseError, match="datapoint"):
+        driver.read_mailbox_stats(since=date(2026, 8, 1), configuration_set_name="cfg-1", now=_NOW)
+
+
+# --- CLOSE8-2: the read path's own `botocore` errors must not traceback ---
+
+
+class _RaisingCloudWatch:
+    """A CloudWatch client whose `get_metric_statistics` always raises a
+    given exception, standing in for a real AWS transport/service
+    failure -- no live account, no network (AGENTS.md)."""
+
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def get_metric_statistics(self, **kwargs: object) -> Mapping[str, object]:
+        raise self._exc
+
+
+def _client_error(code: str) -> Exception:
+    import botocore.exceptions
+
+    return botocore.exceptions.ClientError(
+        {"Error": {"Code": code, "Message": f"synthetic {code}"}}, "GetMetricStatistics"
+    )
+
+
+def test_read_mailbox_stats_translates_a_client_error_into_provider_error() -> None:
+    """CLOSE8-2's reproduction: this read path had NO exception handling
+    at all -- unlike every SES write path, which already wraps its own
+    `botocore` call in `except Exception`. An `AccessDenied` `ClientError`
+    (an expired token, a missing IAM permission) used to raise straight
+    out of `read_mailbox_stats`, uncaught by `cli.main` (`botocore`
+    exceptions are neither `httpx.HTTPError`, nor `ProviderError`, nor
+    `ValueError`). Translated into this project's own vocabulary now, the
+    same way every other driver's client-library exceptions already are."""
+    cloudwatch = _RaisingCloudWatch(_client_error("AccessDenied"))
+    driver = _driver(_FakeSesV2Client(), cloudwatch)  # type: ignore[arg-type]
+    with pytest.raises(ProviderError, match="AccessDenied"):
+        driver.read_mailbox_stats(since=date(2026, 8, 1), configuration_set_name="cfg-1", now=_NOW)
+
+
+def test_read_mailbox_stats_translates_a_throttling_client_error_into_rate_limit_exceeded() -> None:
+    """A `Throttling` `ClientError` specifically becomes
+    `RateLimitExceededError`, not the generic `ProviderError` -- the same
+    "back off and re-evaluate, this isn't evidence about the mailbox"
+    distinction every other driver's 429 already gets."""
+    cloudwatch = _RaisingCloudWatch(_client_error("Throttling"))
+    driver = _driver(_FakeSesV2Client(), cloudwatch)  # type: ignore[arg-type]
+    with pytest.raises(RateLimitExceededError):
+        driver.read_mailbox_stats(since=date(2026, 8, 1), configuration_set_name="cfg-1", now=_NOW)
+
+
+def test_read_mailbox_stats_translates_a_botocore_transport_error_into_provider_error() -> None:
+    """The other `botocore` exception family: connection-level failures
+    (`BotoCoreError`, not `ClientError` -- `EndpointConnectionError` is a
+    real example of one) must also become `ProviderError`, not traceback."""
+    import botocore.exceptions
+
+    cloudwatch = _RaisingCloudWatch(
+        botocore.exceptions.EndpointConnectionError(endpoint_url="https://monitoring.example.com")
+    )
+    driver = _driver(_FakeSesV2Client(), cloudwatch)  # type: ignore[arg-type]
+    with pytest.raises(ProviderError):
         driver.read_mailbox_stats(since=date(2026, 8, 1), configuration_set_name="cfg-1", now=_NOW)
 
 

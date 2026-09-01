@@ -10,7 +10,7 @@ definition of done for this item.
 
 import io
 import sys
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
@@ -862,6 +862,202 @@ def test_main_run_reports_a_valueerror_from_evaluation_with_its_own_exit_code(
     exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
 
     assert exit_code == 3
+
+
+# --- CLOSE8-2: real botocore/AWS errors get a documented exit code too -----
+
+
+class _FakeSesV2ClientForCli:
+    def put_configuration_set_sending_options(
+        self, *, ConfigurationSetName: str, SendingEnabled: bool
+    ) -> Mapping[str, object]:
+        raise AssertionError("not reached -- a read-path failure never attempts an action")
+
+    def put_account_sending_attributes(self, *, SendingEnabled: bool) -> Mapping[str, object]:
+        raise AssertionError("not reached")
+
+
+class _RaisingCloudWatchClient:
+    def __init__(self, exc: Exception) -> None:
+        self._exc = exc
+
+    def get_metric_statistics(self, **kwargs: object) -> Mapping[str, object]:
+        raise self._exc
+
+
+def _ses_client_error(code: str) -> Exception:
+    import botocore.exceptions
+
+    return botocore.exceptions.ClientError(
+        {"Error": {"Code": code, "Message": f"synthetic {code}"}}, "GetMetricStatistics"
+    )
+
+
+def _ses_endpoint_connection_error() -> Exception:
+    import botocore.exceptions
+
+    return botocore.exceptions.EndpointConnectionError(
+        endpoint_url="https://monitoring.example.com"
+    )
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: _ses_client_error("AccessDenied"),
+        lambda: _ses_client_error("Throttling"),
+        lambda: _ses_endpoint_connection_error(),
+    ],
+    ids=["ClientError-AccessDenied", "ClientError-Throttling", "EndpointConnectionError"],
+)
+def test_main_check_survives_real_ses_botocore_errors_end_to_end(
+    make_exc: Callable[[], Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE8-2's reproduction, through the real `SesConfigurationSetDriver`
+    -- not a stand-in -- and the real `cli.main`: an expired token
+    (`AccessDenied`), a CloudWatch rate limit (`Throttling`), or a network
+    failure (`EndpointConnectionError`) each used to traceback `check` with
+    no exit code at all, entirely outside the documented 0/1/2/3 map."""
+    from deliverability_guard.providers.ses import SesConfigurationSetDriver, SesDriver
+
+    driver = SesConfigurationSetDriver(
+        inner=SesDriver(
+            sesv2_client=_FakeSesV2ClientForCli(),
+            cloudwatch_client=_RaisingCloudWatchClient(make_exc()),
+        ),
+        configuration_set_name="cfg-1",
+    )
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    text = _VALID_YAML.replace("provider: fake", "provider: ses")
+    config_path = _config(tmp_path, text=text, decision_log=str(tmp_path / "decisions.jsonl"))
+    out = io.StringIO()
+    monkeypatch.setattr(sys, "stdout", out)
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    assert out.getvalue() == ""  # no partial output, no traceback on stdout
+    assert len(err.getvalue().strip().splitlines()) == 1  # one clean error line
+    assert "Traceback" not in err.getvalue()
+
+
+def test_build_driver_ses_without_a_region_raises_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """CLOSE8-2: `boto3.client(...)` raises `NoRegionError` at CONSTRUCTION
+    time (region resolution, unlike credential resolution, happens
+    immediately) when no region is configured anywhere. A missing region
+    is a setup problem exactly like a missing credential just above it in
+    `build_driver`, not a live provider failure -- `CliError`, not a
+    traceback."""
+    from botocore.exceptions import NoRegionError
+
+    def _raising_ses_driver(*, region_name: str | None = None) -> object:
+        raise NoRegionError()
+
+    monkeypatch.setattr(cli_module, "SesDriver", _raising_ses_driver)
+
+    with pytest.raises(CliError, match="AWS_REGION"):
+        build_driver("ses", env={"SES_CONFIGURATION_SET_NAME": "cfg-1"})
+
+
+def test_main_check_reports_ses_no_region_error_as_exit_2(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The same construction failure, end to end through `cli.main`: exit
+    2 (config/setup error), not a traceback, and grouped with every other
+    "you forgot to configure something" case `check` already reports that
+    way for."""
+    from botocore.exceptions import NoRegionError
+
+    def _raising_ses_driver(*, region_name: str | None = None) -> object:
+        raise NoRegionError()
+
+    monkeypatch.setattr(cli_module, "SesDriver", _raising_ses_driver)
+    config_path = _config(tmp_path, text=_VALID_YAML.replace("provider: fake", "provider: ses"))
+    monkeypatch.setenv("SES_CONFIGURATION_SET_NAME", "cfg-1")
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 2
+
+
+# --- CLOSE8-2: no unanticipated exception can traceback either command ----
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyError("payload"),
+        TypeError("bad shape"),
+        AttributeError("x"),
+        RuntimeError("x"),
+    ],
+    ids=["KeyError", "TypeError", "AttributeError", "RuntimeError"],
+)
+def test_main_check_survives_any_unanticipated_exception_from_evaluation(
+    exc: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The CHANGELOG's CLOSE7-2 entry claimed 'no future driver bug or
+    malformed response can traceback either command, even one this fix
+    doesn't anticipate' -- measured false: only `ValueError` was ever
+    caught. `KeyError`/`TypeError`/`AttributeError`/an unwrapped
+    `RuntimeError` -- none of them provider-specific, all plausible shapes
+    for a driver bug this project hasn't written yet -- each used to
+    traceback with no exit code at all. `cli.main`'s new catch-all closes
+    this for good: not a list of types to keep extending, but every
+    exception type this module doesn't already have a more specific
+    handler for."""
+    failing_driver = _TransportFailingDriver(exc)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    assert "Traceback" not in err.getvalue()
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [
+        KeyError("payload"),
+        TypeError("bad shape"),
+        AttributeError("x"),
+        RuntimeError("x"),
+    ],
+    ids=["KeyError", "TypeError", "AttributeError", "RuntimeError"],
+)
+def test_main_run_survives_any_unanticipated_exception_from_evaluation(
+    exc: Exception, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same property, `run` side."""
+    failing_driver = _TransportFailingDriver(exc)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+    assert "Traceback" not in err.getvalue()
 
 
 # --- CLOSE-5a: the noop driver end to end -----------------------------------

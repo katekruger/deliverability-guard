@@ -157,6 +157,69 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`providers/ses.py`, `cli.py`: real AWS/`botocore` errors tracebacked
+  `check`/`run` with no exit code at all** (external audit finding
+  CLOSE8-2, production-reachable today -- unlike CLOSE8-1's latent one).
+  `SesDriver._daily_sums`'s CloudWatch call had no exception handling,
+  unlike every SES write path (`_set_configuration_set_sending`,
+  `pause_account`, `resume_account`), which already wraps its own
+  `botocore` call in `except Exception`. An expired token, an IAM
+  permission gap, a CloudWatch rate limit, or a network failure each
+  raised straight out of `read_mailbox_stats` -- `botocore` exceptions are
+  neither `httpx.HTTPError`, nor `ProviderError`, nor `ValueError`, and
+  `cli.main` caught only those. Same at construction: `boto3.client(...)`
+  raises `NoRegionError` immediately when no region is configured
+  anywhere, and `build_driver`'s `ses` branch was wrapped only in `except
+  CliError`, whose own docstring promises "never a traceback a cron job's
+  error email has to explain."
+
+  Fixed by translating `botocore.exceptions.ClientError`/`BotoCoreError`
+  into this project's own vocabulary at the read-path boundary --
+  `RateLimitExceededError` for a `Throttling`-shaped `ClientError`
+  (matching every other driver's own 429 framing: back off and
+  re-evaluate, this isn't evidence about the mailbox), `ProviderError`
+  for everything else -- so `cli.main`'s EXISTING `ProviderError` handler
+  picks it up with no further wiring. `NoRegionError` at construction is
+  now caught in `build_driver` and re-raised as `CliError`, exit 2,
+  grouped with every other missing-configuration case.
+
+  Then the class was re-run over every driver's read path, per this
+  round's own opening instruction (round 7 fixed an instance and named
+  the class without re-running it; this is that step, done):
+
+  | Driver | Read-path exception source | Where it lands |
+  |---|---|---|
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) | `cli.main`'s existing `httpx.HTTPError` handler |
+  | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
+  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers) | same two handlers |
+  | `lemlist.py` | same shape | same two handlers |
+  | `apollo.py` | same shape | same two handlers |
+  | `ses.py` | `botocore.exceptions.ClientError`/`BotoCoreError` from `CloudWatchClient.get_metric_statistics` | translated to `RateLimitExceededError`/`ProviderError` at the driver boundary (CLOSE8-2, this entry) -- `cli.main`'s existing `ProviderError` handler |
+  | `ses.py` | `botocore.exceptions.NoRegionError` at construction (`boto3.client(...)`, no region configured anywhere) | caught in `build_driver`, re-raised as `CliError` (CLOSE8-2) -- exit 2 |
+  | `noop.py` | none -- no external client of any kind | n/a |
+
+  Every httpx-based driver was already safe -- confirmed, not assumed:
+  `httpx.HTTPError` is the base of both httpx exception families
+  (`RequestError` and `HTTPStatusError`), so `cli.main`'s existing handler
+  already covers every network/timeout/status failure those four drivers
+  can produce, and every parse failure already raises `MalformedResponseError`
+  via the shared `_parsing.py` helpers. `ses.py` -- the one driver with a
+  DIFFERENT client library underneath -- was the only real gap.
+
+  Also, per this round's own opening instruction, `cli.main` gained a
+  final, broad `except Exception` around both `check`'s and `run`'s
+  evaluation loops, after every more specific handler. The previous
+  (CLOSE7-2) entry in this file claimed "no future driver bug or
+  malformed response can traceback either command, even one this fix
+  doesn't anticipate" -- measured false: a `KeyError`, `TypeError`,
+  `AttributeError`, or an unwrapped `RuntimeError` from a driver each
+  still tracebacked with no exit code. That claim is now true rather than
+  softened: every exception type without a more specific handler above it
+  maps to exit 3 with a one-line message, which is the only way to
+  actually keep that promise -- there is no way to enumerate every
+  exception type every current and future driver's client library might
+  ever raise.
+
 - **`engine/breaker.py`: a compliance-forced PAUSE diverged live-vs-replay
   on the unsupported-throttle streak** (external audit finding CLOSE8-1 --
   blind-spot list item 3, `tests/test_breaker.py:1627`, found exactly what
