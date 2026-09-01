@@ -744,6 +744,223 @@ class _NoLimitDriver:
         )
 
 
+class _PhaseDriver:
+    """A driver whose reported evidence and daily limit change over the
+    test's own lifetime, simulating a mailbox that gets paused, then later
+    (wrongly, pre-CLOSE5-1) reports a real daily limit, then later still
+    reports healthy evidence -- CLOSE5-1's own seven-phase reproduction."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.sends = 20_000
+        self.bounces = 30
+        self.current_daily_limit: int | None = None
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=self.sends,
+                bounces=self.bounces,
+                current_daily_limit=self.current_daily_limit,
+            )
+        ]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def test_seven_phase_reproduction_a_paused_mailbox_never_auto_un_pauses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE5-1: the serious one. Seven SEPARATE `cli.main` invocations
+    (`from_log` rebuilt fresh each time, the documented cron deployment).
+    Phase 1 (no known daily limit) escalates to PAUSE via the CLOSE3-2
+    streak on run 4 -- one real provider `pause()` call. Phase 2 (the
+    provider now reports a real `current_daily_limit`) must NOT throttle the
+    already-paused mailbox, regardless of what its evidence says. Phase 3
+    (evidence recovers to OK) must NOT auto-resume it either -- CLOSE-3b's
+    recovery path is for THROTTLED mailboxes, and this one must never have
+    become THROTTLED in the first place. `resume_after_human_review` is
+    never called; no `ResumeRecord` exists in the log."""
+    driver = _PhaseDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _PhaseDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+
+    # Phase 1: no known daily limit. Runs 1-4.
+    for _ in range(4):
+        main(["--config", str(config_path), "check"])
+    assert (
+        BreakerStateStore.from_log(tmp_path / "decisions.jsonl").status_of(mailbox)
+        == MailboxBreakerStatus.PAUSED
+    )
+
+    # Phase 2: provider now reports a real daily limit. Runs 5-6.
+    driver.current_daily_limit = 50
+    for _ in range(2):
+        main(["--config", str(config_path), "check"])
+
+    # Phase 3: evidence recovers. Run 7.
+    driver.sends = 5000
+    driver.bounces = 0
+    main(["--config", str(config_path), "check"])
+
+    final_store = BreakerStateStore.from_log(tmp_path / "decisions.jsonl")
+    assert final_store.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+    assert driver.throttle_calls == []
+    assert driver.pause_calls == [mailbox]
+
+
+def test_seven_phase_reproduction_never_writes_a_resume_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _PhaseDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _PhaseDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(4):
+        main(["--config", str(config_path), "check"])
+    driver.current_daily_limit = 50
+    for _ in range(2):
+        main(["--config", str(config_path), "check"])
+    driver.sends = 5000
+    driver.bounces = 0
+    main(["--config", str(config_path), "check"])
+
+    events = read_events(tmp_path / "decisions.jsonl")
+    assert not any(isinstance(e, ResumeRecord) for e in events)
+
+
+class _SmartleadShapedDriver:
+    """Capability/outcome shape matches `smartlead` exactly:
+    `pause(MailboxRef)` -> UNSUPPORTED (Smartlead has no per-mailbox pause
+    endpoint), `throttle(mailbox_id, limit)` -> PERFORMED. CLI-selectable in
+    real deployments, unlike the phase drivers above -- CLOSE5-2's own
+    reproduction names it specifically."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.phase = 0  # advanced externally between the three moves
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        # THROTTLE_PERFORMED, PAUSE_UNSUPPORTED, THROTTLE_PERFORMED --
+        # CLOSE5-2's own three-move reproduction.
+        sends, bounces, current_daily_limit = (
+            (20_000, 30, 100),
+            (5000, 40, None),
+            (20_000, 30, 100),
+        )[self.phase]
+        return [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=sends,
+                bounces=bounces,
+                current_daily_limit=current_daily_limit,
+            )
+        ]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return unsupported(Capability.PAUSE, self.name, "fake: no per-mailbox pause endpoint")
+
+
+def test_daemon_and_cron_agree_on_a_smartlead_shaped_three_move_sequence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE5-2: the same three evaluations (THROTTLE/PERFORMED,
+    PAUSE/UNSUPPORTED, THROTTLE/PERFORMED again), run once as an
+    uninterrupted daemon (`run` -- one `state_store`, no restarts) and once
+    as three separate `check` invocations (`from_log` rebuilt fresh each
+    time -- cron). Both must make the SAME real provider calls and reach
+    the SAME final state; before CLOSE5-2's fix, cron made one fewer real
+    `throttle()` call and read the mailbox as pristine (ACTIVE) where the
+    daemon correctly read it as THROTTLED."""
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+
+    # --- daemon: one process, one state_store, three ticks, no restarts ---
+    daemon_driver = _SmartleadShapedDriver()
+    daemon_store = BreakerStateStore()
+    for phase in range(3):
+        daemon_driver.phase = phase
+        stats = daemon_driver.read_mailbox_stats(date(2025, 12, 31))[0]
+        evaluate(
+            driver=daemon_driver,
+            mailbox=mailbox,
+            sends=stats.sends,
+            complaints=stats.bounces,
+            prior=DEFAULT_PRIOR,
+            thresholds=DEFAULT_LADDER,
+            state_store=daemon_store,
+            dry_run=False,
+            now=_NOW,
+            current_daily_limit=stats.current_daily_limit,
+        )
+
+    # --- cron: three separate `cli.main` invocations, from_log rebuilt
+    # fresh each time ---
+    cron_driver = _SmartleadShapedDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _SmartleadShapedDriver:
+        return cron_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+    for phase in range(3):
+        cron_driver.phase = phase
+        main(["--config", str(config_path), "check"])
+
+    cron_store = BreakerStateStore.from_log(tmp_path / "decisions.jsonl")
+
+    assert cron_driver.throttle_calls == daemon_driver.throttle_calls
+    assert cron_driver.pause_calls == daemon_driver.pause_calls
+    assert cron_store.status_of(mailbox) == daemon_store.status_of(mailbox)
+    assert cron_store.throttled_at_limit(mailbox) == daemon_store.throttled_at_limit(mailbox)
+
+
 def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -776,6 +993,37 @@ def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
     assert statuses[3:] == ["PAUSED"] * 7  # escalates by run 4, stays PAUSED through run 10
     assert driver.pause_calls == [mailbox]
     assert driver.throttle_calls == []  # current_daily_limit is always None -- never a real call
+
+
+def test_ten_separate_check_invocations_after_pause_write_an_honest_already_paused_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE5-4: verified rather than assumed. Before CLOSE5-1's fix, the
+    verdict cycle after escalation ran forever (a real `pause()` call every
+    four runs) and each record for a PAUSED mailbox reported a bare
+    `THROTTLE` verdict with no indication anything was refused -- exactly
+    what CLOSE5-4 worried an operator tailing cron mail would see. Neither
+    is true anymore: every record recorded for the mailbox once it's PAUSED
+    carries CLOSE5-1's own "mailbox is paused; ... refused pending human
+    review" detail, an honest record rather than a bare, unexplained
+    THROTTLE."""
+    driver = _NoLimitDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _NoLimitDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(10):
+        main(["--config", str(config_path), "check"])
+
+    records = read_records(tmp_path / "decisions.jsonl")
+    post_pause_records = records[4:]  # runs 5-10, after run 4's escalation to PAUSE
+    assert len(post_pause_records) == 6
+    for record in post_pause_records:
+        assert record.action_detail is not None
+        assert "paused" in record.action_detail
 
 
 def test_from_log_restart_between_tick_one_and_two_is_a_no_op(tmp_path: Path) -> None:

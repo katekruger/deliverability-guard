@@ -157,6 +157,99 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: a PAUSED mailbox auto-un-paused through THROTTLE
+  then OK, with no human review** (external audit finding CLOSE5-1 — the
+  serious one). `_act`'s THROTTLE branch never consulted `state_store.
+  status_of`, unlike its PAUSE branch, which has always checked "is this
+  mailbox already paused?" before acting. A mailbox already PAUSED whose
+  evidence on a later tick happened to land in the THROTTLE band got a REAL
+  `driver.throttle()` call, `mark_throttled` moved it to THROTTLED, and one
+  later OK evaluation then hit CLOSE-3b's sustained-recovery path and moved
+  it all the way to ACTIVE — `resume_after_human_review` never called, no
+  `ResumeRecord` ever written. Reproduction: seven separate `check`
+  processes ended with the breaker having paused a mailbox, then told the
+  provider to re-enable its sending at a reduced limit, then reported it
+  fully healthy three runs later — contradicting ADR 0003 itself,
+  `BreakerStateStore`'s own class docstring ("`resume_after_human_review`
+  is the ONLY path back from PAUSED to ACTIVE"), and `mark_active`'s own
+  docstring ("never for un-pausing a confirmed-paused mailbox on its own").
+  Fixed by adding the same status check to `_act`'s THROTTLE branch that
+  its PAUSE branch already has (see [ADR
+  0008](docs/decisions/0008-throttle-must-not-act-on-a-paused-mailbox.md)
+  for why the check lives there and not in `evaluate()`), and extending
+  `from_log`'s THROTTLE/PERFORMED replay to recognize the resulting
+  paused-idempotent no-op record and leave status untouched during replay.
+  A new source-level guard test
+  (`test_act_checks_paused_status_before_ever_calling_throttle`) asserts
+  `_act` consults PAUSED status before it can ever reach
+  `driver.throttle()`, in the same idiom the repo already used for the
+  symmetric `resume_after_human_review` claim.
+
+- **`engine/breaker.py`: `from_log`'s PAUSE/`UNSUPPORTED` branch didn't
+  mirror `mark_active`, leaving a stale `throttled_at_limit` behind**
+  (external audit finding CLOSE5-2, found by extending the CLOSE4-1
+  permutation sweep with a `PAUSE_UNSUPPORTED` move and switching from
+  `itertools.permutations` to `itertools.product` so repeated moves are
+  covered — 14 of 343 three-move sequences mismatched). `_act`'s
+  PAUSE/UNSUPPORTED path calls `state_store.mark_active`, which clears both
+  `_throttled_at_limit` and the unsupported-throttle streak; `from_log`'s
+  corresponding `else` branch set status to ACTIVE but left
+  `throttled_at_limit` in place. The stale limit then made the very next
+  `THROTTLE`/`PERFORMED` record look like CLOSE4-1's `is_idempotent_replay`
+  case, so replay never restored THROTTLED — reachable in production on
+  `smartlead` (CLI-selectable, `pause(MailboxRef)` UNSUPPORTED,
+  `throttle(mailbox_id, limit)` PERFORMED): on identical evidence, `run`
+  (no restart) and `check` (restart between every evaluation) made a
+  DIFFERENT number of real provider calls, and after any restart the
+  breaker read a genuinely throttled mailbox as pristine. Fixed with the
+  one-line mirror of `mark_active` the finding named
+  (`throttled_at_limit.pop(mailbox, None)`). The permutation sweep now
+  compares `status_of`, `throttled_at_limit`, AND the unsupported-throttle
+  streak (previously status only), and 0/343 sequences mismatch. A new
+  `test_daemon_and_cron_agree_on_a_smartlead_shaped_three_move_sequence`
+  reproduces the finding through the real `evaluate()`/`cli.main` paths
+  directly. Also corrected: the comment above the fixed branch, which
+  argued it was "structurally unreachable from an already-PAUSED mailbox"
+  — true for the status question, irrelevant to the limit question, since
+  this defect's reproduction never starts from PAUSED — and this
+  CHANGELOG's own CLOSE4-1 entry, which claimed a non-acting record "leaves
+  status (and, where relevant, `throttled_at_limit`) untouched during
+  replay, exactly mirroring `_act`." It didn't, for exactly this branch.
+
+- **`README.md`/`CHANGELOG.md`: two absolute claims with no executable
+  guard** (external audit finding CLOSE5-3). Both landed in the CLOSE4-3
+  commit; neither was false when written, and neither would have failed
+  when it became false. (1) The README's/CHANGELOG's claim that the
+  ladder "only ever constructs a `MailboxRef`, never a `CampaignRef`" —
+  added `test_engine_breaker_module_never_constructs_a_campaign_ref`, the
+  same source-level idiom `tests/test_breaker.py` already uses for the
+  `resume_after_human_review` claim. (2) The CLOSE4-1 CHANGELOG entry's
+  "exactly mirroring `_act`" — refuted by CLOSE5-2 above; corrected in
+  that same commit. Swept the README for the same shape of claim while
+  here: "every driver's `pause()`/`throttle()` is always callable and
+  returns an explicit 'unsupported' result rather than silently doing
+  nothing" (line 101) also had no guard — added
+  `test_every_driver_declines_an_unsupported_capability_without_raising`
+  to `tests/test_provider_conformance.py`, exercising only the (driver,
+  verb) pairs each driver structurally declines, so it never makes a live
+  call against the capabilities the HTTP-backed drivers actually implement.
+
+- **The log-growth cycle on a paused mailbox** (external audit finding
+  CLOSE5-4 — verified, not assumed, to be a side effect of CLOSE5-1's fix
+  rather than a separate defect). Before CLOSE5-1, ten consecutive `check`
+  processes against a provider with no daily limit escalated to PAUSE,
+  un-paused via the CLOSE5-1 bug, and re-escalated with period 4 forever —
+  a real provider `pause()` call every four runs, and an unbounded, cyclic
+  decision log. Re-running the same ten-process harness after CLOSE5-1:
+  the mailbox reaches PAUSED once and stays there, with exactly one real
+  provider `pause()` call — the cycle is gone, as a direct consequence of
+  the mailbox's status no longer being un-paused mid-cycle. The log still
+  grows one record per `check` invocation (a defensible audit trail, per
+  the finding's own framing), but every record for an already-PAUSED
+  mailbox now carries CLOSE5-1's own "mailbox is paused; ... refused
+  pending human review" detail rather than reporting a bare, unexplained
+  `THROTTLE` — an honest record, not a misleading one.
+
 - **`README.md`: the capability matrix's "campaign only" pause marks
   described driver-API surface the breaker itself never reaches** (external
   audit finding CLOSE4-3, a documentation decision rather than a bug).
@@ -189,8 +282,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   escalate-then-un-pause cycle repeated with period 4 forever — a real
   provider `pause()` call every time it escalated, not once. Fixed: a
   record whose action did not touch the provider now leaves status (and,
-  where relevant, `throttled_at_limit`) untouched during replay, exactly
-  mirroring `_act`. The idempotent-PERFORMED case is distinguished from a
+  where relevant, `throttled_at_limit`) untouched during replay for
+  THROTTLE's three branches, mirroring `_act` for those three cases
+  specifically — **not** "exactly mirroring `_act`" in general, a claim
+  CLOSE5-2 (below) found false for the PAUSE/`UNSUPPORTED` branch this
+  entry didn't touch. The idempotent-PERFORMED case is distinguished from a
   genuine throttle purely from records already replayed: a genuine
   throttle always sets `throttled_at_limit` for the first time or to a
   STRICTLY larger value, while an idempotent replay's `applied_daily_limit`
