@@ -157,6 +157,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_breaker.py`: the second vacuous `getsource`-based guard,
+  two files from the one CLOSE7-3 fixed** (external audit finding
+  CLOSE8-3). `test_act_checks_paused_status_before_ever_calling_throttle`
+  used raw `inspect.getsource(breaker_module._act)` and an `in`-flavoured
+  `.index()` comparison. `_act` has no docstring, so CLOSE7-3's
+  docstring-stripping `source_body` alone would not have caught this --
+  but raw `getsource` ALSO includes comments, and a mutation that deleted
+  the real `MailboxBreakerStatus.PAUSED` check while leaving a COMMENT
+  naming it (`# MUTATION (audit): the real ... guard is gone; only this
+  comment mentions MailboxBreakerStatus.PAUSED now.` followed by `if
+  False:`) still passed this test unchanged -- confirmed against the real
+  mutation, applied and reverted. `source_body` now strips comments too
+  (via `tokenize`, which correctly leaves a `#` inside a string literal
+  alone, unlike a naive text scan), and this guard is routed through it.
+
+  All five `getsource`-based assertion sites in this suite were reviewed
+  against the same question: three (`CampaignRef` in `engine/breaker.py`,
+  `resume_after_human_review` x2) assert `not in` and are immune by
+  construction -- a docstring or comment mention can only make a `not in`
+  assertion correctly fail, never incorrectly pass. One
+  (`loops/slow.py`'s import check) is a real `ast` walk, not a text
+  search, and was never vulnerable either. This PAUSE/throttle guard was
+  the fifth and last one that needed fixing.
+
+  This failure shape has now appeared twice in two rounds (CLOSE7-3,
+  CLOSE8-3), so it's made structural rather than merely documented: a new
+  test, `tests/test_source_inspect.py`, scans every test file for a bare
+  `in inspect.getsource(...)` outside the two known, deliberate
+  vacuous-vs-fixed demonstrations, and fails the suite if a third one ever
+  appears -- a future occurrence is now something CI catches, not
+  something the next audit has to find.
+
 - **`providers/ses.py`, `cli.py`: real AWS/`botocore` errors tracebacked
   `check`/`run` with no exit code at all** (external audit finding
   CLOSE8-2, production-reachable today -- unlike CLOSE8-1's latent one).

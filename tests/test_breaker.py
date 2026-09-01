@@ -357,18 +357,67 @@ def test_act_checks_paused_status_before_ever_calling_throttle() -> None:
     crude source-level check, but it is what would have caught this. `_act`
     must consult `MailboxBreakerStatus.PAUSED` before it can ever reach
     `effective_driver.throttle(...)` -- the same ordering its PAUSE branch
-    has always had relative to `effective_driver.pause(...)`."""
-    import inspect
+    has always had relative to `effective_driver.pause(...)`.
 
+    CLOSE8-3: this guard used raw `inspect.getsource`, unguarded -- `_act`
+    has no docstring (so CLOSE7-3's `source_body` fix alone would not have
+    caught this), but raw `getsource` ALSO includes comments, and a
+    mutation that deleted the real check while leaving behind a comment
+    naming `MailboxBreakerStatus.PAUSED` passed this test unchanged. Now
+    routed through `source_body` (which strips comments too, as of
+    CLOSE8-3), so `.index()` can only find the name in actual CODE --
+    and raises `ValueError`, failing this test outright, if the mutation
+    removes the check entirely and leaves nothing but a comment behind."""
     from deliverability_guard.engine import breaker as breaker_module
+    from fixtures.source_inspect import source_body
 
-    source = inspect.getsource(breaker_module._act)  # pyright: ignore[reportPrivateUsage]
+    source = source_body(breaker_module._act)  # pyright: ignore[reportPrivateUsage]
     paused_check_index = source.index("MailboxBreakerStatus.PAUSED")
     throttle_call_index = source.index("effective_driver.throttle(")
     assert paused_check_index < throttle_call_index, (
         "_act must consult PAUSED status before ever calling driver.throttle() "
         "-- CLOSE5-1: a PAUSED mailbox must never receive a real throttle call"
     )
+
+
+def test_act_paused_status_guard_catches_the_comment_only_mutation_the_vacuous_one_missed() -> None:
+    """CLOSE8-3's own reproduction, kept as a regression test, in the same
+    shape as `test_check_and_run_drift_guard_catches_a_hand_duplicated_
+    loop_the_vacuous_one_missed` in `tests/test_cli.py`: a stand-in
+    function shaped exactly like the audit's own mutation -- the real
+    `MailboxBreakerStatus.PAUSED` check replaced with `if False:`, with a
+    COMMENT left behind naming it, and no docstring at all (so this is a
+    genuinely different failure mode than CLOSE7-3's docstring-only one).
+
+    The vacuous (pre-CLOSE8-3) guard -- raw `inspect.getsource` -- passes
+    against this, because the comment mention is enough for `.index()` to
+    find both names in the right order. The fixed guard (`source_body`
+    with comment-stripping) must not: with the comment gone, `.index()`
+    can't find `MailboxBreakerStatus.PAUSED` in the code at all and raises
+    `ValueError`, which is a genuine test failure, not a silent pass."""
+    import inspect
+
+    from fixtures.source_inspect import source_body
+
+    def mutated_act(verdict: str) -> str:
+        # MUTATION (audit): the real MailboxBreakerStatus.PAUSED guard is
+        # gone; only this comment mentions MailboxBreakerStatus.PAUSED now.
+        if verdict == "THROTTLE":
+            if False:
+                return "refused"
+            return "effective_driver.throttle(mailbox_id, new_limit)"
+        return "paused"
+
+    # The vacuous guard this test file used to have: passes purely because
+    # the comment mentions the name and happens to sit before the call.
+    vacuous_source = inspect.getsource(mutated_act)
+    assert vacuous_source.index("MailboxBreakerStatus.PAUSED") < vacuous_source.index(
+        "effective_driver.throttle("
+    )
+    # The fixed guard: the name only ever existed in a comment, so once
+    # comments are stripped it isn't in the code at all.
+    with pytest.raises(ValueError, match="substring not found"):
+        source_body(mutated_act).index("MailboxBreakerStatus.PAUSED")
 
 
 def test_engine_breaker_module_never_constructs_a_campaign_ref() -> None:

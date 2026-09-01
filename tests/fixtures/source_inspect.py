@@ -13,37 +13,57 @@ what let `test_check_and_run_share_the_same_evaluation_chokepoint` pass
 against a hand-duplicated aggregation loop that never touched
 `evaluate_all_mailboxes` at all -- the docstring still named it in prose.
 
-`source_body` strips a function's own docstring out of its source before
-returning it, so any `in` assertion built on it only passes because the
-CODE references the name, never because the docstring does.
+CLOSE8-3: the SAME failure shape reappeared two files away, in a function
+with NO docstring at all -- `_act`'s own guard
+(`test_act_checks_paused_status_before_ever_calling_throttle`) used raw
+`inspect.getsource`, unguarded, and a mutation that deleted the real
+`MailboxBreakerStatus.PAUSED` check while leaving a COMMENT naming it
+still passed. `source_body` now strips comments too (via `tokenize`, which
+correctly leaves a `#` INSIDE a string literal alone -- unlike a naive
+text scan), so this is the one place to fix the class everywhere, not just
+docstrings. Every `getsource`-based `in` assertion in this test suite is
+expected to route through `source_body`; there is no longer a reason to
+call `inspect.getsource` directly and check `in` on the raw result.
 
-Deliberately AST-based, not `source.replace(func.__doc__, "")`: Python
-3.13 dedents a multi-line `__doc__` at compile time (its leading whitespace
-per continuation line is stripped from the STORED string), so `func.__doc__`
-is no longer a verbatim substring of `inspect.getsource(func)` on 3.13+ --
-a `.replace()`-based version silently does nothing there. Locating the
-docstring's exact line span via `ast` instead is immune to that: it looks
-at where the docstring statement sits in the source, never at the string
-value CPython chose to store for `__doc__`.
+`source_body` strips a function's own docstring AND every comment out of
+its source before returning it, so any `in` assertion built on it only
+passes because the CODE references the name, never because a docstring or
+a comment does.
+
+Docstring stripping is deliberately AST-based, not `source.replace(func.
+__doc__, "")`: Python 3.13 dedents a multi-line `__doc__` at compile time
+(its leading whitespace per continuation line is stripped from the STORED
+string), so `func.__doc__` is no longer a verbatim substring of `inspect.
+getsource(func)` on 3.13+ -- a `.replace()`-based version silently does
+nothing there. Locating the docstring's exact line span via `ast` instead
+is immune to that: it looks at where the docstring statement sits in the
+source, never at the string value CPython chose to store for `__doc__`.
 """
 
 import ast
 import inspect
+import io
 import textwrap
+import tokenize
 from collections.abc import Callable
 
 
 def source_body(func: Callable[..., object]) -> str:
     """`inspect.getsource(func)`, with `func`'s own docstring statement (if
-    it has one) removed entirely.
+    it has one) and every comment removed.
 
     Use this instead of a bare `inspect.getsource(func)` any time the
     assertion built on top is `in`, not `not in`. A `not in` assertion
-    needs no help -- a docstring mention only makes it fail, correctly, if
-    anything; only an `in` assertion is vulnerable to a docstring alone
-    making it pass.
+    needs no help -- a docstring or comment mention only makes it fail,
+    correctly, if anything; only an `in` assertion is vulnerable to prose
+    alone making it pass.
     """
     source = textwrap.dedent(inspect.getsource(func))
+    source = _without_docstring(source)
+    return _without_comments(source)
+
+
+def _without_docstring(source: str) -> str:
     tree = ast.parse(source)
     func_node = tree.body[0]
     if not isinstance(func_node, ast.FunctionDef | ast.AsyncFunctionDef):
@@ -59,4 +79,21 @@ def source_body(func: Callable[..., object]) -> str:
     doc_statement = func_node.body[0]
     lines = source.splitlines(keepends=True)
     del lines[doc_statement.lineno - 1 : doc_statement.end_lineno]
+    return "".join(lines)
+
+
+def _without_comments(source: str) -> str:
+    """Blank out every `#...` comment `tokenize` finds, in place. Unlike a
+    naive text scan for `#`, `tokenize` never mistakes a `#` inside a
+    string literal (an f-string, a URL, a hex color in a docstring
+    example) for a comment -- it tokenizes the source the same way the
+    real Python compiler does."""
+    lines = source.splitlines(keepends=True)
+    for token in tokenize.generate_tokens(io.StringIO(source).readline):
+        if token.type != tokenize.COMMENT:
+            continue
+        row, col = token.start
+        line = lines[row - 1]
+        keep_newline = "\n" if line.endswith("\n") else ""
+        lines[row - 1] = line[:col] + keep_newline
     return "".join(lines)
