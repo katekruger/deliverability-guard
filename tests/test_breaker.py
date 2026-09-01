@@ -1673,14 +1673,16 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
     assert restored.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
-# --- What the sweep below still cannot see (CLOSE7-4) ---------------------
+# --- What the sweep below still cannot see (CLOSE7-4, updated CLOSE8-4) ---
 #
-# Written down deliberately, not fixed here -- per the round-7 audit's own
-# closing instruction: the highest-value thing a session like this one can
-# do is name what the sweep is still blind to, even where nothing gets
-# closed. Four rounds running, this sweep has found exactly what it was
-# pointed at and missed everything it wasn't -- these are the places it
-# isn't pointed yet:
+# Written down deliberately -- per the round-7 audit's own closing
+# instruction: the highest-value thing a session like this one can do is
+# name what the sweep is still blind to, even where nothing gets closed.
+# Kept updated rather than deleted once an item DOES close, the way
+# `campaign-preflight`'s own report marks a finding resolved instead of
+# erasing it -- a list that shows what it caught is worth more than one
+# that only shows what's left. Five rounds running, this sweep has found
+# exactly what it was pointed at and missed everything it wasn't:
 #
 # 1. Every move here is against ONE mailbox (`_MAILBOX`). Cross-mailbox
 #    state leakage -- one mailbox's record somehow perturbing another's
@@ -1688,7 +1690,10 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    keys its dicts by `MailboxRef`, so this is probably fine, but
 #    "probably fine" is exactly the kind of claim this project's other
 #    audit findings have repeatedly shown needs an executable check, not
-#    an assumption.
+#    an assumption. Re-read for CLOSE8-4 and still open -- the
+#    single-mailbox scope of every move here is structural to how
+#    `_apply_move`/`_snapshot` are built, not a small addition; this is
+#    the item worth picking up next.
 # 2. `THROTTLE_PERFORMED` always uses a fixed `current_daily_limit=100`.
 #    The sweep never exercises a limit that GROWS between throttles (an
 #    operator manually raising it back up outside the breaker), nor
@@ -1696,14 +1701,18 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    same sequence -- only ever "still 100, or whatever `_act` computed
 #    last." CLOSE4-1's `is_idempotent_replay` logic is keyed on exactly
 #    this comparison, and its edge cases beyond "never changes" or "grows
-#    once" are unswept.
-# 3. `compliance_gate_tripped` (the hard PAUSE gate from
-#    `signals.postmaster.forces_hard_gate`) has no move at all.
-#    `DecisionRecord` doesn't persist whether a PAUSE was compliance-forced
-#    or ladder-derived, so a compliance-forced PAUSE record replays
-#    identically to an ordinary one today -- believed harmless, since
-#    `from_log` only ever reads `verdict`/`action_outcome`, but "believed"
-#    is doing the same load-bearing work item 1 above flags.
+#    once" are unswept. Re-read for CLOSE8-4 and still open.
+# 3. CLOSED (CLOSE8-1). `compliance_gate_tripped` (the hard PAUSE gate from
+#    `signals.postmaster.forces_hard_gate`) had no move, and this item's
+#    own "believed harmless... but 'believed' is doing the same
+#    load-bearing work item 1 above flags" turned out to be exactly right:
+#    the streak dimension (never the status/limit ones) diverged live-vs-
+#    replay, because `evaluate()`'s compliance branch skipped the same
+#    `clear_unsupported_throttle_streak` call every OTHER PAUSE-producing
+#    path made. `COMPLIANCE_PAUSE` is now in `_PERMUTATION_MOVES` below.
+#    This is the list doing exactly what it was written to do -- naming a
+#    gap precisely enough that finding what was in it was mechanical, not
+#    exploratory.
 # 4. The floor-escalation (CLOSE-3d, a throttle whose halved result would
 #    be <= the floor) and unsupported-streak-escalation (CLOSE3-2) paths
 #    to PAUSE are never swept as their OWN move -- only a fresh ladder
@@ -1711,16 +1720,39 @@ def test_state_store_rebuild_keeps_a_paused_mailbox_paused_through_a_later_faile
 #    `sends=5000, complaints=40`) is. Both escalation paths produce a
 #    verdict=PAUSE record exactly like the ladder's own PAUSE does, so this
 #    is likely another "same shape, untested independently" gap rather
-#    than a known divergence.
+#    than a known divergence. Re-read for CLOSE8-4 and still open --
+#    unlike item 3, nothing this round touched makes this one more or
+#    less likely to be live.
 # 5. No sequence longer than 3 moves is ever swept (`repeat=3`), and no
 #    move appears more than 3 times total across a sequence. A defect
 #    requiring a 4th- or 5th-order interaction -- CLOSE5-2 needed 3 moves
 #    with a repeat that `permutations` alone couldn't produce; nothing
 #    guarantees the next one needs only 3 either -- would be invisible
-#    here by construction, not by oversight.
-#
-# None of these are closed by this round. They're named so the next
-# session doesn't have to rediscover them by finding the bug first.
+#    here by construction, not by oversight. Re-read for CLOSE8-4 and
+#    still open.
+# 6. NEW (CLOSE8-4, from CLOSE8-2). No driver's read-path exception types
+#    were ever enumerated against what `cli.main` actually catches, until
+#    CLOSE8-2 did it once, by hand, after `SesDriver._daily_sums` already
+#    tracebacked in production. The four `httpx`-based drivers turned out
+#    fine (`httpx.HTTPError` covers all of them, `MalformedResponseError`
+#    covers the rest), but that was verified this round, not before it --
+#    the next driver added to this project (a tenth surveyed platform, a
+#    new client library) needs the same enumeration done for it BEFORE it
+#    ships, not after a live account produces the exception nobody
+#    thought to catch. See CHANGELOG.md's CLOSE8-2 entry for the table.
+# 7. NEW (CLOSE8-4, from CLOSE8-3). The `in`-over-`inspect.getsource`
+#    failure shape (a docstring or comment mention alone making an `in`
+#    assertion pass, without the code it claims to check actually being
+#    there) has now appeared twice, in two different rounds, in two
+#    different functions. It is now checked structurally
+#    (`tests/test_source_inspect.py`), but that only guards THIS specific
+#    pattern in THIS suite -- whenever a future round adds any new
+#    source-level guard, of any shape, the standing question is "does this
+#    assertion pass only because the CODE has the property being checked,
+#    or could a comment/docstring/unrelated string alone make it pass?"
+#    `not in` is safe by construction; `in` needs `source_body` or an
+#    equivalent structural check (an `ast` walk, an explicit line-order
+#    comparison on already-stripped source, ...).
 
 _PERMUTATION_MOVES = (
     "PAUSE_PERFORMED",

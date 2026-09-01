@@ -157,6 +157,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`tests/test_breaker.py`: the blind-spot list kept alive, item 3 marked
+  closed rather than deleted** (CLOSE8-4). The list at
+  `tests/test_breaker.py:1627` (round 7's own artifact) found CLOSE8-1
+  exactly where it said it would -- item 3 named `compliance_gate_tripped`
+  as untested with "'believed' is doing the same load-bearing work item 1
+  flags," and the streak divergence CLOSE8-1 found is precisely that.
+  Marked CLOSED in place, with what closed it and why, rather than
+  deleted -- the same "mark resolved, don't erase" instinct
+  `campaign-preflight`'s own report uses, because a list that shows what
+  it caught is worth more than one that only shows what's left. Items 1,
+  2, 4, and 5 re-read with fresh eyes and left open (still real, nothing
+  this round closed or ruled out); item 1 (cross-mailbox state leakage) is
+  flagged as the one worth picking up next. Two new items added, both
+  taught by this round directly: driver read-path exception types are
+  never enumerated ahead of time (CLOSE8-2 found `ses.py`'s gap only after
+  it was already live), and the `in`-over-`getsource` failure shape --
+  now appeared twice, in two different functions, in two different rounds
+  -- is a standing question to ask of every future source-level guard,
+  not just the two instances already fixed.
+
 - **`tests/test_breaker.py`: the second vacuous `getsource`-based guard,
   two files from the one CLOSE7-3 fixed** (external audit finding
   CLOSE8-3). `test_act_checks_paused_status_before_ever_calling_throttle`
