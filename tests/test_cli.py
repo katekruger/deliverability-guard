@@ -714,6 +714,70 @@ def test_six_separate_check_invocations_throttle_the_mailbox_exactly_once(
     assert state_store.status_of(mailbox) == MailboxBreakerStatus.THROTTLED
 
 
+class _NoLimitDriver:
+    """Reports `current_daily_limit=None` on every read -- a provider that
+    genuinely cannot report a daily limit, so THROTTLE can never actually
+    execute (CLOSE3-2/CLOSE4-2's reproduction). Also supports pause, so the
+    CLOSE3-2 escalation can actually complete."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [MailboxDayStats(mailbox=mailbox, day=date(2025, 12, 31), sends=20_000, bounces=30)]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return unsupported(Capability.THROTTLE, self.name, "fake: no daily limit known")
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE4-1/CLOSE4-2: ten separate `cli.main` invocations against a
+    provider that can never report a daily limit. `check` escalates to
+    PAUSE via the CLOSE3-2 streak on run 4 -- and before CLOSE4-1's fix, the
+    very next THROTTLE/UNSUPPORTED record replayed on run 5 silently
+    un-paused the mailbox, so the escalate-then-un-pause cycle repeated with
+    period 4 forever, calling the provider's real `pause()` again every time
+    it escalated. After the fix: the mailbox reaches PAUSED once and stays
+    there for the remaining six runs, with exactly one real provider pause
+    call -- later escalations replaying against an already-PAUSED mailbox
+    are idempotent no-ops."""
+    driver = _NoLimitDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _NoLimitDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+
+    statuses: list[str] = []
+    for _ in range(10):
+        main(["--config", str(config_path), "check"])
+        statuses.append(
+            BreakerStateStore.from_log(tmp_path / "decisions.jsonl").status_of(mailbox).name
+        )
+
+    assert statuses[3:] == ["PAUSED"] * 7  # escalates by run 4, stays PAUSED through run 10
+    assert driver.pause_calls == [mailbox]
+    assert driver.throttle_calls == []  # current_daily_limit is always None -- never a real call
+
+
 def test_from_log_restart_between_tick_one_and_two_is_a_no_op(tmp_path: Path) -> None:
     """A restart between the very first throttle and the second identical
     evaluation specifically: tick 2 must be idempotent, not a fresh
