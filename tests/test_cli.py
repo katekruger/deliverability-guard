@@ -744,6 +744,121 @@ class _NoLimitDriver:
         )
 
 
+class _PhaseDriver:
+    """A driver whose reported evidence and daily limit change over the
+    test's own lifetime, simulating a mailbox that gets paused, then later
+    (wrongly, pre-CLOSE5-1) reports a real daily limit, then later still
+    reports healthy evidence -- CLOSE5-1's own seven-phase reproduction."""
+
+    name = "fake"
+
+    def __init__(self) -> None:
+        self.capabilities = frozenset(
+            {Capability.READ_STATS, Capability.THROTTLE, Capability.PAUSE}
+        )
+        self.throttle_calls: list[tuple[str, int]] = []
+        self.pause_calls: list[MailboxRef | CampaignRef] = []
+        self.sends = 20_000
+        self.bounces = 30
+        self.current_daily_limit: int | None = None
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+        return [
+            MailboxDayStats(
+                mailbox=mailbox,
+                day=date(2025, 12, 31),
+                sends=self.sends,
+                bounces=self.bounces,
+                current_daily_limit=self.current_daily_limit,
+            )
+        ]
+
+    def throttle(self, mailbox_id: str, daily_limit: int) -> ActionResult:
+        self.throttle_calls.append((mailbox_id, daily_limit))
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED,
+            detail="fake: throttled",
+            capability=Capability.THROTTLE,
+        )
+
+    def pause(self, target: MailboxRef | CampaignRef) -> ActionResult:
+        self.pause_calls.append(target)
+        return ActionResult(
+            outcome=ActionOutcome.PERFORMED, detail="fake: paused", capability=Capability.PAUSE
+        )
+
+
+def test_seven_phase_reproduction_a_paused_mailbox_never_auto_un_pauses(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE5-1: the serious one. Seven SEPARATE `cli.main` invocations
+    (`from_log` rebuilt fresh each time, the documented cron deployment).
+    Phase 1 (no known daily limit) escalates to PAUSE via the CLOSE3-2
+    streak on run 4 -- one real provider `pause()` call. Phase 2 (the
+    provider now reports a real `current_daily_limit`) must NOT throttle the
+    already-paused mailbox, regardless of what its evidence says. Phase 3
+    (evidence recovers to OK) must NOT auto-resume it either -- CLOSE-3b's
+    recovery path is for THROTTLED mailboxes, and this one must never have
+    become THROTTLED in the first place. `resume_after_human_review` is
+    never called; no `ResumeRecord` exists in the log."""
+    driver = _PhaseDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _PhaseDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+    mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
+
+    # Phase 1: no known daily limit. Runs 1-4.
+    for _ in range(4):
+        main(["--config", str(config_path), "check"])
+    assert (
+        BreakerStateStore.from_log(tmp_path / "decisions.jsonl").status_of(mailbox)
+        == MailboxBreakerStatus.PAUSED
+    )
+
+    # Phase 2: provider now reports a real daily limit. Runs 5-6.
+    driver.current_daily_limit = 50
+    for _ in range(2):
+        main(["--config", str(config_path), "check"])
+
+    # Phase 3: evidence recovers. Run 7.
+    driver.sends = 5000
+    driver.bounces = 0
+    main(["--config", str(config_path), "check"])
+
+    final_store = BreakerStateStore.from_log(tmp_path / "decisions.jsonl")
+    assert final_store.status_of(mailbox) == MailboxBreakerStatus.PAUSED
+    assert driver.throttle_calls == []
+    assert driver.pause_calls == [mailbox]
+
+
+def test_seven_phase_reproduction_never_writes_a_resume_record(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    driver = _PhaseDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> _PhaseDriver:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, text=_LIVE_YAML, decision_log=str(tmp_path / "decisions.jsonl"))
+
+    for _ in range(4):
+        main(["--config", str(config_path), "check"])
+    driver.current_daily_limit = 50
+    for _ in range(2):
+        main(["--config", str(config_path), "check"])
+    driver.sends = 5000
+    driver.bounces = 0
+    main(["--config", str(config_path), "check"])
+
+    events = read_events(tmp_path / "decisions.jsonl")
+    assert not any(isinstance(e, ResumeRecord) for e in events)
+
+
 def test_ten_separate_check_invocations_pause_the_mailbox_exactly_once(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

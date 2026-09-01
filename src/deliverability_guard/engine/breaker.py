@@ -325,27 +325,38 @@ class BreakerStateStore:
             elif record.verdict is Verdict.THROTTLE:
                 if record.action_outcome is ActionOutcome.PERFORMED:
                     # A PERFORMED throttle can itself be `_act`'s idempotent
-                    # no-op ("mailbox already throttled at this limit; no
-                    # action taken") -- which, like UNSUPPORTED/FAILED just
-                    # below, never touches `state_store` on the live path,
-                    # so it must not overwrite a PAUSED status here either.
-                    # It's distinguishable from a GENUINE throttle purely
-                    # from the records replayed so far: `_act` only reaches
-                    # its idempotent branch when a limit is already
-                    # recorded and this record's `applied_daily_limit`
-                    # doesn't exceed it (mirroring the live check
-                    # `current_daily_limit <= recorded_limit` in `_act`) --
-                    # a genuine throttle always either sets the limit for
-                    # the first time (nothing recorded yet) or records a
-                    # STRICTLY larger one (`_act` only falls through to a
-                    # real `driver.throttle()` call when
-                    # `current_daily_limit > recorded_limit`).
-                    previously_recorded_limit = throttled_at_limit.get(mailbox)
-                    is_idempotent_replay = (
-                        previously_recorded_limit is not None
-                        and record.applied_daily_limit is not None
-                        and record.applied_daily_limit <= previously_recorded_limit
-                    )
+                    # no-op, in TWO different ways: "mailbox already
+                    # throttled at this limit" (CLOSE4-1), or -- CLOSE5-1 --
+                    # "mailbox is paused; throttle refused pending human
+                    # review." Neither ever touches `state_store` on the
+                    # live path, so neither must overwrite a PAUSED status
+                    # here either.
+                    #
+                    # If the mailbox's status entering this record is
+                    # already PAUSED, this record can ONLY be CLOSE5-1's
+                    # paused-idempotent no-op: `_act`'s THROTTLE branch now
+                    # checks PAUSED status before anything else, so a
+                    # genuine throttle can never be recorded for a mailbox
+                    # that was already PAUSED at the time -- leave status
+                    # (and `throttled_at_limit`) exactly as they were.
+                    #
+                    # Otherwise, CLOSE4-1's original distinction still
+                    # applies: `_act` only reaches its limit-idempotent
+                    # branch when a limit is already recorded and this
+                    # record's `applied_daily_limit` doesn't exceed it
+                    # (mirroring the live check `current_daily_limit <=
+                    # recorded_limit`) -- a genuine throttle always either
+                    # sets the limit for the first time (nothing recorded
+                    # yet) or records a STRICTLY larger one.
+                    if status.get(mailbox) is MailboxBreakerStatus.PAUSED:
+                        is_idempotent_replay = True
+                    else:
+                        previously_recorded_limit = throttled_at_limit.get(mailbox)
+                        is_idempotent_replay = (
+                            previously_recorded_limit is not None
+                            and record.applied_daily_limit is not None
+                            and record.applied_daily_limit <= previously_recorded_limit
+                        )
                     if not is_idempotent_replay:
                         status[mailbox] = MailboxBreakerStatus.THROTTLED
                         if record.applied_daily_limit is not None:
@@ -760,6 +771,30 @@ def _act(
     effective_driver: ProviderDriver = DryRunDriver(inner=driver) if dry_run else driver
 
     if verdict is Verdict.THROTTLE:
+        if state_store.status_of(mailbox) is MailboxBreakerStatus.PAUSED:
+            # CLOSE5-1: a mailbox already PAUSED is behind ADR 0003's
+            # human-review gate, and nothing automatic may touch its
+            # sending limits in either direction -- mirrors the PAUSE
+            # branch's own already-PAUSED short-circuit below, forty lines
+            # down, which this branch never had. Without this, `evaluate()`
+            # computes a fresh verdict from today's evidence with no idea
+            # the mailbox is paused (neither `evaluate()` nor this function
+            # consulted `status_of` before reaching here), so a PAUSED
+            # mailbox whose evidence happened to land in the THROTTLE band
+            # got a REAL `driver.throttle()` call and `mark_throttled` moved
+            # it to THROTTLED -- from which a single later OK evaluation
+            # reaches ACTIVE via CLOSE-3b's sustained-recovery path, with no
+            # human-review action of any kind ever recorded. Returned as
+            # PERFORMED/idempotent, not UNSUPPORTED: this isn't the provider
+            # refusing anything, it's this breaker refusing to ask -- the
+            # same framing the PAUSE
+            # branch already uses for "a previous trip already got this
+            # mailbox paused."
+            return ActionResult(
+                outcome=ActionOutcome.PERFORMED,
+                detail="mailbox is paused; throttle refused pending human review (ADR 0003)",
+                capability=Capability.THROTTLE,
+            )
         # Idempotent, keyed on the (verdict, applied limit) pair, not just
         # the status (CLOSE-3b/ENG-5a): a mailbox is a no-op repeat only if
         # its current daily limit hasn't grown past what we last throttled

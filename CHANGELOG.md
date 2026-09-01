@@ -157,6 +157,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`engine/breaker.py`: a PAUSED mailbox auto-un-paused through THROTTLE
+  then OK, with no human review** (external audit finding CLOSE5-1 — the
+  serious one). `_act`'s THROTTLE branch never consulted `state_store.
+  status_of`, unlike its PAUSE branch, which has always checked "is this
+  mailbox already paused?" before acting. A mailbox already PAUSED whose
+  evidence on a later tick happened to land in the THROTTLE band got a REAL
+  `driver.throttle()` call, `mark_throttled` moved it to THROTTLED, and one
+  later OK evaluation then hit CLOSE-3b's sustained-recovery path and moved
+  it all the way to ACTIVE — `resume_after_human_review` never called, no
+  `ResumeRecord` ever written. Reproduction: seven separate `check`
+  processes ended with the breaker having paused a mailbox, then told the
+  provider to re-enable its sending at a reduced limit, then reported it
+  fully healthy three runs later — contradicting ADR 0003 itself,
+  `BreakerStateStore`'s own class docstring ("`resume_after_human_review`
+  is the ONLY path back from PAUSED to ACTIVE"), and `mark_active`'s own
+  docstring ("never for un-pausing a confirmed-paused mailbox on its own").
+  Fixed by adding the same status check to `_act`'s THROTTLE branch that
+  its PAUSE branch already has (see [ADR
+  0008](docs/decisions/0008-throttle-must-not-act-on-a-paused-mailbox.md)
+  for why the check lives there and not in `evaluate()`), and extending
+  `from_log`'s THROTTLE/PERFORMED replay to recognize the resulting
+  paused-idempotent no-op record and leave status untouched during replay.
+  A new source-level guard test
+  (`test_act_checks_paused_status_before_ever_calling_throttle`) asserts
+  `_act` consults PAUSED status before it can ever reach
+  `driver.throttle()`, in the same idiom the repo already used for the
+  symmetric `resume_after_human_review` claim.
+
 - **`README.md`: the capability matrix's "campaign only" pause marks
   described driver-API surface the breaker itself never reaches** (external
   audit finding CLOSE4-3, a documentation decision rather than a bug).

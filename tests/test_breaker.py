@@ -236,6 +236,83 @@ def test_throttle_that_would_drop_below_the_floor_escalates_to_pause() -> None:
     assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
 
 
+# --- CLOSE5-1: a PAUSED mailbox must never be throttled --------------------
+
+
+def test_a_paused_mailbox_that_evaluates_to_throttle_is_not_throttled() -> None:
+    """CLOSE5-1: `_act`'s THROTTLE branch never consulted
+    `state_store.status_of`, unlike its PAUSE branch -- so a mailbox already
+    behind the human-review gate (ADR 0003) got a REAL `driver.throttle()`
+    call the moment its evidence happened to compute THROTTLE instead of
+    PAUSE, and `mark_throttled` moved it to THROTTLED. Nothing about that
+    involves a human."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    state_store.mark_paused(_MAILBOX)
+
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=20_000,
+        complaints=30,  # 0.15% -- THROTTLE band on its own evidence
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+        current_daily_limit=100,
+    )
+
+    assert result.verdict == Verdict.THROTTLE
+    assert driver.throttle_calls == []
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+    assert state_store.throttled_at_limit(_MAILBOX) is None
+
+
+def test_a_paused_mailbox_with_an_ok_verdict_stays_paused() -> None:
+    """CLOSE-3b's sustained-recovery path only ever fires for THROTTLED, not
+    PAUSED -- confirming that stays true after CLOSE5-1's fix, since the
+    reproduction reaches ACTIVE via THROTTLED, never directly from PAUSED."""
+    driver = FakeDriver()
+    state_store = BreakerStateStore()
+    state_store.mark_paused(_MAILBOX)
+
+    result = evaluate(
+        driver=driver,
+        mailbox=_MAILBOX,
+        sends=5000,
+        complaints=0,
+        prior=DEFAULT_PRIOR,
+        thresholds=DEFAULT_LADDER,
+        state_store=state_store,
+        dry_run=False,
+        now=_NOW,
+    )
+
+    assert result.verdict == Verdict.OK
+    assert state_store.status_of(_MAILBOX) == MailboxBreakerStatus.PAUSED
+
+
+def test_act_checks_paused_status_before_ever_calling_throttle() -> None:
+    """CLOSE5-1's guard, in the idiom
+    `test_evaluate_never_calls_resume_after_human_review` already uses: a
+    crude source-level check, but it is what would have caught this. `_act`
+    must consult `MailboxBreakerStatus.PAUSED` before it can ever reach
+    `effective_driver.throttle(...)` -- the same ordering its PAUSE branch
+    has always had relative to `effective_driver.pause(...)`."""
+    import inspect
+
+    from deliverability_guard.engine import breaker as breaker_module
+
+    source = inspect.getsource(breaker_module._act)  # pyright: ignore[reportPrivateUsage]
+    paused_check_index = source.index("MailboxBreakerStatus.PAUSED")
+    throttle_call_index = source.index("effective_driver.throttle(")
+    assert paused_check_index < throttle_call_index, (
+        "_act must consult PAUSED status before ever calling driver.throttle() "
+        "-- CLOSE5-1: a PAUSED mailbox must never receive a real throttle call"
+    )
+
+
 # --- CLOSE3-2: an unexecutable throttle must not loop forever -------------
 
 
