@@ -16,6 +16,7 @@ from collections.abc import Callable, Mapping
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 
+import httpx
 import pytest
 
 import deliverability_guard.cli as cli_module
@@ -976,6 +977,46 @@ def test_main_check_reports_an_httpx_transport_error_with_its_own_exit_code(
     exit_code = main(["--config", str(config_path), "check"])
 
     assert exit_code == 3
+
+
+@pytest.mark.parametrize(
+    "make_exc",
+    [
+        lambda: httpx.InvalidURL("bad url"),
+        lambda: httpx.CookieConflict("dup"),
+        lambda: httpx.StreamConsumed(),
+    ],
+    ids=["InvalidURL", "CookieConflict", "StreamConsumed"],
+)
+def test_main_check_survives_httpx_exceptions_outside_httpxerror(
+    make_exc: Callable[[], Exception], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE9-4: the per-driver exception table (CHANGELOG.md's CLOSE8-2
+    entry) originally claimed `httpx.HTTPError` covers what the four
+    `httpx`-based drivers can raise -- false for three families:
+    `httpx.InvalidURL` and `httpx.CookieConflict` are bare `Exception`
+    subclasses, and the `StreamError` family (`StreamConsumed` here) is a
+    `RuntimeError`, none of them `httpx.HTTPError`. All three still fall
+    through to CLOSE8-2's own catch-all and produce a clean exit 3 with no
+    traceback -- verified here directly, so the table's CORRECTED claim
+    (fallthrough, not the `httpx.HTTPError`-specific handler) is backed by
+    a test, not just a corrected sentence."""
+    exc = make_exc()
+    assert not isinstance(exc, httpx.HTTPError)  # confirms these really are the uncovered family
+    failing_driver = _TransportFailingDriver(exc)
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return failing_driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    assert "Traceback" not in err.getvalue()
 
 
 def test_main_check_reports_a_provider_error_with_its_own_exit_code(

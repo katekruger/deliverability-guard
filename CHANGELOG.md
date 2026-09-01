@@ -372,22 +372,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   | Driver | Read-path exception source | Where it lands |
   |---|---|---|
-  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) | `cli.main`'s existing `httpx.HTTPError` handler |
+  | `instantly.py` | `httpx.Client.get`/`.post` -- `httpx.HTTPError` (`RequestError`/`HTTPStatusError` family: connection, timeout, status) covers the large majority; three families do NOT subclass it -- `httpx.InvalidURL`, `httpx.CookieConflict` (both bare `Exception`), and the `StreamError` family (`StreamConsumed`/`StreamClosed`/`RequestNotRead`/`ResponseNotRead`, a `RuntimeError`) [CORRECTED, CLOSE9-4 -- see below] | `httpx.HTTPError` cases: `cli.main`'s `httpx.HTTPError` handler. The three families above: `cli.main`'s CLOSE8-2 catch-all (exit 3, generic message -- not the provider-specific one this row used to imply) |
   | `instantly.py` | malformed/non-JSON response body, missing fields | `MalformedResponseError` (a `ProviderError`) via `_parsing.py`'s `require_*` helpers -- `cli.main`'s `ProviderError` handler |
-  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers) | same two handlers |
-  | `lemlist.py` | same shape | same two handlers |
-  | `apollo.py` | same shape | same two handlers |
+  | `smartlead.py` | same shape as `instantly.py` (`httpx`-based, same `_parsing.py` helpers, same three-family gap) | same handlers |
+  | `lemlist.py` | same shape | same handlers |
+  | `apollo.py` | same shape | same handlers |
   | `ses.py` | `botocore.exceptions.ClientError`/`BotoCoreError` from `CloudWatchClient.get_metric_statistics` | translated to `RateLimitExceededError`/`ProviderError` at the driver boundary (CLOSE8-2, this entry) -- `cli.main`'s existing `ProviderError` handler |
   | `ses.py` | `botocore.exceptions.NoRegionError` at construction (`boto3.client(...)`, no region configured anywhere) | caught in `build_driver`, re-raised as `CliError` (CLOSE8-2) -- exit 2 |
   | `noop.py` | none -- no external client of any kind | n/a |
 
-  Every httpx-based driver was already safe -- confirmed, not assumed:
-  `httpx.HTTPError` is the base of both httpx exception families
-  (`RequestError` and `HTTPStatusError`), so `cli.main`'s existing handler
-  already covers every network/timeout/status failure those four drivers
-  can produce, and every parse failure already raises `MalformedResponseError`
-  via the shared `_parsing.py` helpers. `ses.py` -- the one driver with a
-  DIFFERENT client library underneath -- was the only real gap.
+  **Correction (CLOSE9-4):** this table originally claimed `httpx.HTTPError`
+  covers "what those drivers can raise" for all four `httpx`-based
+  drivers -- false. `httpx.InvalidURL` and `httpx.CookieConflict` are bare
+  `Exception` subclasses, not `httpx.HTTPError`; the `StreamError` family
+  is a `RuntimeError`. None of the three are reachable through this
+  project's own drivers today in practice (base URLs are hardcoded
+  constants, so `InvalidURL` in particular has no live path), and CLOSE8-2's
+  own catch-all DOES still turn all three into a clean exit 3 with no
+  traceback -- verified through a real `check` for `ConnectError`,
+  `InvalidURL`, `CookieConflict`, and `StreamConsumed` alike, all exit 3,
+  no traceback. But the message for the three uncovered families is the
+  GENERIC catch-all one, not the provider-specific "provider request
+  failed" this row's original wording implied, and the enumeration this
+  table exists to BE didn't itself hold up under its own standard (blind-
+  spot item 6: "enumerated ... BEFORE it ships, not after" -- this shipped
+  and missed three families). Left uncorrected in the handler itself
+  deliberately, not fixed: the fallthrough behavior is already correct
+  and safe, and this is a documentation-accuracy fix, not a functional
+  gap, per AGENTS.md's "no new features beyond what closes the finding."
 
   Also, per this round's own opening instruction, `cli.main` gained a
   final, broad `except Exception` around both `check`'s and `run`'s
