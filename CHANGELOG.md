@@ -157,6 +157,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`README.md`: four more unguarded absolute claims, and one stale
+  CHANGELOG sentence** (external audit finding CLOSE6-3, the same shape as
+  CLOSE5-3, applied to the claims that finding didn't reach). Each claim
+  was true when written and had no executable guard behind it:
+  (1) "PAUSE actually executes against exactly one provider (`instantly`),
+  and THROTTLE against exactly one (`smartlead`); no single provider can
+  do both" (README:118) — the `CampaignRef` half of this sentence was
+  guarded in CLOSE5-3, this half wasn't; added
+  `test_pause_and_throttle_via_mailboxref_reach_exactly_one_provider_each`
+  to `tests/test_provider_conformance.py`, exercising Instantly's `pause`
+  and Smartlead's `throttle` against recorded fixtures (never live) and
+  reusing CLOSE5-3's existing UNSUPPORTED coverage for every other
+  (driver, verb) pair. (2) "they share one code path
+  (`loops.fast.evaluate_all_mailboxes`)" (README:56) — added
+  `test_check_and_run_share_the_same_evaluation_chokepoint` to
+  `tests/test_cli.py`, the same source-level idiom already used for the
+  `CampaignRef` and `resume_after_human_review` claims. (3) "no code path
+  can pause or throttle without `dry_run=False`, set on purpose"
+  (README:90) — added
+  `test_dry_run_parameter_has_no_default_on_evaluate_or_act` to
+  `tests/test_breaker.py`, the same `inspect.signature` idiom
+  `tests/test_slow_loop.py`'s `test_tune_thresholds_signature_has_no_
+  capability_carrying_parameter` already established for a different
+  claim. (4) "`resume <mailbox>` is the only way a paused mailbox becomes
+  active again ... there is no automatic path back from `PAUSED`"
+  (README:58) — closed by CLOSE6-2's new exclusivity test above, no
+  separate change needed here. README:101's "every driver's
+  `pause()`/`throttle()` is always callable and returns an explicit
+  'unsupported' result" is left as-is per its own test's documented
+  caveat (10 of 12 (driver, verb) pairs covered; the other 2 would be live
+  calls). Also corrected `CHANGELOG.md`'s CLOSE4-1 entry, which still said
+  the permutation sweep asserted equality "over all 720 orderings of six
+  representative moves" — stale since CLOSE5-2 changed the comparison
+  (three fields, not one) and move count, and stale again after CLOSE6-2
+  above; reworded to point at the entries that carry the current numbers
+  instead of repeating a count that goes stale every time the set grows.
+
 - **`engine/breaker.py`: a WARN record could un-pause a mailbox, and
   nothing would fail** (external audit finding CLOSE6-2). The code itself
   was correct; the invariant guarding it was not. Two gaps: (1) `WARN` and
@@ -351,9 +388,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   STRICTLY larger value, while an idempotent replay's `applied_daily_limit`
   never exceeds what's already tracked. A new property-style test
   (`test_from_log_replay_matches_the_live_path_over_every_move_ordering`)
-  asserts replayed status equals live-path status over all 720 orderings of
-  six representative moves (PAUSE/PERFORMED, THROTTLE/PERFORMED,
-  THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME) — the invariant meant
+  asserts replayed status equals live-path status over move sequences drawn
+  from a set of representative moves (PAUSE/PERFORMED, THROTTLE/PERFORMED,
+  THROTTLE/UNSUPPORTED, THROTTLE/FAILED, OK, RESUME at the time this entry
+  was written — CLOSE5-2 and CLOSE6-2 below both extended the move set and
+  the comparison further; see those entries for the current numbers, since
+  this sentence goes stale every time the set grows) — the invariant meant
   to stop this exact defect shape recurring a fifth time. Ten consecutive
   `check` processes against a provider with no daily limit now reach PAUSED
   once, on run 4, and stay there through run 10, with exactly one real

@@ -938,6 +938,28 @@ def test_evaluate_never_calls_resume_after_human_review() -> None:
     )
 
 
+def test_dry_run_parameter_has_no_default_on_evaluate_or_act() -> None:
+    """CLOSE6-3: README.md's own claim -- 'no code path can pause or
+    throttle without `dry_run=False`, set on purpose' -- had no signature
+    guard, despite `tests/test_slow_loop.py`'s
+    `test_tune_thresholds_signature_has_no_capability_carrying_parameter`
+    already using exactly this `inspect.signature` idiom for a different
+    claim in this repo. `evaluate`'s and `_act`'s own docstrings already
+    say `dry_run` has no default so every call site must decide
+    explicitly -- this is that claim, checked."""
+    import inspect
+
+    from deliverability_guard.engine import breaker as breaker_module
+
+    evaluate_signature = inspect.signature(breaker_module.evaluate)
+    assert evaluate_signature.parameters["dry_run"].default is inspect.Parameter.empty
+
+    act_signature = inspect.signature(
+        breaker_module._act  # pyright: ignore[reportPrivateUsage]
+    )
+    assert act_signature.parameters["dry_run"].default is inspect.Parameter.empty
+
+
 # --- Dry-run identity -------------------------------------------------------
 
 

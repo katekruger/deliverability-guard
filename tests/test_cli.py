@@ -1572,3 +1572,22 @@ def test_close1_run_actually_executes_pooled_posterior_and_cusum_step(
     assert exit_code == 0
     assert len(pooled_posterior_calls) == 5
     assert len(cusum_step_calls) == 5
+
+
+def test_check_and_run_share_the_same_evaluation_chokepoint() -> None:
+    """CLOSE6-3: README.md's own claim -- `check` and `run`'s fast tick
+    "share one code path (`loops.fast.evaluate_all_mailboxes`), so the two
+    can't drift apart" -- had no executable guard. A source-level check,
+    in the same idiom this repo already uses for
+    `test_evaluate_never_calls_resume_after_human_review` and
+    `test_engine_breaker_module_never_constructs_a_campaign_ref`: both
+    `cmd_check` and `loops.controller.run` must reference
+    `evaluate_all_mailboxes` by name -- if either one stopped calling it
+    (e.g. reimplementing its own aggregation-and-evaluation loop), this
+    fails without needing to notice the behavioral drift first."""
+    import inspect
+
+    from deliverability_guard.loops import controller as controller_module
+
+    assert "evaluate_all_mailboxes" in inspect.getsource(cli_module.cmd_check)
+    assert "evaluate_all_mailboxes" in inspect.getsource(controller_module.run)
