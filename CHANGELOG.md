@@ -236,6 +236,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the older CHANGELOG entries recording what was said at the time are
   unchanged, same as CLOSE10-3 left them -- those are still correct.
 
+- **CLOSE9-2's real-filesystem `resume` permission test silently skips
+  under root** (external audit finding CLOSE11-4). `chmod`-based
+  permission checks are a no-op for a root-running process, so
+  `test_main_resume_against_a_read_only_log_directory_gets_its_own_exit_code`
+  skips under any root-running CI job or containerized agent, with
+  nothing to make that skip visible in an otherwise-green run -- the
+  top-level summary still reads "N passed" and the process still exits 0.
+  A deterministic companion (`test_main_resume_survives_an_injected_
+  write_failure`, monkeypatching `append_resume_record` directly, the
+  same treatment CLOSE10-2's own tests already use) already covered the
+  same property and already runs everywhere -- what was missing was
+  making the skip itself impossible to miss.
+
+  New `tests/conftest.py`: a `pytest_terminal_summary`/`pytest_
+  sessionfinish` hook pair that turns ANY skip in the suite into a
+  failing session, with the skip's own reason printed to the summary.
+  Verified against a synthetic always-skipping test in an isolated
+  directory: exit code 1, not 0, with the skip reason visible. The one
+  real skip in this suite (the test above, only reachable as root) is
+  the reason this exists; a future skip that is genuinely intentional
+  and permanent should carve itself out in `conftest.py` by name, not
+  pass unnoticed the way this one did.
+
 - **"Sustained recovery" renamed to "single-OK recovery"** (external audit
   finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
   automatic recovery path (and CLOSE9-1's extension of it to

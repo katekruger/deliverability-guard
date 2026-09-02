@@ -878,7 +878,21 @@ def test_main_resume_against_a_read_only_log_directory_gets_its_own_exit_code(
     default exit code for an uncaught exception (1) collides with this
     project's OWN exit-code map, which already assigns 1 to "resume was
     refused" -- an operator wrapper reading exit 1 here would conclude
-    the wrong thing entirely."""
+    the wrong thing entirely.
+
+    CLOSE11-4: root bypasses file-permission checks entirely, so this
+    test's own `chmod`-based reproduction is a no-op under any
+    root-running process -- a root-running CI job or a containerized agent
+    included, not just an unusual local setup -- and used to skip
+    silently there, with no red build to notice. The deterministic
+    companion just below (`test_main_resume_survives_an_injected_write_
+    failure`) covers the same property without touching real file
+    permissions, so it runs everywhere including as root; this one stays
+    for the real-filesystem case CLOSE9-2 was originally reproduced
+    against, but `tests/conftest.py`'s `pytest_sessionfinish` now turns
+    ANY skip in this suite into a failing session -- so a skip here (or
+    anywhere else) is a red build, not a silent gap, under whatever
+    process actually runs this suite."""
     if hasattr(os, "geteuid") and os.geteuid() == 0:
         pytest.skip("root bypasses file permission checks; this test needs a real one")
 
