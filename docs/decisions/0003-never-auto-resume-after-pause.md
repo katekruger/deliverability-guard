@@ -389,9 +389,14 @@ Both clear `throttled_at_limit`, which is the part that actually matters:
 CLOSE-3c's original property (a failed pause must not make the
 IMMEDIATELY NEXT throttle re-halve an already-throttled limit) still
 holds, because nothing about this changes what happens on the evaluation
-right after the failed pause -- only what happens after SUSTAINED healthy
-evidence, which is a different question this ADR's own THROTTLED
-precedent already answered the same way.
+right after the failed pause -- only what happens after a single OK
+evaluation's recovery, which is a different question this ADR's own
+THROTTLED precedent already answered the same way. (CLOSE11-3: this line
+itself still said "SUSTAINED healthy evidence" -- the exact word the
+addendum below renamed everywhere else in this project, but missed here,
+two paragraphs above its own reproduction. Fixed in the same audit round
+that also corrected the "renamed everywhere" claim just below to actually
+include this file.)
 
 ### Confirmation
 
@@ -465,12 +470,25 @@ finding go away.
 Every docstring, comment, and test description using "sustained recovery"
 / "sustained OK verdict" / "sustained healthy evaluations" for this
 specific mechanism was renamed to "single-OK recovery" (`engine/breaker.py`,
-`cli.py`, `docs/decisions/0008`, `tests/test_breaker.py`). Deliberately
-NOT renamed: `engine/changepoint.py`'s and `loops/fast.py`'s own uses of
-"sustained shift" / "sustained elevated rate" describing CUSUM's actual
-detection target (a genuinely multi-period accumulation, a different
-mechanism entirely) -- those uses were already accurate and renaming them
-would have been the same mistake in the other direction.
+`cli.py`, `docs/decisions/0008`, `tests/test_breaker.py`, and -- CLOSE11-3
+-- **this file, `docs/decisions/0003` itself**). Deliberately NOT renamed:
+`engine/changepoint.py`'s and `loops/fast.py`'s own uses of "sustained
+shift" / "sustained elevated rate" describing CUSUM's actual detection
+target (a genuinely multi-period accumulation, a different mechanism
+entirely) -- those uses were already accurate and renaming them would have
+been the same mistake in the other direction. Also deliberately NOT
+touched: `engine/breaker.py`'s own historical notes about what a comment
+used to say, and every CHANGELOG entry that is a record of what this
+project said AT THE TIME -- those are correct AS history, not live claims.
+
+(CLOSE11-3: the paragraph above originally claimed this rename covered
+"everywhere the mechanism is described" without listing this file, while
+the "Both clear `throttled_at_limit`" paragraph two above still said
+"SUSTAINED healthy evidence" in this SAME document, two paragraphs above
+where that claim was made. A rename that overclaims its own coverage is
+the same failure class "sustained" itself was -- restated here because
+that is the joke, and it is worth saying out loud rather than just
+quietly fixing the line.)
 
 ### Confirmation
 

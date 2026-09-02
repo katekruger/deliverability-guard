@@ -157,6 +157,108 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: CLOSE10-2's own fix reintroduced the same bug, pointing the
+  other way** (external audit finding CLOSE11-1). `check`/`run`'s
+  `except OSError` handler, added by CLOSE10-2 to stop a local
+  decision-log write failure from being blamed on the provider, was broad
+  enough to also catch a raw socket-level error --
+  `ConnectionResetError`, `TimeoutError`, and `socket.timeout` are all
+  `OSError` subclasses -- escaping a driver that doesn't wrap its own
+  transport errors into `httpx.HTTPError`/`ProviderError` (`ses.py`'s
+  boto3 calls are the likeliest real case; the other four drivers mostly
+  wrap their network errors already, which is why this was latent rather
+  than already observed). That reversed CLOSE10-2's own fix: "a local
+  disk failure blamed on the provider" became "a provider failure blamed
+  on the local disk." The exit code (3) was right either way, which is
+  exactly why an exit-code-only assertion never caught it -- CLOSE10-2's
+  own tests monkeypatch `append_record` to raise, so they passed either
+  way.
+
+  Fixed by narrowing, not widening: `audit.log.append_record` and
+  `append_resume_record` now raise a dedicated `DecisionLogWriteError` on
+  their own write failure instead of letting a bare `OSError` escape, and
+  `check`/`run`'s handler catches that specific type. A
+  `ConnectionResetError` from the provider read path -- never touching
+  `append_record` at all -- no longer matches, and falls through to the
+  generic catch-all, which correctly blames the provider. New tests:
+  `test_main_check_reports_a_raw_socket_error_as_a_provider_failure_not_a_decision_log_one`
+  and its `run` counterpart reproduce the reversed bug directly
+  (`_RawSocketErrorDriver` raises `ConnectionResetError` from
+  `read_mailbox_stats`); the two existing CLOSE10-2 tests were updated to
+  raise `DecisionLogWriteError` from their monkeypatched
+  `append_record`, matching what the real, fixed function now raises;
+  two new `tests/test_audit_log.py` tests exercise the real (non-mocked)
+  wrapping path directly, against an actually-nonexistent directory.
+
+- **One canonical exit-code map, not three separately-maintained
+  copies** (external audit finding CLOSE11-2). CLOSE10-1 fixed
+  `README.md`'s stale exit-code line by pointing it at two other
+  places -- `cli.py`'s module docstring AND `--help`'s epilog -- which is
+  still more than the one source of truth `AGENTS.md` item 5 (added in
+  that same PR, for this exact failure) calls for. Nothing enforced
+  either: deleting the decision-log clause from `--help`'s own
+  `_EXIT_CODE_EPILOG`, or restoring `README.md`'s line to a stale copy,
+  both left the suite green.
+
+  `_EXIT_CODE_EPILOG` (what `--help` actually renders -- the one place a
+  cron author looks) is now the single canonical copy. `cli.py`'s module
+  docstring no longer restates the map; it explains the mechanism behind
+  exit 3 (`DecisionLogWriteError`, CLOSE11-1) and points at
+  `_EXIT_CODE_EPILOG` for what each code means. `README.md`'s exit-code
+  line is now a pointer to `deliverability-guard --help`, not a copy.
+  Three new `tests/test_cli.py` tests make the drift detectable instead
+  of just conventional:
+  `test_help_documents_the_exit_code_map` gained an assertion for the
+  decision-log clause specifically (the clause that drifted out of
+  `README.md` once already, and that the original version of this test
+  never checked existed anywhere);
+  `test_readme_exit_code_line_points_at_help_instead_of_copying_it`
+  fails if `README.md`'s line grows the map's own detail back (asserts
+  `--help` is mentioned and phrases like "malformed response" are not);
+  `test_module_docstring_does_not_restate_the_exit_code_map_either` holds
+  `cli.py`'s docstring to the same standard.
+
+- **`docs/decisions/0003`'s own CLOSE10-3 rename claimed completeness it
+  did not have** (external audit finding CLOSE11-3). Two paragraphs above
+  the addendum that renamed "sustained recovery" to "single-OK recovery"
+  everywhere the mechanism is described, the SAME document's CLOSE9-1
+  addendum still said "only what happens after SUSTAINED healthy
+  evidence" -- the exact word being renamed, missed in the very file
+  making the claim. The addendum's own "renamed everywhere" list named
+  `engine/breaker.py`, `cli.py`, `docs/decisions/0008`, and
+  `tests/test_breaker.py`, but not `docs/decisions/0003` itself. Fixed
+  both: the stray "SUSTAINED" reworded to match the rename, and the
+  completeness list corrected to include this file. A rename that
+  overclaims its own coverage is the same failure class "sustained" was
+  -- said explicitly in the ADR's own text this time, not just fixed
+  quietly. `changepoint.py`, `loops/fast.py`, `test_changepoint.py`'s
+  CUSUM-related "sustained" uses, `breaker.py`'s historical notes, and
+  the older CHANGELOG entries recording what was said at the time are
+  unchanged, same as CLOSE10-3 left them -- those are still correct.
+
+- **CLOSE9-2's real-filesystem `resume` permission test silently skips
+  under root** (external audit finding CLOSE11-4). `chmod`-based
+  permission checks are a no-op for a root-running process, so
+  `test_main_resume_against_a_read_only_log_directory_gets_its_own_exit_code`
+  skips under any root-running CI job or containerized agent, with
+  nothing to make that skip visible in an otherwise-green run -- the
+  top-level summary still reads "N passed" and the process still exits 0.
+  A deterministic companion (`test_main_resume_survives_an_injected_
+  write_failure`, monkeypatching `append_resume_record` directly, the
+  same treatment CLOSE10-2's own tests already use) already covered the
+  same property and already runs everywhere -- what was missing was
+  making the skip itself impossible to miss.
+
+  New `tests/conftest.py`: a `pytest_terminal_summary`/`pytest_
+  sessionfinish` hook pair that turns ANY skip in the suite into a
+  failing session, with the skip's own reason printed to the summary.
+  Verified against a synthetic always-skipping test in an isolated
+  directory: exit code 1, not 0, with the skip reason visible. The one
+  real skip in this suite (the test above, only reachable as root) is
+  the reason this exists; a future skip that is genuinely intentional
+  and permanent should carve itself out in `conftest.py` by name, not
+  pass unnoticed the way this one did.
+
 - **"Sustained recovery" renamed to "single-OK recovery"** (external audit
   finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
   automatic recovery path (and CLOSE9-1's extension of it to
