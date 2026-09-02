@@ -218,6 +218,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test_module_docstring_does_not_restate_the_exit_code_map_either` holds
   `cli.py`'s docstring to the same standard.
 
+- **`docs/decisions/0003`'s own CLOSE10-3 rename claimed completeness it
+  did not have** (external audit finding CLOSE11-3). Two paragraphs above
+  the addendum that renamed "sustained recovery" to "single-OK recovery"
+  everywhere the mechanism is described, the SAME document's CLOSE9-1
+  addendum still said "only what happens after SUSTAINED healthy
+  evidence" -- the exact word being renamed, missed in the very file
+  making the claim. The addendum's own "renamed everywhere" list named
+  `engine/breaker.py`, `cli.py`, `docs/decisions/0008`, and
+  `tests/test_breaker.py`, but not `docs/decisions/0003` itself. Fixed
+  both: the stray "SUSTAINED" reworded to match the rename, and the
+  completeness list corrected to include this file. A rename that
+  overclaims its own coverage is the same failure class "sustained" was
+  -- said explicitly in the ADR's own text this time, not just fixed
+  quietly. `changepoint.py`, `loops/fast.py`, `test_changepoint.py`'s
+  CUSUM-related "sustained" uses, `breaker.py`'s historical notes, and
+  the older CHANGELOG entries recording what was said at the time are
+  unchanged, same as CLOSE10-3 left them -- those are still correct.
+
 - **"Sustained recovery" renamed to "single-OK recovery"** (external audit
   finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
   automatic recovery path (and CLOSE9-1's extension of it to
