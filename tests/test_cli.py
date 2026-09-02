@@ -789,6 +789,57 @@ def test_help_documents_the_exit_code_map() -> None:
     assert "breach" in help_text
     assert "config" in help_text.lower()
     assert "transport" in help_text.lower()
+    # CLOSE11-2: CLOSE10-2 added a whole new clause to exit 3 (a decision-log
+    # write failure, distinct from a provider transport failure) but the
+    # only test of --help's own text never grew an assertion for it -- so
+    # when CLOSE9-2's own `_EXIT_CODE_EPILOG` update to add this clause
+    # later drifted out of `README.md` (CLOSE10-1's finding), THIS test
+    # would not have caught the drift either, because it never checked the
+    # clause existed anywhere to begin with. Checking it here means a
+    # future edit that quietly drops the clause from `_EXIT_CODE_EPILOG`
+    # itself -- not just from a document that merely COPIES it -- fails
+    # this test directly, instead of only failing wherever else happens to
+    # notice.
+    assert "decision-log write failure" in help_text
+
+
+def test_readme_exit_code_line_points_at_help_instead_of_copying_it() -> None:
+    """CLOSE11-2: `AGENTS.md` item 5, added in the CLOSE10-1 PR for this
+    exact failure, says a checkable fact restated in more than one place
+    should have ONE source of truth with the others pointing at it -- but
+    CLOSE10-1's own fix designated *two* sources (`cli.py`'s module
+    docstring AND `--help`'s epilog), which is still more than one, and
+    nothing enforced either. `_EXIT_CODE_EPILOG` (what `--help` renders) is
+    now the single canonical copy; `README.md`'s exit-code line must be a
+    POINTER to it, not a copy of its own. Mutate the README line back to a
+    a restated map (add "malformed response" or "read-only mount" the way
+    CLOSE10-1 originally worded it) and this fails -- proving the assertion
+    actually reads the line's content, not just its presence."""
+    readme_path = Path(__file__).resolve().parent.parent / "README.md"
+    readme_text = readme_path.read_text(encoding="utf-8")
+    exit_code_lines = [line for line in readme_text.splitlines() if line.startswith("Exit codes:")]
+    assert len(exit_code_lines) == 1, "expected exactly one 'Exit codes:' line in README.md"
+    line = exit_code_lines[0]
+    assert "--help" in line
+    # A restated copy of the map would name what exit 3 actually covers --
+    # a pointer never needs to.
+    assert "malformed response" not in line
+    assert "read-only mount" not in line
+    assert "config/setup error" not in line
+
+
+def test_module_docstring_does_not_restate_the_exit_code_map_either() -> None:
+    """CLOSE11-2: `cli.py`'s own module docstring was the SECOND designated
+    source of truth CLOSE10-1 left standing, alongside `--help`'s epilog --
+    itself a violation of the "pick ONE" rule the same PR added. The
+    docstring may explain the mechanism behind exit 3 (what
+    `DecisionLogWriteError` is, why it's distinct from a bare `OSError`),
+    but it must not restate the map -- what each code number MEANS -- a
+    second time; that's `_EXIT_CODE_EPILOG`'s job alone."""
+    docstring = cli_module.__doc__ or ""
+    assert "malformed response" not in docstring
+    assert "read-only mount" not in docstring
+    assert "bad YAML" not in docstring
 
 
 def test_main_reports_a_config_error_cleanly(tmp_path: Path) -> None:

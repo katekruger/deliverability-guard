@@ -190,6 +190,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   two new `tests/test_audit_log.py` tests exercise the real (non-mocked)
   wrapping path directly, against an actually-nonexistent directory.
 
+- **One canonical exit-code map, not three separately-maintained
+  copies** (external audit finding CLOSE11-2). CLOSE10-1 fixed
+  `README.md`'s stale exit-code line by pointing it at two other
+  places -- `cli.py`'s module docstring AND `--help`'s epilog -- which is
+  still more than the one source of truth `AGENTS.md` item 5 (added in
+  that same PR, for this exact failure) calls for. Nothing enforced
+  either: deleting the decision-log clause from `--help`'s own
+  `_EXIT_CODE_EPILOG`, or restoring `README.md`'s line to a stale copy,
+  both left the suite green.
+
+  `_EXIT_CODE_EPILOG` (what `--help` actually renders -- the one place a
+  cron author looks) is now the single canonical copy. `cli.py`'s module
+  docstring no longer restates the map; it explains the mechanism behind
+  exit 3 (`DecisionLogWriteError`, CLOSE11-1) and points at
+  `_EXIT_CODE_EPILOG` for what each code means. `README.md`'s exit-code
+  line is now a pointer to `deliverability-guard --help`, not a copy.
+  Three new `tests/test_cli.py` tests make the drift detectable instead
+  of just conventional:
+  `test_help_documents_the_exit_code_map` gained an assertion for the
+  decision-log clause specifically (the clause that drifted out of
+  `README.md` once already, and that the original version of this test
+  never checked existed anywhere);
+  `test_readme_exit_code_line_points_at_help_instead_of_copying_it`
+  fails if `README.md`'s line grows the map's own detail back (asserts
+  `--help` is mentioned and phrases like "malformed response" are not);
+  `test_module_docstring_does_not_restate_the_exit_code_map_either` holds
+  `cli.py`'s docstring to the same standard.
+
 - **"Sustained recovery" renamed to "single-OK recovery"** (external audit
   finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
   automatic recovery path (and CLOSE9-1's extension of it to
