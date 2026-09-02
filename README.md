@@ -152,6 +152,14 @@ Sourced against:
 - **Which campaign caused a spike, without the identity scheme adopted first.** Postmaster reports a domain-day scalar; the sequencer reports per-message events; there is no join key between them by default. `identity/feedback_id.py` and `identity/subdomain_advisor.py` fix this — but only for mail sent *after* they're adopted, and only if the underlying sending architecture actually follows the scheme. See [`docs/limits.md`](docs/limits.md).
 - **Warmup adherence.** Not implemented in v0.1's shipped surface — a heuristic comparison against a folklore ramp curve exists at [`experimental/warmup_advisor.py`](src/deliverability_guard/experimental/warmup_advisor.py), quarantined there because nothing calls it yet, not because the logic is unfinished. When it ships for real, it will ship as explicitly-labeled vendor-consensus heuristics, not a standard — there is no RFC or independent research behind published warmup curves, and presenting folklore as authoritative would be this project's fastest way to lose credibility.
 
+## See also
+
+Every project here shares one idea: a GTM system should refuse to act on data it cannot verify.
+
+[campaign-preflight](https://github.com/katekruger/campaign-preflight) — the preflight counterpart. That one catches problems before a campaign sends; this one watches while it is sending.
+
+[instantly-mcp](https://github.com/katekruger/instantly-mcp) — the sending surface these signals are usually measured against, with every write gated behind an explicit confirm.
+
 ## License
 
 [MIT](LICENSE)
