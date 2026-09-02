@@ -157,6 +157,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+- **`cli.py`: CLOSE10-2's own fix reintroduced the same bug, pointing the
+  other way** (external audit finding CLOSE11-1). `check`/`run`'s
+  `except OSError` handler, added by CLOSE10-2 to stop a local
+  decision-log write failure from being blamed on the provider, was broad
+  enough to also catch a raw socket-level error --
+  `ConnectionResetError`, `TimeoutError`, and `socket.timeout` are all
+  `OSError` subclasses -- escaping a driver that doesn't wrap its own
+  transport errors into `httpx.HTTPError`/`ProviderError` (`ses.py`'s
+  boto3 calls are the likeliest real case; the other four drivers mostly
+  wrap their network errors already, which is why this was latent rather
+  than already observed). That reversed CLOSE10-2's own fix: "a local
+  disk failure blamed on the provider" became "a provider failure blamed
+  on the local disk." The exit code (3) was right either way, which is
+  exactly why an exit-code-only assertion never caught it -- CLOSE10-2's
+  own tests monkeypatch `append_record` to raise, so they passed either
+  way.
+
+  Fixed by narrowing, not widening: `audit.log.append_record` and
+  `append_resume_record` now raise a dedicated `DecisionLogWriteError` on
+  their own write failure instead of letting a bare `OSError` escape, and
+  `check`/`run`'s handler catches that specific type. A
+  `ConnectionResetError` from the provider read path -- never touching
+  `append_record` at all -- no longer matches, and falls through to the
+  generic catch-all, which correctly blames the provider. New tests:
+  `test_main_check_reports_a_raw_socket_error_as_a_provider_failure_not_a_decision_log_one`
+  and its `run` counterpart reproduce the reversed bug directly
+  (`_RawSocketErrorDriver` raises `ConnectionResetError` from
+  `read_mailbox_stats`); the two existing CLOSE10-2 tests were updated to
+  raise `DecisionLogWriteError` from their monkeypatched
+  `append_record`, matching what the real, fixed function now raises;
+  two new `tests/test_audit_log.py` tests exercise the real (non-mocked)
+  wrapping path directly, against an actually-nonexistent directory.
+
 - **"Sustained recovery" renamed to "single-OK recovery"** (external audit
   finding CLOSE10-3 -- a documentation overclaim, not a defect). CLOSE-3b's
   automatic recovery path (and CLOSE9-1's extension of it to

@@ -21,6 +21,7 @@ import pytest
 
 import deliverability_guard.cli as cli_module
 from deliverability_guard.audit.log import (
+    DecisionLogWriteError,
     DecisionRecord,
     ResumeRecord,
     append_record,
@@ -1157,14 +1158,19 @@ def test_main_run_reports_a_valueerror_from_evaluation_with_its_own_exit_code(
 def test_main_check_reports_a_decision_log_write_failure_specifically(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """CLOSE10-2: a read-only decision-log directory makes `on_evaluation`'s
-    own `append_record` call raise `OSError` -- nothing about PROVIDER data
-    failed (the mailbox was read and evaluated just fine), but before this
-    fix the exception fell through to CLOSE8-2's generic catch-all and
-    printed "unexpected failure evaluating provider data," blaming the
-    provider for a local disk problem. The exit code (3) was already
-    right; only the message was wrong. Now gets the same specific wording
-    CLOSE9-2 already gave `resume`'s identical write path."""
+    """CLOSE10-2: a read-only decision-log directory makes `append_record`
+    raise `DecisionLogWriteError` (CLOSE11-1: previously a bare `OSError`)
+    -- nothing about PROVIDER data failed (the mailbox was read and
+    evaluated just fine), but before CLOSE10-2 the exception fell through
+    to CLOSE8-2's generic catch-all and printed "unexpected failure
+    evaluating provider data," blaming the provider for a local disk
+    problem. The exit code (3) was already right; only the message was
+    wrong. Now gets the same specific wording CLOSE9-2 already gave
+    `resume`'s identical write path. Raises `DecisionLogWriteError`
+    directly here (not a bare `OSError`) to simulate what the real,
+    CLOSE11-1-fixed `append_record` itself now raises on a write failure
+    -- see `test_main_check_reports_a_raw_socket_error_as_a_provider_failure_not_a_decision_log_one`
+    for the property that distinguishes this from a raw `OSError`."""
     mailbox = MailboxRef(provider="fake", mailbox_id="a@example.com")
     driver = FakeDriver(stats_to_return=[_stats(mailbox, date(2025, 12, 31), 5000, 0)])
 
@@ -1172,7 +1178,7 @@ def test_main_check_reports_a_decision_log_write_failure_specifically(
         return driver
 
     def _raising_append_record(path: Path, record: object) -> None:
-        raise OSError(errno.EACCES, "Permission denied")
+        raise DecisionLogWriteError(os.strerror(errno.EACCES))
 
     monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
     monkeypatch.setattr(cli_module, "append_record", _raising_append_record)
@@ -1200,7 +1206,7 @@ def test_main_run_reports_a_decision_log_write_failure_specifically(
         return driver
 
     def _raising_append_record(path: Path, record: object) -> None:
-        raise OSError(errno.EACCES, "Permission denied")
+        raise DecisionLogWriteError(os.strerror(errno.EACCES))
 
     monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
     monkeypatch.setattr(cli_module, "append_record", _raising_append_record)
@@ -1214,6 +1220,87 @@ def test_main_run_reports_a_decision_log_write_failure_specifically(
     printed = err.getvalue()
     assert "could not record a decision" in printed
     assert "provider data" not in printed
+    assert "Traceback" not in printed
+
+
+# --- CLOSE11-1: CLOSE10-2's own fix reintroduced the same bug, pointing
+# the other way -- a raw socket-level OSError must not be blamed on the
+# decision log -----------------------------------------------------------
+
+
+class _RawSocketErrorDriver:
+    """A driver whose `read_mailbox_stats` raises a bare `OSError` subclass
+    directly -- standing in for `ses.py`'s boto3 calls or any other driver
+    that doesn't wrap every network failure into `httpx.HTTPError` or
+    `ProviderError` before it escapes. `ConnectionResetError`,
+    `TimeoutError`, and `socket.timeout` (an alias of `TimeoutError` since
+    Python 3.10) are all `OSError` subclasses -- this is the shape CLOSE10-2
+    itself did not anticipate could reach the SAME broad `except OSError`
+    it added for the decision-log write."""
+
+    name = "fake"
+    capabilities = frozenset({Capability.READ_STATS})
+
+    def read_mailbox_stats(self, since: date) -> list[MailboxDayStats]:
+        raise ConnectionResetError(104, "Connection reset by peer")
+
+
+def test_main_check_reports_a_raw_socket_error_as_a_provider_failure_not_a_decision_log_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """CLOSE11-1's own reproduction: a `ConnectionResetError` escaping the
+    provider read path (never touching `append_record` at all -- the
+    driver raises before any evaluation, let alone a write, happens) used
+    to be caught by CLOSE10-2's broad `except OSError` and print "could
+    not record a decision" -- CLOSE10-2's own bug, pointing the other way:
+    where CLOSE10-2 fixed "a local disk failure blamed on the provider,"
+    this is "a provider failure blamed on the local disk." The exit code
+    (3) was right in both directions, which is exactly why an exit-code-only
+    assertion never caught it. `append_record`/`append_resume_record` now
+    raise a dedicated `DecisionLogWriteError` (CLOSE11-1) instead of a bare
+    `OSError`, and `check`'s handler catches that specific type -- so this
+    `ConnectionResetError`, never having touched the decision log, now
+    falls through to the generic catch-all and gets the PROVIDER message
+    instead."""
+    driver = _RawSocketErrorDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "check"])
+
+    assert exit_code == 3
+    printed = err.getvalue()
+    assert "could not record a decision" not in printed
+    assert "provider data" in printed
+    assert "Traceback" not in printed
+
+
+def test_main_run_reports_a_raw_socket_error_as_a_provider_failure_not_a_decision_log_one(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Same property, `run` side."""
+    driver = _RawSocketErrorDriver()
+
+    def _fake_build_driver(provider: str, *, env: Mapping[str, str]) -> object:
+        return driver
+
+    monkeypatch.setattr(cli_module, "build_driver", _fake_build_driver)
+    config_path = _config(tmp_path, decision_log=str(tmp_path / "decisions.jsonl"))
+    err = io.StringIO()
+    monkeypatch.setattr(sys, "stderr", err)
+
+    exit_code = main(["--config", str(config_path), "run", "--ticks", "1"])
+
+    assert exit_code == 3
+    printed = err.getvalue()
+    assert "could not record a decision" not in printed
+    assert "provider data" in printed
     assert "Traceback" not in printed
 
 

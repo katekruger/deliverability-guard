@@ -38,6 +38,24 @@ class CorruptDecisionRecordError(Exception):
     """A serialized decision record couldn't be parsed back into a `DecisionRecord`."""
 
 
+class DecisionLogWriteError(Exception):
+    """`append_record`/`append_resume_record`'s own write to `path` failed
+    (CLOSE11-1). A distinct type, not a bare `OSError`, specifically so a
+    caller wrapping a wider block of code -- `cli.py`'s `check`/`run`
+    handlers evaluate a provider AND write a decision record in the same
+    try block -- can tell "the write to our own log failed" apart from any
+    other `OSError` that block might see, such as a raw socket error
+    (`ConnectionResetError`, `TimeoutError`, ... -- all `OSError`
+    subclasses) escaping an unwrapped provider driver. CLOSE10-2 fixed
+    "a local disk failure blamed on the provider" by catching bare
+    `OSError` around that whole block; that catch then blamed the DISK for
+    a provider failure instead, the same bug pointing the other way. This
+    type exists so the CLI only ever narrows on write failures it can
+    actually name, and anything else -- including a provider's own
+    `OSError` -- keeps falling through to the handler that actually
+    describes it."""
+
+
 @dataclass(frozen=True, slots=True)
 class DecisionRecord:
     """A JSON-serializable snapshot of one `BreakerEvaluation`."""
@@ -233,13 +251,19 @@ def replay(record: DecisionRecord) -> Verdict:
 
 
 def append_record(path: Path, record: DecisionRecord) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record.to_dict()) + "\n")
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record.to_dict()) + "\n")
+    except OSError as exc:
+        raise DecisionLogWriteError(str(exc)) from exc
 
 
 def append_resume_record(path: Path, record: ResumeRecord) -> None:
-    with path.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record.to_dict()) + "\n")
+    try:
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(record.to_dict()) + "\n")
+    except OSError as exc:
+        raise DecisionLogWriteError(str(exc)) from exc
 
 
 def _is_resume_line(data: object) -> bool:

@@ -13,20 +13,22 @@ secrets in the repo, ever) -- never from the YAML config `config.py` loads.
 `check` and `run`'s fast tick both call `loops.fast.evaluate_all_mailboxes`,
 so the one-shot and continuous forms cannot drift apart from each other.
 
-Exit codes (CLOSE-5b): 0 all clear, 1 `check` found a breach (or `resume`
-was refused), 2 a config/setup error (bad YAML, unknown provider, missing
-credential), 3 a provider transport failure (network error, rate limit
-exhausted, malformed response) OR a decision-log write failure -- both
-`resume`'s `append_resume_record` call (CLOSE9-2) and `check`/`run`'s own
-per-mailbox `append_record` calls (CLOSE10-2) write to the same decision
-log and can fail the same ways (a read-only mount, a full disk, a
-directory owned by a different user); each gets its own message naming
-the write failure specifically, distinct from a real provider failure, so
-the catch-all's generic wording stays reserved for something genuinely
-unanticipated -- and exit 3 must never collide with exit 1, which already
-means "refused." Distinct from 1 so a cron wrapper can tell "the fleet is
-healthy" apart from "we couldn't even ask the provider" or "we couldn't
-record what we did."
+Exit codes: see `_EXIT_CODE_EPILOG` below (also what `--help` renders,
+and what `README.md`'s own exit-code line points at rather than
+restating -- CLOSE10-1/CLOSE11-2: one canonical copy, not three that can
+drift apart).
+
+`check`/`run`'s own per-mailbox `append_record` call and `resume`'s own
+`append_resume_record` call (CLOSE9-2, CLOSE10-2) can each fail on the
+underlying write -- CLOSE11-1: `audit.log` raises `DecisionLogWriteError`
+on exactly that failure, not a bare `OSError`, so `check`/`run`'s handler
+for it can catch that specific type rather than `OSError` itself. A bare
+`OSError` catch there used to also catch a raw socket-level error
+escaping a driver that doesn't wrap its own transport errors, and blame
+the decision log for a provider failure -- CLOSE10-2's own bug, pointing
+the other way. Narrowing to `DecisionLogWriteError` means that kind of
+error now falls through to the catch-all below instead, where it
+belongs.
 """
 
 import argparse
@@ -42,6 +44,7 @@ import httpx
 from botocore.exceptions import NoRegionError
 
 from deliverability_guard.audit.log import (
+    DecisionLogWriteError,
     DecisionRecord,
     ResumeRecord,
     append_record,
@@ -497,7 +500,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             # undocumented traceback.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
-        except OSError as exc:
+        except DecisionLogWriteError as exc:
             # CLOSE10-2: `on_evaluation`'s own `append_record` call (a LOCAL
             # decision-log write, not a provider request) used to fall
             # through to the catch-all below and get the exact same
@@ -509,6 +512,20 @@ def main(argv: Sequence[str] | None = None) -> int:
             # catch-all below keeps its generic wording for things that are
             # genuinely unexpected, not for a local disk CLOSE9-2 already
             # named once.
+            #
+            # CLOSE11-1: this used to catch bare `OSError`, which reintroduced
+            # CLOSE10-2's own bug pointing the other way -- `ConnectionResetError`,
+            # `TimeoutError`, and `socket.timeout` are all `OSError` subclasses,
+            # so a raw socket error escaping a driver that doesn't wrap its own
+            # transport errors into `httpx.HTTPError`/`ProviderError` (`ses.py`'s
+            # boto3 calls are the likeliest real case) landed HERE and printed
+            # "could not record a decision" for a failure that had nothing to do
+            # with the decision log at all. `append_record`/`append_resume_record`
+            # now raise this dedicated type on their own write failure instead of
+            # a bare `OSError`, so this except clause only ever catches a write
+            # this project can actually name -- any other `OSError` now falls
+            # through, uncaught here, to the catch-all below, which is right:
+            # it's an unanticipated provider-path failure, not a log-write one.
             print(f"error: could not record a decision: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2, see this except's own comment below
@@ -571,8 +588,8 @@ def main(argv: Sequence[str] | None = None) -> int:
             # CLOSE7-2: see the identical `check` handler just above.
             print(f"error: could not evaluate provider data: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
-        except OSError as exc:
-            # CLOSE10-2: see the identical `check` handler just above.
+        except DecisionLogWriteError as exc:
+            # CLOSE10-2/CLOSE11-1: see the identical `check` handler just above.
             print(f"error: could not record a decision: {exc}", file=sys.stderr)
             return _EXIT_PROVIDER_TRANSPORT_FAILURE
         except Exception as exc:  # CLOSE8-2/CLOSE9-2, see the identical `check` handler above

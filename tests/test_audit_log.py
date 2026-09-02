@@ -7,6 +7,7 @@ import pytest
 
 from deliverability_guard.audit.log import (
     CorruptDecisionRecordError,
+    DecisionLogWriteError,
     DecisionRecord,
     ResumeRecord,
     append_record,
@@ -336,3 +337,31 @@ def test_read_events_skips_blank_lines(tmp_path: Path) -> None:
     append_resume_record(path, _resume_record())
 
     assert read_events(path) == [decision, _resume_record()]
+
+
+# --- CLOSE11-1: append_record/append_resume_record raise a dedicated type
+# on their own write failure, not a bare OSError ---------------------------
+
+
+def test_append_record_wraps_a_real_write_failure_in_decision_log_write_error(
+    tmp_path: Path,
+) -> None:
+    """A path whose parent directory doesn't exist makes `Path.open("a")`
+    raise `FileNotFoundError` -- a real `OSError`, no monkeypatching. This
+    is `append_record`'s own contract (CLOSE11-1): wrap it into
+    `DecisionLogWriteError` so `cli.py`'s `check`/`run` handlers can catch
+    that specific type instead of a bare `OSError`, which would also catch
+    an unrelated provider-side socket error (see `tests/test_cli.py`'s
+    CLOSE11-1 tests for why that distinction matters)."""
+    path = tmp_path / "no-such-directory" / "decisions.jsonl"
+    with pytest.raises(DecisionLogWriteError):
+        append_record(path, _record_with_action())
+
+
+def test_append_resume_record_wraps_a_real_write_failure_in_decision_log_write_error(
+    tmp_path: Path,
+) -> None:
+    """Same property, `append_resume_record`."""
+    path = tmp_path / "no-such-directory" / "decisions.jsonl"
+    with pytest.raises(DecisionLogWriteError):
+        append_resume_record(path, _resume_record())
