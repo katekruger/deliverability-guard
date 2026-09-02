@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- `docs/plans/going-public-checklist.md` had drifted stale -- it still
+  showed visibility, security settings, branch protection, and the CI
+  matrix as unchecked, though all of them had been done since v0.1.0.
+  Corrected to match actual repo state, and now documents the real branch
+  protection settings (required review count is 0, not the 1 originally
+  planned, per PR #6's friction on a solo-maintained repo) plus the v0.1.0
+  and v0.2.0 release history.
+
 ## 0.2.0 - 2026-09-01
 
 ### Added
