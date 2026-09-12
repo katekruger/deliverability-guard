@@ -44,7 +44,7 @@ dev = [
     # unpinned linter can turn a green CI red with zero code change on our
     # side. Bump these deliberately, in their own PR, reviewing the changelog.
     # (parsedmarc does the same and it's the right call.)
-    "ruff==0.16.5",
+    "ruff==0.16.6",
     "pyright==1.1.411",
     "pytest>=8.3",
     "pytest-cov>=6.0",
